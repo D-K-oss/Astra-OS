@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Codex finding-triage ledger -- decisions survive compaction and rollover.
+
+Every Codex finding gets a stable ID = sha256(review kind + reviewed blob
+SHAs + severity + file:line + normalized title). The session records its
+Fix/Reject/Accept decision + evidence once; a woken/rolled-over/compacted
+session looks the finding up instead of re-classifying it. A lookup MISS
+means the finding (or the content it targets) is genuinely new.
+
+  finding-ledger.py id     <kind> <severity> <file:line> <title...>
+  finding-ledger.py record <kind> <severity> <file:line> --decision fix|reject|accept [--section N] [--round N]
+                     --todo PATH --evidence "<text>" [--class <defect-class>] <title...>
+                     (--todo + --evidence are REQUIRED: a disposition without the
+                     section it belongs to and its reason cannot be reused -- I4)
+  finding-ledger.py lookup <kind> <severity> <file:line> <title...>
+  finding-ledger.py list [--todo PATH]
+  finding-ledger.py classes                 promotion report: per defect class,
+                     fixed-finding count; classes at >= 3 are flagged
+                     PROMOTE (build a lint/static-assert/test-helper/hook so
+                     the class is caught deterministically before review)
+
+Defect classes are short kebab-case tags chosen at record time (e.g.
+overflow-guard, raw-user-pointer, lock-misuse, stale-xref,
+unchecked-allocation, missing-error-path, abi-mismatch). Reviewer-to-
+automation promotion: every expensive discovery makes the whole class
+cheaper to detect next time.
+
+Blob binding: the ID includes the CURRENT staged/worktree blob of the target
+file, so the same words against changed content is a different finding (it
+must be re-triaged -- the code moved).
+Ledger: .claude/state/finding-triage.jsonl (ring, newest 500 kept).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LEDGER_REL = ".claude/state/finding-triage.jsonl"
+# The live ledger keeps 500 entries for lookups, about three days at site-review
+# rates, so yield per round was unmeasurable. What it trims lands here untouched.
+ARCHIVE_REL = ".claude/state/finding-triage-archive.jsonl"
+MAX_ENTRIES = 500
+
+
+def _blob(root: Path, path: str) -> str:
+    try:
+        r = subprocess.run(["git", "-C", str(root), "hash-object", path],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else "absent"
+    except Exception:
+        return "absent"
+
+
+def finding_id(root: Path, kind: str, severity: str, loc: str, title: str) -> str:
+    path = loc.split(":", 1)[0]
+    h = hashlib.sha256()
+    for part in (kind.lower(), severity.lower(), loc,
+                 re.sub(r"\s+", " ", title.lower()).strip(),
+                 _blob(root, path)):
+        h.update(part.encode())
+        h.update(b"\0")
+    return h.hexdigest()[:20]
+
+
+def load(root: Path) -> list:
+    try:
+        return [json.loads(ln) for ln in
+                (root / LEDGER_REL).read_text(encoding="utf-8").splitlines()
+                if ln.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def save(root: Path, entries: list) -> None:
+    p = root / LEDGER_REL
+    p.parent.mkdir(parents=True, exist_ok=True)
+    overflow = entries[:-MAX_ENTRIES]
+    if overflow:
+        with (root / ARCHIVE_REL).open("a", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(e) + "\n" for e in overflow))
+    p.write_text("\n".join(json.dumps(e) for e in entries[-MAX_ENTRIES:]) + "\n",
+                 encoding="utf-8")
+
+
+def main(argv) -> int:
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    verb = argv[0]
+    root = Path(".").resolve()
+    entries = load(root)
+
+    if verb == "list":
+        todo = argv[argv.index("--todo") + 1] if "--todo" in argv else None
+        for e in entries:
+            if todo and todo not in (e.get("todo") or ""):
+                continue
+            print(json.dumps(e))
+        return 0
+
+    if verb == "classes":
+        counts: dict = {}
+        for e in entries:
+            c = e.get("class")
+            if c and e.get("decision") == "fix":
+                counts[c] = counts.get(c, 0) + 1
+        promote = {c: n for c, n in counts.items() if n >= 3}
+        print(json.dumps({
+            "classes": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "promote": promote,
+            "note": ("PROMOTE classes have >= 3 fixed findings: create a "
+                     "lint check / _Static_assert pattern / test helper / "
+                     "PreToolUse hook so the class is caught before review, "
+                     "then tag the automation here via a doctrine note.")
+        }, indent=1))
+        return 0
+
+    if len(argv) < 5:
+        print("usage: finding-ledger.py id|record|lookup <kind> <severity> "
+              "<file:line> [flags] <title...>", file=sys.stderr)
+        return 2
+    kind, severity, loc = argv[1], argv[2], argv[3]
+    rest = argv[4:]
+    decision = evidence = dclass = None
+    if "--decision" in rest:
+        i = rest.index("--decision")
+        decision = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    if "--evidence" in rest:
+        i = rest.index("--evidence")
+        evidence = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    if "--class" in rest:
+        i = rest.index("--class")
+        dclass = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    todo = None
+    if "--todo" in rest:
+        i = rest.index("--todo")
+        todo = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    section = review_round = None
+    if "--section" in rest:
+        i = rest.index("--section")
+        section = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    if "--round" in rest:
+        i = rest.index("--round")
+        review_round = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    title = " ".join(rest)
+    fid = finding_id(root, kind, severity, loc, title)
+
+    if verb == "id":
+        print(fid)
+        return 0
+    if verb == "record":
+        if decision not in ("fix", "reject", "accept"):
+            print("record needs --decision fix|reject|accept", file=sys.stderr)
+            return 2
+        # I4: require --todo + --evidence. Of 56 prior records 43 had EMPTY
+        # evidence and NONE stored a todo, so `list --todo` never matched and the
+        # ledger was structurally unusable -- the review re-triaged settled
+        # systemic findings for ZERO source changes. A disposition without the
+        # section it belongs to and the reason for it cannot be reused, so it is
+        # rejected at record time rather than accrued as dead weight.
+        if not todo:
+            print("record needs --todo PATH (the section/TODO this finding "
+                  "belongs to) so a later session can look it up by section",
+                  file=sys.stderr)
+            return 2
+        if not (evidence or "").strip():
+            print("record needs --evidence \"<text>\" (the file:line reason for "
+                  "the fix/reject/accept) -- an empty disposition is not reusable",
+                  file=sys.stderr)
+            return 2
+        entries = [e for e in entries if e.get("id") != fid]
+        entries.append({"id": fid, "kind": kind, "severity": severity,
+                        "loc": loc, "title": title[:300],
+                        "decision": decision, "class": dclass,
+                        "todo": todo, "section": section, "round": review_round,
+                        "evidence": (evidence or "")[:1000],
+                        "epoch": int(time.time())})
+        save(root, entries)
+        print(json.dumps({"id": fid, "recorded": decision, "todo": todo}))
+        return 0
+    if verb == "lookup":
+        hit = next((e for e in reversed(entries) if e.get("id") == fid), None)
+        if hit:
+            print(json.dumps({"hit": True, **hit}, indent=1))
+            return 0
+        print(json.dumps({"hit": False, "id": fid,
+                          "note": "new finding OR the target content changed "
+                                  "since the last triage -- classify it"}))
+        return 1
+    print(f"unknown verb: {verb}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

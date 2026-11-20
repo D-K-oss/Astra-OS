@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://impossible-os.local/schema/todo-graph/cache.schema.json",
+  "title": "TODO graph cache (build/todo-cache.json)",
+  "description": "Per-node shape emitted by scripts/todo-graph/build.py. The cache is a JSON array of these nodes, sorted by file_path. The artifact's own PRODUCER CONTRACT identity (cache_format_version + producer_contract_digest) is not in this document: it rides in the digest-named corpus binding sidecar beside the cache, which is where the artifact-level facts already live (TODO-06 section 25). This schema is the optional companion to the per-file frontmatter spec at docs/infrastructure/todo-metadata.schema.json: that one constrains hand-authored frontmatter; this one constrains the generator's output. The forbidden-field validator in build.py rejects hand-authored copies of any field marked cache-only here (created_at, last_active_at, stamped_items). WHY THIS IS LAXER THAN THE FRONTMATTER SCHEMA ON SHARED FIELDS: id, schema_version, status and title are nullable here and the id-grammar patterns are absent, which is deliberate rather than drift. build_node returns a PLACEHOLDER node with those fields null when a TODO has no frontmatter block, so downstream code that expects a dict does not crash; main() then treats missing-frontmatter as fatal and refuses to write the cache, so a published artifact never carries them. Mirroring the frontmatter constraints here would reject that in-memory shape and the fixtures built on it. The producer-contract digest covers the declared field NAMES, not their value ranges -- per-field value shapes are enforced by cache_schema's subtree validators, which is where a reader's actual consumption is declared.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "id",
+      "schema_version",
+      "domain",
+      "status",
+      "title",
+      "file_path",
+      "created_at",
+      "last_active_at",
+      "sections",
+      "section_headings",
+      "inputs_xrefs",
+      "stamps_xrefs"
+    ],
+    "properties": {
+      "id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "schema_version": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "domain": {
+        "type": "string"
+      },
+      "status": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "title": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "file_path": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Repo-relative path of the TODO. minLength is load-bearing, not decoration: both cache readers build occurrence keys from this field, so an empty one produces a keyed-on-nothing occurrence rather than a refusal (TODO-06 section 17)."
+      },
+      "created_at": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "ISO-8601 UTC timestamp from git log (cache-only; rejected in frontmatter)."
+      },
+      "last_active_at": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "ISO-8601 UTC timestamp from git log (cache-only; rejected in frontmatter)."
+      },
+      "effort": {
+        "type": "string",
+        "pattern": "^[1-9][0-9]*[dw]$",
+        "not": {
+          "pattern": "[\\r\\n]"
+        },
+        "$comment": "The `not` clause mirrors docs/infrastructure/todo-metadata.schema.json and is required for the same reason: Python's re -- the engine jsonschema uses -- matches `$` before a trailing newline, so the anchored pattern alone ACCEPTS \"2w\\n\" while cache_schema.EFFORT_REGEX (`\\Z`) refuses it. The renderer interpolates this value straight into a mermaid Gantt row, where an embedded newline ends the row early (Codex consistency, TODO-06 section 25, [medium]).",
+        "description": "Optional Gantt row duration copied from the TODO's frontmatter: whole days or whole weeks, e.g. '3d' or '2w'. Deliberately narrower than Mermaid's full duration grammar -- every unit this rejects is one that cannot reach the emitted gantt line. Absent means the renderer's 1w default; a present-but-invalid value is refused by build.py rather than defaulted, because silently defaulting hides a typo behind a plausible schedule (TODO-06 section 25)."
+      },
+      "owners": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "depends_on": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uniqueItems": true
+      },
+      "satisfies": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uniqueItems": true
+      },
+      "superseded_by": {
+        "type": "string",
+        "minLength": 1
+      },
+      "file_patterns": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uniqueItems": true
+      },
+      "sections": {
+        "type": "array",
+        "description": "Per-section rows. NOTE: consumers enforce one rule this schema cannot express -- `n` must be unique within a node. JSON Schema 2020-12 has no uniqueness-by-property keyword (`uniqueItems` is whole-item equality, so two rows sharing an `n` but differing elsewhere satisfy it), and the rule is load-bearing rather than cosmetic: readers key a dict on `n`, so a duplicate silently overwrites a section's real status. cache_schema.validate_nodes refuses it. A document valid against this schema is therefore well-SHAPED, not automatically trustworthy.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "n",
+            "deliverable",
+            "depends_on",
+            "status"
+          ],
+          "properties": {
+            "n": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "Section number, null when the row's Section column will not parse. Bounds added in TODO-06 section 19 to match cache_schema._require_int, which enforced them while this schema permitted any integer -- so `n: -1` passed the published contract and made the consumer refuse. The maximum is a CPU budget, not a size claim: consumers hash this as a set member and dict key, and CPython hashes an int as value % (2**61-1), so unbounded values can be chosen to collide and degrade those operations to O(n). NOT EXPRESSIBLE HERE: `n` must also be unique within a node, since consumers key a dict on it and a duplicate silently overwrites. JSON Schema has no per-object-array uniqueness-by-property rule, so that one invariant is deliberately Python-only and is pinned by fixtures instead."
+            },
+            "deliverable": {
+              "type": "string"
+            },
+            "depends_on": {
+              "type": "array",
+              "description": "Dependency GROUPS from the Implementation Order row. Item shape added in TODO-06 section 22, derived from the 2,527 live groups, because this was a bare array whose entries `query.py:357-366` dereferences to build the inbound edge index -- a malformed group was silently skipped there, dropping a dependency edge while `blocked`/`blocking`/`backlinks` still reported success. `cache_schema.SUBTREE_SECTION_DEPS` enforces it for callers that declare it; `PROFILE_SECTIONS` deliberately does not, because `todo-reachability.py` reads only `n`/`status`.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "target",
+                  "sections"
+                ],
+                "properties": {
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "sections": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 65535,
+                      "description": "Upper bound mirrors cache_schema._MAX_SECTION_N. Without it the published wire contract accepted a value the routed reader REFUSES, so a producer-valid cache could make every query unavailable while satisfying this schema. The bound belongs here rather than being dropped from the reader: it is a CPU budget on per-field validation, not a statement about plausible section numbers."
+                    }
+                  }
+                }
+              }
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "",
+                " ",
+                "x",
+                "/"
+              ],
+              "description": "Implementation Order marker, a CLOSED domain: build.py extracts it with re.search(r'\\[([ x/])\\]', ...) and emits '' when no marker matched, so no other value is reachable from the producer. Constrained in TODO-06 section 19 because the consumer tests `status not in ('x','/')`, which silently reads any unrecognised value as unfinished."
+            }
+          }
+        }
+      },
+      "section_headings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "n",
+            "title"
+          ],
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "Heading number, parsed from a `## N.` body heading. NOT nullable, unlike sections[].n: a section ROW's Section column is free text that may not parse, whereas a heading is matched by build.extract_section_headings and therefore always has a number. Bounds mirror cache_schema._MAX_SECTION_N, which enforced them while this schema permitted any integer -- the same schema-accepts / Python-refuses gap sections[].n already closed. NOT EXPRESSIBLE HERE: `n` must also be unique within a node, because the consumer compares these as a SET against the Implementation Order rows, so a duplicate silently removes a heading from that comparison. JSON Schema has no per-object-array uniqueness-by-property rule, so that invariant is deliberately Python-only and is pinned by fixtures instead."
+            },
+            "title": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "inputs_xrefs": {
+        "type": "array",
+        "description": "Inputs XREFs as build.py emits them. Item shape added in TODO-06 section 22, derived from the 945 live entries, for the same reason as `sections[].depends_on`: it was a bare array and `query.py:340-344` skipped a non-dict entry, dropping an Inputs edge with nothing reporting it. `target_section` is nullable -- an Inputs XREF may name a file rather than a section. SINCE cache_format_version 5 (TODO-06 section 40) `target_section` is the MARKER ALONE: the enclosing code-span delimiters and any prose punctuation outside them are no longer part of the value, where a v4 producer appended whatever a non-space run swallowed. 508 of the 945 live entries carried that spelling, so a v4 and a v5 artifact disagree about the label on most Inputs edges -- which is the semantic change the version bump exists to declare.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "target_path",
+            "target_section"
+          ],
+          "properties": {
+            "target_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "target_section": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      },
+      "stamps_xrefs": {
+        "type": "array",
+        "description": "Accepted/Deferred stamp XREFs as build.py emits them. Item shape added in TODO-06 section 19, derived from the 994 live entries, because this was a bare array that accepted any entry. Readers ARE routed through it: cache_schema's PROFILE_QUERY and PROFILE_VALIDATE both declare the stamps_xrefs subtree (query.py walks it for deferred / deferred-by / stats, validate.py for the stale-XREF, orphan and reachability checks). This description previously said no reader was routed through it, which was already false when written and was corrected in section 33. That exception is CLOSED, and is written as history so the next reader does not chase it: scripts/overnight/decision-registry.py used to read this array straight out of build/todo-cache.json with no digest-bound sidecar and no cache_format_version check, so it would accept an artifact from ANY earlier contract; it now calls cache_schema.load_and_validate (decision-registry.py:96) like every other routed reader. The sentence described the old behaviour for two sections after the fix landed (Codex consistency, section 40). It does consume the fields emitted here (target_path, target_section, item_name, severity) -- an earlier version of this sentence said it read target/target_file/text/raw, which described a defect already fixed. A filed item (overnight-runner-improvements), not a contract this schema describes. `item_name` is optional: a stamp clause may name a section rather than a named item (73 of 994 live entries omit it).",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "severity",
+            "target_path",
+            "target_section"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "severity": {
+              "type": "string"
+            },
+            "target_path": {
+              "type": "string",
+              "description": "The raw captured target token, NOT a filesystem path. Since producer contract v3 (CACHE_FORMAT_VERSION = 3, TODO-06 section 33) this may be a COMPLETE MARKDOWN LINK -- `[label](destination)` -- whose label contains spaces; before v3 the producer captured with `\\\\S+` and required a section marker after it, so a clause with a space-bearing label matched NOTHING and its edge was OMITTED entirely -- the change is omission-to-emission, not truncation-to-completion. Both forms are strings, so no schema type can tell them apart, which is why the meaning change is gated by the format version rather than by shape. Resolve it through validate.resolve_xref_target, which unwraps the link BEFORE stripping any `#fragment`; the reverse order yields an incomplete link that fails closed and silently drops the edge."
+            },
+            "target_section": {
+              "type": "string",
+              "description": "Since cache_format_version 5 (TODO-06 section 40) this is the MARKER ALONE, excluding the enclosing code-span delimiters and any prose punctuation outside them; 132 live stamp entries moved on that change. Same contract as inputs_xrefs[].target_section -- one shared parser decides it for every producer surface."
+            },
+            "item_name": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "stamped_items": {
+        "type": "array",
+        "description": "Per-`[x]` checklist-item records. Emitted only when the body has at least one [x] item; absent when no items have shipped. Cache-only -- never legal in hand-authored frontmatter (build.py forbidden-field check enforces).",
+        "items": {
+          "type": "object",
+          "required": [
+            "section_n",
+            "item_idx",
+            "item_text",
+            "refs"
+          ],
+          "properties": {
+            "section_n": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "Ceiling added in TODO-06 section 19, same CPU budget as sections[].n: both readers use this value as a dict key."
+            },
+            "item_idx": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "0-based ordinal of the [x] item within the section (skips [ ] / [/])."
+            },
+            "item_text": {
+              "type": "string",
+              "description": "Full prose after the `[x] ` prefix (preserved, not truncated)."
+            },
+            "refs": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": [
+                      "kind",
+                      "file"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "file"
+                      },
+                      "file": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "line": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "kind",
+                      "symbol"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "symbol"
+                      },
+                      "symbol": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional: paired with the FIRST file ref in the same item so consumers (e.g. lint Check 7) can resolve symbol-only stamps deterministically. Absent when the item names a symbol with no nearby file reference."
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}

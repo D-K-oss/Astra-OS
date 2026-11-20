@@ -1,0 +1,419 @@
+/* ============================================================================
+ * ab_boot_metadata.h -- A/B dual-slot boot metadata wire ABI (TODO-21 sec 1)
+ *
+ * The single source of truth for which root slot (A or B) the bootloader
+ * selects, how many boot attempts remain per slot, whether a slot has been
+ * marked good, and the per-slot anti-rollback version. Written/read by both
+ * the pre-ExitBootServices bootloader (the GPT/disk storage adapter lands in
+ * sec 2) and the kernel (mark_boot_successful adapter in sec 5), so the
+ * struct + validators + CRC live here as shared static-inline code -- the
+ * trust gate is byte-identical on both sides (same idiom as
+ * boot_health_handoff.h).
+ *
+ * Storage: the record lives on disk as TWO redundant fixed blocks (sec 7
+ * integrity), NOT in UEFI NVRAM -- EFI vars are rejected for the
+ * high-frequency `tries` state per the repo BootSticky/boot_history doctrine.
+ * The newest valid copy (highest `generation`) wins; if both fail validation
+ * the reader loads factory defaults (sec 7).
+ *
+ * Relationship to existing infra (do NOT duplicate):
+ *   - boot_rollback.c owns the security-version anti-rollback FLOOR
+ *     (IPOSRequiredSecVersion NVRAM, boot_rollback_mark_steady/raise_if_steady).
+ *     `rollback_floor` here is the A/B-slot view that integrates with it (sec 8).
+ *   - boot_health_handoff.h owns per-ENTRY boot counting (tries_left/tries_done)
+ *     + mark-good. This A/B-SLOT layer coexists above it (sec 3/4/5 wiring).
+ *
+ * The full v1 layout is pinned NOW (including the sec 7 generation/crc32 and
+ * sec 8 rollback_index/floor fields) so the on-disk ABI is stable across the
+ * sec 1/7/8 implementations; behavior for the later-section fields ships in
+ * those sections, but the bytes never move.
+ *
+ * Layout discipline: fixed-size, magic + version gated, reserved-zero forward
+ * sentinel, CRC-32/IEEE-802.3 over (size - 4) bytes, _Static_assert offset
+ * pins -- identical conventions to boot_health_handoff.h.
+ * ============================================================================ */
+
+#ifndef AB_BOOT_METADATA_H
+#define AB_BOOT_METADATA_H
+
+#define AB_BOOT_META_MAGIC    0x41424D44u   /* 'ABMD' */
+#define AB_BOOT_META_VERSION  1u
+#define AB_BOOT_META_SIZE     60u
+
+#define AB_BOOT_SLOT_A        0u
+#define AB_BOOT_SLOT_B        1u
+#define AB_BOOT_SLOT_COUNT    2u
+
+/* Max boot attempts before a slot is considered exhausted (sec 4 rollback). */
+#define AB_BOOT_MAX_TRIES     3u
+
+/* Per-slot "successful" bit in boot_info.ab_slot_flags (sec6 diagnostics
+ * snapshot): bit s == slot s was marked successful. Shared so the bootloader
+ * publish and the kernel VPD read use ONE convention instead of duplicated
+ * literal masks that could silently drift if the slot encoding changes. */
+static inline unsigned int ab_boot_slot_flag(unsigned int slot)
+{
+    return 1u << slot;
+}
+
+/* The two redundant copies live at these fixed BYTE offsets within the
+ * A/B-metadata partition. Shared read/write contract: the bootloader reader
+ * (sec 3) and BOTH writers (bootloader sec 4 + kernel sec 5) use these. The
+ * 4 KiB spacing keeps each copy in its own media block on 512B..4096B media. */
+#define AB_META_COPY0_BYTE_OFF   0u
+#define AB_META_COPY1_BYTE_OFF   4096u
+
+/* Per-slot record. tries/successful drive the sec 3 successful/pending/
+ * unbootable state model (the state is derived, not a separate field):
+ *   - unbootable = tries >= MAX (regardless of successful -- mark-good resets
+ *     tries to 0, so only a slot failing MAX times in a row gets here; sec 3
+ *     selection rolls back off it EVEN IF it was once successful),
+ *   - successful = the slot was marked good (tie-breaker among bootable slots),
+ *   - pending     = !successful && tries < MAX (update written, unproven).
+ * rollback_index is the monotonic OS/security version checked against the
+ * floor (sec 8). */
+struct ab_boot_slot {
+    unsigned int tries;          /* boot attempts consumed, 0..AB_BOOT_MAX_TRIES */
+    unsigned int successful;     /* 1 once mark_boot_successful confirmed this slot */
+    unsigned int priority;       /* higher = preferred when both slots valid */
+    unsigned int rollback_index; /* monotonic security version (sec 8) */
+};
+
+_Static_assert(sizeof(unsigned int) == 4u, "ab_boot wire ABI assumes 32-bit unsigned int");
+_Static_assert(sizeof(struct ab_boot_slot) == 16u, "ab_boot_slot must be 16 bytes");
+_Static_assert(__builtin_offsetof(struct ab_boot_slot, tries) == 0, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_slot, successful) == 4, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_slot, priority) == 8, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_slot, rollback_index) == 12, "");
+
+struct ab_boot_metadata {
+    unsigned int magic;                          /* AB_BOOT_META_MAGIC */
+    unsigned int version;                        /* AB_BOOT_META_VERSION */
+    unsigned int generation;                     /* monotonic; newest valid copy wins (sec 7) */
+    unsigned int active_slot;                    /* AB_BOOT_SLOT_A or _B */
+    struct ab_boot_slot slot[AB_BOOT_SLOT_COUNT];/* per-slot state */
+    unsigned int rollback_floor;                 /* min acceptable rollback_index (sec 8) */
+    unsigned int reserved;                       /* must be 0 (forward sentinel) */
+    unsigned int crc32;                          /* CRC-32 over the first 56 bytes */
+};
+
+_Static_assert(sizeof(struct ab_boot_metadata) == AB_BOOT_META_SIZE,
+    "ab_boot_metadata size must match AB_BOOT_META_SIZE");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, magic) == 0, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, version) == 4, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, generation) == 8, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, active_slot) == 12, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, slot) == 16, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, rollback_floor) == 48, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, reserved) == 52, "");
+_Static_assert(__builtin_offsetof(struct ab_boot_metadata, crc32) == 56, "");
+
+/* CRC-32/IEEE-802.3 over the first (total_len - 4) bytes of buf (excludes the
+ * trailing crc32 field). Same polynomial as boot_health_handoff /
+ * boot_entries envelope so producers and consumers agree byte-for-byte.
+ * Inline so the freestanding bootloader and the kernel share one definition
+ * without a separate object file. */
+static inline unsigned int
+ab_boot_meta_compute_crc(const void *buf, unsigned int total_len)
+{
+    static const unsigned int poly = 0xEDB88320u;
+    const unsigned char *p = (const unsigned char *)buf;
+    unsigned int crc = 0xFFFFFFFFu;
+    unsigned int n;
+    if (total_len < 4u) return 0u;
+    n = total_len - 4u;
+    for (unsigned int i = 0; i < n; i++) {
+        crc ^= (unsigned int)p[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (poly & -(int)(crc & 1u));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/* Validate a record: magic, version, reserved-zero, active_slot in range, and
+ * CRC over the first (AB_BOOT_META_SIZE - 4) bytes. Returns 1 (valid) or 0.
+ * Shared so the trust gate is identical on bootloader and kernel sides. */
+static inline int
+ab_boot_meta_is_valid(const struct ab_boot_metadata *r)
+{
+    if (!r) return 0;
+    if (r->magic != AB_BOOT_META_MAGIC) return 0;
+    if (r->version != AB_BOOT_META_VERSION) return 0;
+    if (r->reserved != 0u) return 0;
+    if (r->active_slot >= AB_BOOT_SLOT_COUNT) return 0;
+    /* Per-slot field domains: a CRC-valid but crafted/corrupt record must not
+     * smuggle out-of-domain tries/successful into the rollback state machine. */
+    for (unsigned int s = 0u; s < AB_BOOT_SLOT_COUNT; s++) {
+        if (r->slot[s].tries > AB_BOOT_MAX_TRIES) return 0;
+        if (r->slot[s].successful > 1u) return 0;
+    }
+    if (ab_boot_meta_compute_crc(r, AB_BOOT_META_SIZE) != r->crc32) return 0;
+    return 1;
+}
+
+/* Populate `out` with factory defaults: boot slot A, no tries consumed, not
+ * yet successful, slot A preferred, zero rollback state. Used when both stored
+ * copies fail validation (sec 7 corrupt-metadata recovery). CRC is finalized. */
+static inline void
+ab_boot_meta_default(struct ab_boot_metadata *out)
+{
+    unsigned int i;
+    if (!out) return;
+    for (i = 0; i < AB_BOOT_META_SIZE; i++)
+        ((unsigned char *)out)[i] = 0u;
+    out->magic = AB_BOOT_META_MAGIC;
+    out->version = AB_BOOT_META_VERSION;
+    out->generation = 0u;
+    out->active_slot = AB_BOOT_SLOT_A;
+    out->slot[AB_BOOT_SLOT_A].priority = 1u;  /* A preferred over a blank B */
+    out->crc32 = ab_boot_meta_compute_crc(out, AB_BOOT_META_SIZE);
+}
+
+/* Stamp magic/version, clear reserved, and finalize the CRC. Call before
+ * serializing a record to storage so ab_boot_meta_is_valid accepts it. */
+static inline void
+ab_boot_meta_finalize(struct ab_boot_metadata *out)
+{
+    if (!out) return;
+    out->magic = AB_BOOT_META_MAGIC;
+    out->version = AB_BOOT_META_VERSION;
+    out->reserved = 0u;
+    out->crc32 = ab_boot_meta_compute_crc(out, AB_BOOT_META_SIZE);
+}
+
+/* Given the two redundant stored copies, return the valid one with the higher
+ * `generation` (sec 7 newest-wins), or 0 if neither validates (caller loads
+ * factory defaults). On a tie in generation, prefers `a`. *winner receives the
+ * chosen pointer when the return is 1. */
+static inline int
+ab_boot_meta_select_newest(const struct ab_boot_metadata *a,
+                           const struct ab_boot_metadata *b,
+                           const struct ab_boot_metadata **winner)
+{
+    int va = a && ab_boot_meta_is_valid(a);
+    int vb = b && ab_boot_meta_is_valid(b);
+    if (!va && !vb) return 0;
+    if (va && !vb) { if (winner) *winner = a; return 1; }
+    if (!va && vb) { if (winner) *winner = b; return 1; }
+    if (winner) *winner = (b->generation > a->generation) ? b : a;
+    return 1;
+}
+
+/* Selection state model: given a validated record, return the slot index the
+ * bootloader should boot. A slot is "unbootable" when it has exhausted its
+ * attempts (tries >= AB_BOOT_MAX_TRIES) -- this holds EVEN IF the slot was
+ * previously marked successful, because mark-boot-successful resets tries to 0,
+ * so a slot only reaches the exhaustion threshold by failing MAX times in a row
+ * without a fresh mark-good (a once-good slot that has since broken). Among the
+ * bootable slots, prefer the highest priority; tie-break successful-first, then
+ * lower tries. This rolls back away from a once-good slot that later broke, as
+ * long as another viable slot exists. If BOTH slots are unbootable, fall back
+ * to the record's recorded active_slot (both-exhausted -> recovery routing is
+ * owned by the failure-counting + recovery-partition work, not selection).
+ * Shared so the bootloader's choice and the kernel/test view are byte-identical. */
+static inline unsigned int
+ab_boot_meta_choose_slot(const struct ab_boot_metadata *m)
+{
+    unsigned int best;
+    int best_set = 0;
+    unsigned int s;
+    if (!m) return AB_BOOT_SLOT_A;
+    best = (m->active_slot < AB_BOOT_SLOT_COUNT) ? m->active_slot : AB_BOOT_SLOT_A;
+    for (s = 0u; s < AB_BOOT_SLOT_COUNT; s++) {
+        const struct ab_boot_slot *sl = &m->slot[s];
+        if (sl->tries >= AB_BOOT_MAX_TRIES)
+            continue;  /* unbootable -- exhausted, even if once-successful */
+        if (!best_set) { best = s; best_set = 1; continue; }
+        const struct ab_boot_slot *b = &m->slot[best];
+        if (sl->priority != b->priority) {
+            if (sl->priority > b->priority) best = s;
+            continue;
+        }
+        if (sl->successful != b->successful) {
+            if (sl->successful > b->successful) best = s;
+            continue;
+        }
+        if (sl->tries < b->tries) best = s;
+    }
+    return best;
+}
+
+/* True when EVERY slot has exhausted its boot attempts (tries >= MAX). In this
+ * state choose_slot() can no longer roll forward to a healthy peer -- the caller
+ * must invoke the both-exhausted stopgap rather than treat choose_slot's return
+ * (the recorded active slot) as a normal selection. */
+static inline int
+ab_boot_meta_all_exhausted(const struct ab_boot_metadata *m)
+{
+    unsigned int s;
+    if (!m) return 0;
+    for (s = 0u; s < AB_BOOT_SLOT_COUNT; s++)
+        if (m->slot[s].tries < AB_BOOT_MAX_TRIES) return 0;
+    return 1;
+}
+
+/* Both-exhausted stopgap: when no slot is bootable, pick the LEAST-BAD slot to
+ * attempt anyway. A defined fallback beats an undefined terminal path while the
+ * recovery partition is unbuilt (the recovery-partition work owns the real
+ * recovery UI). Prefer a previously-successful slot, then higher priority, then
+ * fewer accumulated tries, else keep the recorded active slot. This boots the
+ * most-likely-recoverable root with a loud diagnostic instead of bricking.
+ * Pure logic, shared so the bootloader's stopgap and the test view agree. */
+static inline unsigned int
+ab_boot_meta_least_bad_slot(const struct ab_boot_metadata *m)
+{
+    unsigned int best, s;
+    if (!m) return AB_BOOT_SLOT_A;
+    best = (m->active_slot < AB_BOOT_SLOT_COUNT) ? m->active_slot : AB_BOOT_SLOT_A;
+    for (s = 0u; s < AB_BOOT_SLOT_COUNT; s++) {
+        const struct ab_boot_slot *sl = &m->slot[s];
+        const struct ab_boot_slot *b = &m->slot[best];
+        if (s == best) continue;
+        if (sl->successful != b->successful) {
+            if (sl->successful > b->successful) best = s;
+            continue;
+        }
+        if (sl->priority != b->priority) {
+            if (sl->priority > b->priority) best = s;
+            continue;
+        }
+        if (sl->tries != b->tries) {
+            if (sl->tries < b->tries) best = s;
+            continue;
+        }
+        /* fully tied -> keep current best (recorded active slot wins) */
+    }
+    return best;
+}
+
+/* Why the bootloader chose the slot it did -- drives user-facing diagnostics
+ * (a rollback serial line + an on-screen "reverting to previous version" notice)
+ * that choose_slot's bare index cannot express. */
+enum ab_boot_select_reason {
+    AB_BOOT_SEL_NORMAL = 0,         /* booting the preferred / active slot */
+    AB_BOOT_SEL_ROLLBACK = 1,       /* active slot exhausted; rolled back to peer */
+    AB_BOOT_SEL_BOTH_EXHAUSTED = 2  /* all slots exhausted; least-bad stopgap */
+};
+
+struct ab_boot_decision {
+    unsigned int slot;                   /* slot index to boot */
+    enum ab_boot_select_reason reason;
+    unsigned int from_slot;              /* the exhausted slot rolled away from */
+    unsigned int from_tries;             /* that slot's tries (for the diagnostic) */
+};
+
+/* Full selection decision: the slot to boot PLUS the reason it was chosen.
+ * Wraps choose_slot (whose contract is unchanged) and classifies the outcome so
+ * the bootloader can surface rollbacks. NORMAL when the active slot is still
+ * bootable (even if a higher-priority peer wins -- that is policy, not failure);
+ * ROLLBACK when the active slot is exhausted and a healthy peer takes over;
+ * BOTH_EXHAUSTED when no slot is bootable (least-bad stopgap). Pure + shared. */
+static inline struct ab_boot_decision
+ab_boot_meta_decide(const struct ab_boot_metadata *m)
+{
+    struct ab_boot_decision d;
+    unsigned int active;
+    d.slot = AB_BOOT_SLOT_A;
+    d.reason = AB_BOOT_SEL_NORMAL;
+    d.from_slot = 0u;
+    d.from_tries = 0u;
+    if (!m) return d;
+    active = (m->active_slot < AB_BOOT_SLOT_COUNT) ? m->active_slot : AB_BOOT_SLOT_A;
+    if (ab_boot_meta_all_exhausted(m)) {
+        d.slot = ab_boot_meta_least_bad_slot(m);
+        d.reason = AB_BOOT_SEL_BOTH_EXHAUSTED;
+        d.from_slot = active;
+        d.from_tries = m->slot[active].tries;
+        return d;
+    }
+    d.slot = ab_boot_meta_choose_slot(m);
+    if (d.slot != active && m->slot[active].tries >= AB_BOOT_MAX_TRIES) {
+        d.reason = AB_BOOT_SEL_ROLLBACK;
+        d.from_slot = active;
+        d.from_tries = m->slot[active].tries;
+    }
+    return d;
+}
+
+/* GPT-copy reconciliation for locating the A/B metadata partition. The
+ * bootloader reads BOTH the primary and backup GPT raw (firmware's own CRC
+ * validation is bypassed by a raw read), so the two copies must be reconciled
+ * before trusting a "no metadata partition" conclusion. */
+enum ab_gpt_reconcile {
+    AB_GPT_USE_PRIMARY = 0,  /* primary GPT valid and carries the metadata */
+    AB_GPT_USE_BACKUP  = 1,  /* primary invalid; backup valid and carries it */
+    AB_GPT_NO_AB       = 2,  /* both GPTs valid and agree: no metadata (non-A/B) */
+    AB_GPT_FATAL       = 3   /* corrupt or inconsistent -- fail closed */
+};
+
+/* Map the primary/backup (valid, has-metadata) states to a decision. Inputs
+ * are 0/1. FAIL-CLOSED by construction -- the only non-fatal answers are:
+ *   USE_PRIMARY: primary valid + has MD, AND the backup does not CONTRADICT it
+ *                (backup invalid -> unreadable, primary is authoritative; or
+ *                 backup valid + also has MD -> the caller still verifies the
+ *                 two MD LBA ranges match and fatals on a range mismatch),
+ *   USE_BACKUP : primary invalid, backup valid + has MD (firmware-equiv recover),
+ *   NO_AB      : BOTH copies valid AND both lack the metadata (genuine non-A/B).
+ * Every other state is FATAL: both invalid; a presence disagreement (one copy
+ * has MD, the other validates without it -- split-brain); or a lone valid copy
+ * with no MD while its peer is unreadable. Guessing a slot from an inconsistent
+ * partition table could boot the wrong or rolled-back root. Pure logic, shared
+ * so it is unit-testable. */
+static inline int
+ab_boot_meta_reconcile_gpt(int p_valid, int p_has_md, int b_valid, int b_has_md)
+{
+    if (p_valid && p_has_md) {
+        if (!b_valid) return AB_GPT_USE_PRIMARY;       /* backup unreadable */
+        if (b_has_md) return AB_GPT_USE_PRIMARY;       /* caller checks LBA range */
+        return AB_GPT_FATAL;                           /* backup valid but lacks MD */
+    }
+    if (!p_valid && b_valid && b_has_md) return AB_GPT_USE_BACKUP;
+    if (p_valid && !p_has_md && b_valid && !b_has_md) return AB_GPT_NO_AB;
+    return AB_GPT_FATAL;
+}
+
+/* ---- Power-fail-atomic write support (sec 7) ----
+ * The two redundant copies are updated one at a time. To make an update
+ * power-fail-atomic, the writer overwrites the copy that is SAFE TO LOSE -- an
+ * invalid copy (carries no good state) or, when both are valid, the
+ * LOWER-generation (older) one -- so a crash mid-write always leaves the OTHER
+ * copy (the prior newest-valid record) intact. The new record is stamped with
+ * a generation strictly higher than both stored copies so it becomes the
+ * newest-valid on the next read (ab_boot_meta_select_newest). These are pure
+ * functions of the two copies' (valid, generation) state -- shared + testable;
+ * the disk read-modify-write adapters live in the bootloader + kernel. */
+
+/* Return the copy index (0 or 1) the writer must overwrite. Prefer an invalid
+ * copy (index 0 before 1); when both are valid, the lower-generation copy (tie
+ * -> copy 0, deterministic). c0_gen/c1_gen are ignored when the matching
+ * cN_valid is 0. */
+static inline unsigned int
+ab_boot_meta_write_target(int c0_valid, unsigned int c0_gen,
+                          int c1_valid, unsigned int c1_gen)
+{
+    if (!c0_valid) return 0u;
+    if (!c1_valid) return 1u;
+    return (c0_gen <= c1_gen) ? 0u : 1u;  /* overwrite the older (or tie) copy */
+}
+
+/* Return the generation to stamp on the new record: STRICTLY GREATER than
+ * every valid stored copy so the just-written copy wins ab_boot_meta_select_newest.
+ * With no valid copy (first write to a blank/corrupt partition) the new
+ * generation is 1. Returns 0 -- the "refuse the write" sentinel, which this
+ * function never returns legitimately -- ONLY when the highest valid generation
+ * is already 0xFFFFFFFF (UINT32_MAX), where no strictly-greater value exists;
+ * the caller MUST then fail the write rather than commit a non-winning record
+ * (a generation counter exhausting 2^32 metadata writes is not reachable in
+ * practice). hi == 0xFFFFFFFE is still writable -> 0xFFFFFFFF. */
+static inline unsigned int
+ab_boot_meta_next_generation(int c0_valid, unsigned int c0_gen,
+                             int c1_valid, unsigned int c1_gen)
+{
+    unsigned int hi = 0u;
+    if (c0_valid && c0_gen > hi) hi = c0_gen;
+    if (c1_valid && c1_gen > hi) hi = c1_gen;
+    if (hi == 0xFFFFFFFFu) return 0u;  /* exhausted -- caller must refuse the write */
+    return hi + 1u;
+}
+
+#endif /* AB_BOOT_METADATA_H */

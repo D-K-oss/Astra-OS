@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# =============================================================================
+# .githooks/pre-push -- always-on control-plane gate + opt-in build/test gate.
+#
+# Two layers:
+#  1. ALWAYS-ON (2026-07-11): if the pushed commits touch the overnight-runner
+#     control plane (scripts/overnight/control-plane-manifest.txt), run the
+#     runner test suite as a HARD gate and runner-doctor as advisory host-health.
+#     This is the net for a control-plane change committed with --no-verify (the
+#     pre-commit suite gate bypassed) -- it must not reach origin unproven.
+#  2. OPT-IN: the heavy full build + test.sh gate, delegated to
+#     scripts/hooks/pre-push, only when the sentinel .git/.impossible-os-prepush
+#     exists. Toggle with:
+#       bash scripts/install-hooks.sh --enable-pre-push
+#       bash scripts/install-hooks.sh --disable-pre-push
+# =============================================================================
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Everything below reaches git through -C "$REPO_ROOT" or the working directory and
+# needs no index, so the hook drops git's exported variables before any suite runs.
+# shellcheck source=.githooks/lib/isolate-git-env.sh
+. "$REPO_ROOT/.githooks/lib/isolate-git-env.sh"
+isolate_git_env
+# Worktree-safe: rev-parse --git-path resolves .git whether it's a directory
+# (main checkout) or a file (linked worktree).
+SENTINEL="$(git -C "$REPO_ROOT" rev-parse --git-path .impossible-os-prepush 2>/dev/null || echo "$REPO_ROOT/.git/.impossible-os-prepush")"
+
+# pre-push receives the ref updates on stdin. Capture verbatim so we can both
+# inspect the pushed range AND re-feed it to the delegated opt-in gate below.
+STDIN_DATA="$(cat)"
+
+EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# ---- No test-fixture identity reaches the remote ------------------------------
+# Runs first and costs one `git log`, so a bad author is refused before any suite.
+if [ "${SKIP_PUSH_IDENTITY_CHECK:-}" != "1" ] && [ -f "$REPO_ROOT/scripts/check-push-identity.py" ]; then
+  while read -r _idl _idloid _idr _idroid; do
+    [ -n "${_idloid:-}" ] || continue
+    python3 "$REPO_ROOT/scripts/check-push-identity.py" "$_idloid" "$_idroid" || exit 1
+  done <<< "$STDIN_DATA"
+fi
+
+# ---- Branch policy: main + gh-pages only -------------------------------------
+#
+# This repo is main-only by decision (CI fires on main; long-lived branches were
+# how a control-plane change once sat unproven for 291 commits). Until now that
+# was a convention with nothing enforcing it -- and it demonstrably did not hold:
+# work on 2026-07-27 began on a stale `overnight-runner-improvements-2026-07-13`
+# that an earlier session created and nobody noticed until it needed cleaning up.
+#
+# gh-pages is the one legitimate exception: it serves impossibleos.co and must
+# never be deleted or blocked.
+#
+# Scope is honest about its limits. A local hook only governs pushes from THIS
+# checkout; it is not a substitute for server-side branch protection, which is
+# the only thing that governs pushes from anywhere else. Treat this as the fast
+# feedback half, not the guarantee.
+while read -r _lref _lsha rref _rsha; do
+  [ -n "${rref:-}" ] || continue
+  case "$rref" in
+    refs/heads/main|refs/heads/gh-pages) ;;
+    refs/heads/*)
+      branch="${rref#refs/heads/}"
+      echo -e "\033[31m[pre-push] BLOCKED: pushing branch '$branch'.\033[0m"
+      echo "  This repo is main-only (gh-pages excepted, it serves impossibleos.co)."
+      echo "  Land the work on main instead:  git switch main && git merge $branch"
+      echo "  Deliberate exception (rare):    SKIP_BRANCH_GUARD=1 git push ..."
+      [ "${SKIP_BRANCH_GUARD:-}" = "1" ] || exit 1
+      echo -e "\033[33m  SKIP_BRANCH_GUARD=1 set -- branch policy overridden\033[0m"
+      ;;
+  esac
+done <<< "$STDIN_DATA"
+
+# A section built while the reviewer was down owes its review, and nothing is
+# pushed until it has had it: an outage is a delay, never an approval. Owner:
+# todo/00-infrastructure/TODO-08-automation-hardening.md section 45. A record
+# that cannot be read refuses too; there is no opt-out variable.
+OWED_TOOL="$REPO_ROOT/scripts/overnight/review_owed.py"
+if [ -f "$OWED_TOOL" ]; then
+  OWED_OUT="$(python3 "$OWED_TOOL" --root "$REPO_ROOT" gate 2>&1)"
+  OWED_RC=$?
+  if [ "$OWED_RC" -ne 0 ]; then
+    echo -e "\033[31m[pre-push] BLOCKED: a review is owed.\033[0m"
+    printf '%s\n' "$OWED_OUT" | sed 's/^/  /'
+    echo "  Review the owed section(s) first (python3 scripts/overnight/review_owed.py list),"
+    echo "  stamp them, then: python3 scripts/overnight/review_owed.py clear --todo <todo> --section <N>"
+    exit 1
+  fi
+fi
+
+# Files changed across every non-delete ref update in this push.
+pushed_files() {
+  local lref loid rref roid base
+  while read -r lref loid rref roid; do
+    [ -n "${loid:-}" ] || continue
+    case "$loid" in *[!0]*) : ;; *) continue ;; esac   # local oid all-zero => deletion, skip
+    case "${roid:-}" in
+      *[!0]*) base="$roid" ;;                            # real remote oid
+      *) base="$(git -C "$REPO_ROOT" merge-base "$loid" origin/main 2>/dev/null || echo "$EMPTY_TREE")" ;;
+    esac
+    git -C "$REPO_ROOT" rev-parse --quiet --verify "$base^{commit}" >/dev/null 2>&1 || base="$EMPTY_TREE"
+    git -C "$REPO_ROOT" diff --name-only "$base" "$loid" 2>/dev/null || true
+  done <<< "$STDIN_DATA"
+}
+
+# ---- Static-analysis gate ----------------------------------------------------
+# A push that adds or changes kernel or loader C sources has those sources
+# analysed as they are in the pushed commit, and is refused on a finding
+# (scripts/hooks/static-analysis-gate.sh). Costs nothing when no source changed.
+_sa_seen="$(mktemp -t static-analysis-seen.XXXXXX)" || exit 1
+trap 'rm -f "$_sa_seen"' EXIT
+while read -r _salref _saloid _sarref _saroid; do
+  [ -n "${_saloid:-}" ] || continue
+  STATIC_ANALYSIS_GATE_SEEN="$_sa_seen" bash "$REPO_ROOT/scripts/hooks/static-analysis-gate.sh" \
+      "${1:-origin}" "$_saloid" "${_saroid:-0}" || { rm -f "$_sa_seen"; exit 1; }
+done <<< "$STDIN_DATA"
+rm -f "$_sa_seen"
+
+# ---------------------------------------------------------------------------
+# Tooling-suite gate. `scripts/test-tooling.sh` is invoked from exactly ONE
+# place in the repo -- .github/workflows/build.yml -- so a tooling script and
+# the test that covers it could diverge with every LOCAL gate green, and the
+# divergence only surfaced as a red CI run the next segment had to repair
+# before doing any section work. Measured 2026-08-05: Check 7's new coverage
+# line printed on stdout, which lint.sh routes through error(), and CI went red
+# for 4 commits before anyone saw it; the run's first act was a CI repair
+# instead of section work, ~10 min plus a 1287-test re-run.
+#
+# CONDITIONAL, because the suite costs ~6 minutes: it fires only when the push
+# touches what the suite actually covers. An unconditional pre-push run would
+# tax every docs commit and would simply be disabled.
+TOOLING_PATHS_RE='^(scripts/lint/|scripts/todo-graph/|scripts/test-tooling\.sh|\.claude/hooks/)'
+# HOST GATES. The gates under tools/ compile kernel and loader sources, so a source
+# change can break them while the tooling trigger above stays silent; that cost
+# three red `Build` runs on 2026-11-07. About 5 s, so it needs no receipt.
+HOST_GATE_PATHS_RE='^(src/|include/|tools/)'
+if [ "${SKIP_HOST_GATES:-0}" != "1" ] && pushed_files | sort -u | grep -qE "$HOST_GATE_PATHS_RE"; then
+  echo ""
+  echo "Pre-push: kernel, loader or tools change in this push -- running the host gates."
+  if ! bash "$REPO_ROOT/scripts/host-gates.sh" "$REPO_ROOT"; then
+    echo "Pre-push: a host gate failed. CI would go red on this push (SKIP_HOST_GATES=1 to override)." >&2
+    exit 1
+  fi
+fi
+
+# A Check 7 baseline bump alone is not a tooling change. A docs section that
+# ticks a satisfied item moves the stub-lint `total`, and the sanctioned repair
+# edits only this data file -- which then pulled the whole pack in behind the
+# push (~15-23 min each, twice in the 2026-09-28 canary). Nothing in the pack
+# reads its tracked numbers (the one real-baseline fixture derives them from the
+# cache), the pre-commit lint already validates it against the corpus, and CI
+# still runs the full pack. Any OTHER tooling path in the same push still gates.
+TOOLING_EXEMPT_RE='^scripts/lint/stub-lint-baseline\.json$'
+TOOLING_HITS="$(pushed_files | sort -u | grep -E "$TOOLING_PATHS_RE" | grep -vE "$TOOLING_EXEMPT_RE" || true)"
+# The pack also reads the TEXT of some kernel, loader and user sources. A push
+# that changes one of those can fail the pack while touching no tooling path:
+# 0fd8bf1c0 moved one expression in test_usermode.c and CI's tooling job went
+# red (2026-11-11). Such a push gates on the pack too; with no tooling path in
+# it the nested suites are unreachable and only the inline checks run.
+TOOLING_READS="$(bash "$REPO_ROOT/scripts/hooks/tooling-pack-reads.sh" "$REPO_ROOT/scripts/test-tooling.sh")" || {
+  echo "Pre-push: the tooling pack's source reads could not be listed; refusing rather than guessing." >&2
+  exit 1
+}
+if [ -n "$TOOLING_READS" ]; then
+  TOOLING_READ_HITS="$(pushed_files | sort -u | grep -Fx -f <(printf '%s\n' "$TOOLING_READS") || true)"
+  TOOLING_HITS="$(printf '%s\n%s\n' "$TOOLING_HITS" "$TOOLING_READ_HITS" | sed '/^$/d' | sort -u)"
+fi
+# CI RUNS THE PACK; THE PUSH DOES NOT WAIT FOR IT (operator decision 2026-11-13,
+# todo/answers.md Q40). build.yml runs this same pack on the same commit, and a
+# section is not finished until `scripts/overnight/ci-wait.py` reports that
+# commit green, so running it here only doubled a 15-minute wait on every push
+# (measured 2026-11-12: about 20 minutes of local gates per push, then CI ran
+# the same pack again). A red pack now shows as a red CI the run fixes before
+# any other work. Run it here with PRE_PUSH_TOOLING=1, for example while
+# repairing the pack itself.
+if [ -n "$TOOLING_HITS" ] && [ "${PRE_PUSH_TOOLING:-0}" != "1" ]; then
+  echo ""
+  echo "Pre-push: tooling change in this push; CI runs scripts/test-tooling.sh on it"
+  echo "  (watch it with scripts/overnight/ci-wait.py; PRE_PUSH_TOOLING=1 runs it here first)."
+elif [ -n "$TOOLING_HITS" ]; then
+  echo ""
+  echo "Pre-push: tooling change in this push -- gating on scripts/test-tooling.sh:"
+  printf '%s\n' "$TOOLING_HITS" | sort -u | head -6 | sed 's/^/  touched: /'
+  # A GREEN RUN ON EXACTLY THESE BYTES ALREADY HAPPENED -> do not pay for it
+  # twice. `scripts/tooling-receipt.py` hashes the whole tooling surface
+  # (tracked AND untracked), the suite writes the receipt only when it finished
+  # with zero failures and its inputs did not move mid-run, and `check` fails
+  # CLOSED on every other state -- no receipt, unreadable, stale key. So the
+  # only way past this branch is evidence that these exact bytes passed.
+  #
+  # Measured 2026-08-08: the suite ran green, then this gate ran the identical
+  # 1300 tests over the identical tree and was killed at the 10-minute tool
+  # wall. This is NOT `SKIP_TOOLING_SUITE` by another name -- that flag skips
+  # the run on an assertion, this skips it on a content-bound receipt, and any
+  # edit to any tooling file invalidates it.
+  #
+  # `--commit <local oid>` (2026-08-10) asks the SECOND question when the first
+  # fails: the worktree has moved, but does the receipt describe the surface AS
+  # COMMITTED in the thing being pushed? The run backgrounds its ship push and
+  # keeps working, so by the time this gate evaluates, its own later edits have
+  # moved the worktree key -- invalidating a receipt that still validly attests
+  # the pushed bytes, and paying the six minutes inside the push anyway. Passing
+  # the oid is strictly ADDITIVE: without it `check` keeps its exact prior
+  # semantics, and with it a pass means the suite ran on bytes byte-identical to
+  # the commit. Untracked files can never match a commit key, so they fall
+  # through to running the suite.
+  PUSHED_OID=""
+  while read -r _l _loid _r _roid; do
+    [ -n "${_loid:-}" ] || continue
+    case "$_loid" in *[!0]*) PUSHED_OID="$_loid"; break ;; esac
+  done <<< "$STDIN_DATA"
+  # SCOPED RUN (2026-08-10). Hand the suite the exact set of files this push
+  # changes so it can skip NESTED suites that set provably cannot reach --
+  # measured, `test_build.sh` is 252s and `test_bridge.sh` 219s of a ~790s pack,
+  # and a push touching only `.claude/hooks/` reaches neither. That 471s is what
+  # took the stack past the 10-minute tool wall and killed two pushes on
+  # 2026-08-10. The suite DEFAULTS to running everything when this file is absent
+  # or unreadable, so CI (which passes nothing) is untouched and a scoping bug
+  # costs time, never coverage. Skips are printed in the suite's own summary, so
+  # a scoped run can never be mistaken for a full one.
+  TT_CHANGED="$(mktemp -t prepush-changed.XXXXXX 2>/dev/null || echo "")"
+  if [ -n "$TT_CHANGED" ]; then
+    pushed_files | sort -u > "$TT_CHANGED" 2>/dev/null || : > "$TT_CHANGED"
+  fi
+  if [ "${SKIP_TOOLING_SUITE:-}" != "1" ] \
+     && [ -f "$REPO_ROOT/scripts/tooling-receipt.py" ] \
+     && python3 "$REPO_ROOT/scripts/tooling-receipt.py" check --project "$REPO_ROOT" \
+          ${PUSHED_OID:+--commit "$PUSHED_OID"} 2>/dev/null; then
+    echo -e "\033[32m  receipt: a green tooling suite already ran on these exact bytes -- not re-running\033[0m"
+    echo "  (any edit to scripts/, .claude/hooks/, .githooks/, workflows or CLAUDE.md invalidates it)"
+  elif [ "${SKIP_TOOLING_SUITE:-}" = "1" ]; then
+    # Skips the RUN, not just a failure. The sibling runner-suite gate can
+    # afford failure-only semantics because run-all.sh takes seconds; this
+    # suite takes ~6 minutes, and a gate that cannot be skipped on a known-good
+    # push is one that gets disabled wholesale. Measured immediately: it timed
+    # out the very push that introduced it.
+    echo -e "\033[33m  SKIP_TOOLING_SUITE=1 set -- tooling suite not run\033[0m"
+  elif ! TEST_TOOLING_CHANGED_PATHS="$TT_CHANGED" \
+         bash "$REPO_ROOT/scripts/hooks/heavy.sh" bash "$REPO_ROOT/scripts/test-tooling.sh" --quiet; then
+    rm -f "$TT_CHANGED" 2>/dev/null || true
+    echo ""
+    echo -e "\033[31mTooling suite failed -- push blocked\033[0m"
+    echo "  A tooling change did not pass scripts/test-tooling.sh, which until"
+    echo "  now ran ONLY in CI. Fix it here rather than discovering it as a red"
+    echo "  build the next run has to repair before it can work."
+    echo "  Opt-out (last resort): SKIP_TOOLING_SUITE=1 git push ..."
+    exit 1
+  fi
+  # Every path out of the branch above except `exit 1` lands here, including the
+  # receipt short-circuit and the SKIP_TOOLING_SUITE branch that never used the
+  # file. Removing it in the failure branch alone leaked one temp file per
+  # successful push.
+  rm -f "$TT_CHANGED" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# RESOLVER IDENTITY GATE, LOCALLY (section 39).
+#
+# WHY THIS EXISTS. `scripts/todo-graph/identity-gate.sh` was invoked from
+# exactly ONE place in the repo -- .github/workflows/todo-graph.yml -- so it was
+# the last CI-only gate of its class, and it failed exactly as the tooling suite
+# used to: main went red on 2026-08-10 (runs 31381391940, 31388159279) having
+# passed every local gate, because nothing local runs it. The Test 22 fixtures in
+# scripts/todo-graph/tests/test_build.sh do exercise its LOGIC against synthetic
+# clones -- but only under test-tooling.sh, and never over the REAL base..head
+# range, which is the only place a corpus-vs-producer interaction can appear.
+#
+# THE BASE IS THE REMOTE OID, and that is the right range rather than a
+# convenience. git hands pre-push the remote's current oid per ref, which is
+# precisely "what main already has" -- so the gate adjudicates exactly the
+# commits about to land. It is also strictly conservative against CI's own base
+# (the last SUCCESSFULLY GATED sha, which can be further back): a range this
+# gate passes may still be re-examined server-side over a wider one, and never
+# the reverse.
+#
+# CONDITIONAL ON THE CLOSURE, which costs ~0 on ordinary pushes: this is the
+# gate's OWN early-exit condition, so a push that does not touch the closure
+# would exit 0 within a second anyway. Firing only on closure changes just skips
+# paying process startup for it.
+IDENTITY_CLOSURE_RE='^scripts/todo-graph/(corpus_resolution_snapshot|ref_resolution|resolve_symbol|cache_schema|build|snapshot_protocol|producer_differential)\.py$|^scripts/todo-graph/identity-gate\.sh$|^scripts/todo-graph/snapshot_protocol\.json$|^scripts/lint/check_bucket_emission\.py$'
+IDENTITY_HITS="$(pushed_files | sort -u | grep -E "$IDENTITY_CLOSURE_RE" || true)"
+if [ -n "$IDENTITY_HITS" ]; then
+  echo ""
+  echo "Pre-push: resolver-closure change in this push -- gating on identity-gate.sh:"
+  printf '%s\n' "$IDENTITY_HITS" | sort -u | sed 's/^/  touched: /'
+  # v17 close-out (2026-08-29): this branch used to be conditioned on `-x`, so a
+  # push that flipped the gate to 100644 alongside a real closure change
+  # satisfied IDENTITY_HITS, failed -x, and SKIPPED THE WHOLE BLOCK SILENTLY --
+  # indistinguishable from "no closure change". The gate is always invoked
+  # through `bash` (the mode is irrelevant to what executes, exactly as CI
+  # does at todo-graph.yml), and a gate that cannot run REFUSES rather than
+  # declining quietly.
+  IDENTITY_GATE_SH="$REPO_ROOT/scripts/todo-graph/identity-gate.sh"
+  if [ ! -f "$IDENTITY_GATE_SH" ]; then
+    echo -e "\033[31m  identity-gate.sh is missing from this checkout -- refusing to push a closure change ungated\033[0m"
+    echo "  Opt-out (last resort): SKIP_IDENTITY_GATE=1 git push ..."
+    exit 1
+  fi
+  # The FIRST non-deleting ref update's remote oid. A push updating several refs
+  # is not a shape this repo makes (main-only, enforced above), and picking one
+  # deterministically beats gating an ambiguous union.
+  # ... and that same update's LOCAL oid is the HEAD the gate must adjudicate.
+  # Without `--head` the gate defaults to the checkout's HEAD, which during an
+  # interrupted rebase is a detached replayed commit while `refs/heads/main`
+  # still names the tip being pushed (v17 close-out, 2026-08-29). The gate must
+  # NOT be "fixed" by refusing a detached HEAD: actions/checkout leaves CI
+  # detached by design. The caller simply tells it which commit.
+  IDENTITY_BASE=""
+  IDENTITY_HEAD=""
+  while read -r _l loid _r roid; do
+    [ -n "${loid:-}" ] || continue
+    case "$loid" in *[!0]*) : ;; *) continue ;; esac
+    IDENTITY_HEAD="${IDENTITY_HEAD:-$loid}"
+    case "${roid:-}" in *[!0]*) IDENTITY_BASE="$roid"; break ;; esac
+  done <<< "$STDIN_DATA"
+  if [ "${SKIP_IDENTITY_GATE:-}" = "1" ]; then
+    echo -e "\033[33m  SKIP_IDENTITY_GATE=1 set -- resolver identity gate not run\033[0m"
+  elif [ -z "$IDENTITY_BASE" ] \
+       || ! git -C "$REPO_ROOT" rev-parse --quiet --verify "$IDENTITY_BASE^{commit}" >/dev/null 2>&1; then
+    # A FIRST PUSH of a ref has no remote oid, and there is then no local range
+    # to adjudicate. Say so rather than substituting HEAD~1: a base nobody chose
+    # answers a different question than the one this gate was asked, which is the
+    # exact failure identity-gate.sh's own --base handling was hardened against.
+    echo -e "\033[33m  no remote oid for this ref (first push?) -- no local range to gate; CI will adjudicate\033[0m"
+  elif ! IDENTITY_GATE_LAST_GATED_SHA="$IDENTITY_BASE" \
+         bash "$IDENTITY_GATE_SH" ${IDENTITY_HEAD:+--head "$IDENTITY_HEAD"}; then
+    echo ""
+    echo -e "\033[31mResolver identity gate failed -- push blocked\033[0m"
+    echo "  A resolver/producer change did not pass scripts/todo-graph/identity-gate.sh,"
+    echo "  which until now ran ONLY in CI. Fix it here rather than discovering it"
+    echo "  as a red main the next session has to repair before doing any work."
+    echo "  Opt-out (last resort): SKIP_IDENTITY_GATE=1 git push ..."
+    exit 1
+  fi
+fi
+
+CP_MATCH="$REPO_ROOT/scripts/overnight/control-plane-match.sh"
+if [ -f "$CP_MATCH" ]; then
+  CP_HITS="$(pushed_files | sort -u | bash "$CP_MATCH" || true)"
+  if [ -n "$CP_HITS" ]; then
+    echo ""
+    echo "Pre-push: control-plane change in this push -- gating on the runner suite:"
+    printf '%s\n' "$CP_HITS" | sort -u | sed 's/^/  touched: /'
+    if ! bash "$REPO_ROOT/scripts/overnight/tests/run-all.sh"; then
+      echo ""
+      echo -e "\033[31mRunner test suite failed -- push blocked\033[0m"
+      echo "  A control-plane change did not pass the overnight-runner tests."
+      echo "  Opt-out (last resort): SKIP_RUNNER_SUITE=1 git push ..."
+      [ "${SKIP_RUNNER_SUITE:-}" = "1" ] || exit 1
+      echo -e "\033[33m  SKIP_RUNNER_SUITE=1 set -- suite failure overridden\033[0m"
+    fi
+    # runner-doctor is ADVISORY here: it reports LOCAL host health (toolchain,
+    # codex auth, run state), which is not a property of the change being
+    # pushed, so it must not block the push -- it only surfaces warnings.
+    DOCTOR="$REPO_ROOT/scripts/overnight/runner-doctor.py"
+    if [ -f "$DOCTOR" ]; then
+      if DOUT="$(cd "$REPO_ROOT" && python3 "$DOCTOR" . 2>&1)"; then
+        echo "  runner-doctor: OK"
+      else
+        echo -e "\033[33m  runner-doctor reports host-health issues (advisory, not blocking):\033[0m"
+        printf '%s\n' "$DOUT" | tail -8 | sed 's/^/    /'
+      fi
+    fi
+  fi
+fi
+
+# True when an unattended run is LIVE and has uncommitted work in the tree.
+#
+# Both halves are required. A run that is live but between sections leaves a
+# clean tree, and the gate can verify the commit correctly then -- refusing
+# would be pure friction. It is only when foreign work is IN the tree that a
+# build here stops testing what is being pushed.
+#
+# Liveness is probed by trying to take the launcher's flock, not by testing
+# that the file exists: `.claude/overnight/launch.lock` outlives a disarm, so
+# existence alone would refuse every push forever after the first run.
+_run_owns_tree() {
+  local root="$1" active=0
+  local lock="$root/.claude/overnight/launch.lock"
+  local state="$root/.claude/state/sequencer-run.json"
+  if [ -f "$lock" ] && command -v flock >/dev/null 2>&1; then
+    flock -n "$lock" true 2>/dev/null || active=1     # cannot take it => held
+  fi
+  if [ "$active" = "0" ] && [ -f "$state" ]; then
+    grep -q '"active"[[:space:]]*:[[:space:]]*true' "$state" 2>/dev/null && active=1
+  fi
+  [ "$active" = "1" ] || return 1
+  [ -n "$(git -C "$root" status --porcelain 2>/dev/null | head -1)" ] || return 1
+  return 0
+}
+
+# ---- REQUIRED CI-parity gate -------------------------------------------------
+#
+# Runs the unit suite on the engine CI actually uses -- the distro apt QEMU with
+# forced TCG -- before anything leaves the machine.
+#
+# This is NOT the opt-in heavy gate below, and it is deliberately not opt-in.
+# That one is optional because "CI already gates PRs", an assumption this repo
+# proved false: a fork+exec frame-handoff bug rode 297 commits and a green local
+# suite into a red CI job, because it only reproduced on the QEMU CI installs.
+# The dev host runs a custom /usr/local build and never saw it. A gate that only
+# runs what already passes is not a gate.
+#
+# Cost measured 2026-07-27: 23.8s CI-parity vs 25.6s for the default KVM run --
+# indistinguishable, and marginally FASTER. There is no speed argument for
+# skipping it, so it is required rather than opt-in. The KVM inner loop is
+# untouched; this is a separate tier that runs once, at the push boundary.
+#
+# Opt-out stays available for a genuine emergency and is logged like every other
+# skip: SKIP_CI_PARITY=1 git push ...
+if [ "${SKIP_CI_PARITY:-}" = "1" ]; then
+  # UNATTENDED: a REASON is mandatory (2026-07-31). Interactively the operator
+  # is present and accountable, so the reason stays optional and the log entry
+  # is enough. In the headless run nobody is present, "(none given)" is the
+  # value that actually gets recorded, and a skip nobody can later justify is
+  # indistinguishable from a gate that silently stopped working. Refusing the
+  # PUSH rather than ignoring the skip is deliberate: silently running the gate
+  # the run asked to skip would surprise it at 03:00 with a compile it did not
+  # budget for.
+  if [ "${OVERNIGHT_SEQUENCER_RUN:-}" = "1" ] && [ -z "${SKIP_CI_PARITY_REASON:-}" ]; then
+    {
+      echo "[pre-push] REFUSED: SKIP_CI_PARITY=1 requires SKIP_CI_PARITY_REASON in the unattended run."
+      echo "  An unattended skip with no stated reason cannot be audited later."
+      echo "  Re-run as: SKIP_CI_PARITY=1 SKIP_CI_PARITY_REASON='<why>' git push ..."
+      echo "  Or drop the skip and let the CI-parity gate run."
+    } >&2
+    exit 1
+  fi
+  echo -e "\033[33m[pre-push] SKIP_CI_PARITY=1 -- CI-parity gate skipped\033[0m"
+  # Logged, not silent. An override that leaves no trace is indistinguishable
+  # from a gate that never ran, and this repo has a standing problem with
+  # reflexive skip-flag use -- the habit the guardrails exist to prevent. Same
+  # skip-log the review-gate opt-outs write to, so "how often was this bypassed"
+  # is one query rather than an act of memory. Never fails the push: a logging
+  # problem must not become a push problem.
+  python3 - <<'PYSKIP' 2>/dev/null || true
+import json, os, subprocess, time
+root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                      capture_output=True, text=True).stdout.strip()
+if root:
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                          capture_output=True, text=True).stdout.strip()
+    path = os.path.join(root, ".claude", "state", "skip-log.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "timestamp_ns": time.time_ns(),
+            "kind": "ci-parity",
+            "mode": "SKIP_CI_PARITY",
+            "reason": os.environ.get("SKIP_CI_PARITY_REASON", "(none given)"),
+            "head_sha": head,
+        }) + "\n")
+PYSKIP
+elif [ "${OVERNIGHT_SEQUENCER_RUN:-}" != "1" ] && _run_owns_tree "$REPO_ROOT"; then
+  # OPERATOR PUSHING WHILE AN UNATTENDED RUN HOLDS THE TREE (2026-07-28).
+  #
+  # The gate compiles the WORKING TREE, not the commit being pushed. With a
+  # section half-written in it the build fails on the RUN's in-flight code and
+  # the operator sees `[FAIL] Build failed` naming their own push -- a
+  # markdown-only commit was refused exactly this way. Two things were wrong
+  # with that: the message blamed the wrong change, and when the run's in-flight
+  # code HAPPENS to compile the gate passes while having verified something
+  # other than what is being pushed.
+  #
+  # Refusing here (rather than skipping) keeps the gate's guarantee intact --
+  # nothing unverified leaves the machine -- while making the reason legible
+  # and the exits obvious.
+  #
+  # THE RUN ITSELF PUSHES at every section ship, so exempting it is
+  # load-bearing, not a nicety: without the OVERNIGHT_SEQUENCER_RUN check this
+  # branch would refuse the run's own ship pushes and wedge it at the first
+  # section. Same discriminator run_phase_guard.is_headless() uses.
+  echo -e "\033[33m[pre-push] REFUSED: an overnight run owns this working tree.\033[0m"
+  echo "  The CI-parity gate compiles the WORKING TREE, and the run has work in"
+  echo "  flight, so a build here tests the run's half-written code, not your"
+  echo "  commit. A failure would name your push and mean nothing."
+  echo ""
+  echo "  In flight right now:"
+  git -C "$REPO_ROOT" status --porcelain 2>/dev/null | head -6 | sed 's/^/    /'
+  _dirty_n="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${_dirty_n:-0}" -gt 6 ] && echo "    ... (+$((_dirty_n - 6)) more)"
+  echo ""
+  echo "  Push at a rollover boundary instead -- the run's tree is clean there,"
+  echo "  and its own ship push carries your commits out with it anyway."
+  echo "  Check:  python3 .claude/hooks/run_phase_guard.py status"
+  echo "  Or override, accepting that the gate verified nothing:"
+  echo "          SKIP_CI_PARITY=1 SKIP_CI_PARITY_REASON='run owns tree' git push ..."
+  exit 1
+elif [ ! -x /usr/bin/qemu-system-x86_64 ]; then
+  echo -e "\033[33m[pre-push] CI-parity gate SKIPPED: /usr/bin/qemu-system-x86_64 absent\033[0m"
+  echo "           CI runs 'apt-get install qemu-system-x86'; install it to enable the gate."
+else
+  echo "[pre-push] CI-parity gate: unit suite on the QEMU CI installs (forced TCG)..."
+  # Serialize against the post-commit test hook on the SHARED lock.
+  #
+  # Both run scripts/test.sh, which patches boot.conf and launches QEMU, and the
+  # overnight sequencer does commit-then-push back to back: the post-commit hook
+  # would still be mid-run (it holds this lock) when the push fires. Two
+  # concurrent runs race on the same boot.conf -- one finishing restores the
+  # file out from under the other mid-boot -- which is the sort of intermittent
+  # failure that is miserable to diagnose at 3am and trivial to prevent here.
+  #
+  # Waits rather than skips: the other run is ~25s, and its engine is KVM, so it
+  # does NOT substitute for this one. Same lock path (and env override) as
+  # .claude/hooks/_postcommit_lock.py so the two agree on what they serialize.
+  # On timeout the gate SKIPS with a warning rather than failing -- a stuck lock
+  # must not wedge an unattended run's push, and something else is demonstrably
+  # testing this tree if the lock is still held ten minutes on.
+  #
+  # The lock is taken INSIDE the queued job, never before it: a push that held
+  # it through a bosun queue wait would hold it while nothing tested, and a
+  # second push would then time out on it and skip, which is exactly the case
+  # the "a held lock means something is testing" reasoning above excludes.
+  # flock exits 75 when the wait times out, so a timeout stays a skip and a
+  # failed suite stays a failure.
+  CI_PARITY_LOCK="${IMPOSSIBLE_OS_POSTCOMMIT_LOCK:-/tmp/impossible-os-postcommit.lock}"
+  CI_PARITY_LOCKED=()
+  if command -v flock >/dev/null 2>&1; then
+    CI_PARITY_LOCKED=(flock -E 75 -w 600 "$CI_PARITY_LOCK")
+  fi
+  (cd "$REPO_ROOT" && CI_PARITY=1 bash scripts/hooks/heavy.sh "${CI_PARITY_LOCKED[@]}" \
+      bash scripts/test.sh QUIET=1 >/tmp/ci-parity-prepush.log 2>&1)
+  CI_PARITY_RC=$?
+  if [ "$CI_PARITY_RC" = "0" ]; then
+    echo -e "\033[32m  CI-parity: PASS\033[0m"
+  elif [ "$CI_PARITY_RC" = "75" ] && [ "${#CI_PARITY_LOCKED[@]}" -gt 0 ]; then
+    echo -e "\033[33m  CI-parity SKIPPED: another test run held $CI_PARITY_LOCK for 600s\033[0m"
+  else
+    echo -e "\033[31m  CI-parity gate FAILED -- this is what CI would have reported.\033[0m"
+    tail -15 /tmp/ci-parity-prepush.log | sed 's/^/    /'
+    echo "  Full log: /tmp/ci-parity-prepush.log"
+    echo "  Opt-out (last resort): SKIP_CI_PARITY=1 git push ..."
+    exit 1
+  fi
+fi
+
+# ---- Opt-in heavy build/test gate --------------------------------------------
+[ -f "$SENTINEL" ] || exit 0
+exec "$REPO_ROOT/scripts/hooks/pre-push" "$@" <<< "$STDIN_DATA"

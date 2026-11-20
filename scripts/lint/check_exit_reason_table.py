@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Lint Check 39: a reserved exit reason is declared only in TASK_EXIT_REASONS.
+
+include/kernel/sched/task.h generates every reserved exit reason, its count,
+_LAST and the classifier bounds from one X-macro table. A reason declared
+anywhere else (a `#define TASK_EXIT_X (TASK_EXIT_REASON_LAST - 1)`, an enum
+or const) builds clean and classifies as an ordinary application status,
+which is the defect the table exists to make impossible.
+
+The table therefore defines the WHOLE `TASK_EXIT_*` namespace: one name per
+row plus the table's own machinery. Any other `TASK_EXIT_*` identifier in the
+code, declared or used, in any declaration form, is a finding. No declaration
+syntax is parsed, so attributes, parenthesised declarators and implicit
+enumerators need no special case.
+
+Identifiers are read after C translation phases 2 and 3 (splices removed,
+then each comment one space, literals emptied), so a comment or string that
+mentions a name is not code and a name split by a continuation is still found.
+A name BUILT by token pasting is out of scope; the table's own row asserts and
+review own that.
+
+    check_exit_reason_table.py --root <repo>   exit 1 on any such declaration
+    check_exit_reason_table.py --control       exit 1 unless the built-in
+                                               fixture is judged as marked
+    check_exit_reason_table.py <file>...       check these files only
+"""
+import os
+import re
+import sys
+
+# The table's own machinery: the base, the table, its count and _LAST, the X
+# helpers and the row-position enum prefix the table pastes.
+MACHINERY = {
+    "TASK_EXIT_REASON_BASE", "TASK_EXIT_REASONS", "TASK_EXIT_REASON_LAST",
+    "TASK_EXIT_REASON_COUNT", "TASK_EXIT_REASON_CONST", "TASK_EXIT_REASON_ROW",
+    "TASK_EXIT_REASON_ROW_", "TASK_EXIT_REASON_ORD_CHECK", "TASK_EXIT_REASON_NAME",
+    "TASK_EXIT_",  # the prefix TASK_EXIT_##name pastes each row name onto
+}
+TABLE_H = os.path.join("include", "kernel", "sched", "task.h")
+IDENT = re.compile(r"\bTASK_EXIT_[A-Za-z0-9_]*")
+# Matched on TRANSLATED text, where the table's splices are gone and a
+# commented-out row is a space: only a row the compiler sees counts. A
+# definition is counted by NAME alone, whatever its parameter spelling, so no
+# second copy can hide from the one-table rule.
+TABLE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+TASK_EXIT_REASONS\b([^\n]*)", re.M)
+PARAMS = re.compile(r"\([ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\)(.*)")
+
+
+def translate(text):
+    """Apply C translation phases 2 and 3 as far as this check needs them.
+
+    Phase 2 deletes every backslash-newline, so a splice can fall inside a
+    directive name or an identifier (`#defi\\<newline>ne`). Phase 3 then turns
+    each comment into ONE space, newlines included, so a comment cannot end a
+    directive line. String and character literals are copied through, so a
+    comment marker inside one is not a comment. Returns the translated text and,
+    for each of its characters, the 1-based source line it came from.
+    """
+    spliced, lines, line = [], [], 1
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] == "\n":
+            i += 2
+            line += 1
+            continue
+        spliced.append(text[i])
+        lines.append(line)
+        if text[i] == "\n":
+            line += 1
+        i += 1
+    src = "".join(spliced)
+    out, origin = [], []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if src.startswith("/*", i):
+            end = src.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append(" ")
+            origin.append(lines[i])
+            i = end
+        elif src.startswith("//", i):
+            end = src.find("\n", i)
+            end = n if end < 0 else end
+            out.append(" ")
+            origin.append(lines[i])
+            i = end
+        elif c in "\"'":
+            j = i + 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j = min(j + 1, n)
+            # The contents never declare anything: keep an empty literal.
+            out.append(c + c)
+            origin.extend((lines[i], lines[j - 1]))
+            i = j
+        else:
+            out.append(c)
+            origin.append(lines[i])
+            i += 1
+    return "".join(out), origin
+
+
+def tables(body):
+    """Each TASK_EXIT_REASONS definition in translated text: its row names, or
+    None for a definition whose parameter list this check cannot read (which
+    fails closed rather than being skipped)."""
+    out = []
+    for m in TABLE.finditer(body):
+        pm = PARAMS.match(m.group(1))
+        if not pm:
+            out.append(None)
+            continue
+        row = re.compile(r"\b" + re.escape(pm.group(1)) + r"[ \t]*\([ \t]*([A-Za-z0-9_]+)[ \t]*,")
+        out.append({"TASK_EXIT_" + r for r in row.findall(pm.group(2))})
+    return out
+
+
+def scan(text):
+    """Translate a file once; its body and line map, or None when it cannot
+    name the namespace (the fast rejection, done after splice removal)."""
+    if "TASK_EXIT_" not in text.replace("\\\n", ""):
+        return None
+    return translate(text)
+
+
+def findings(scanned, path, allowed):
+    body, origin = scanned
+    out = []
+    for m in IDENT.finditer(body):
+        if m.group(0) in allowed:
+            continue
+        out.append(f"{path}:{origin[m.start()]}: {m.group(0)} is not a TASK_EXIT_REASONS row "
+                   f"(add it as a row in {TABLE_H})")
+    return out
+
+
+def judge(texts):
+    """Findings for {path: text}. Exactly ONE table definition may exist among
+    them: a second copy (in `#if 0`, a test header, anywhere) could otherwise
+    authorise rows the compiled table does not have, and choosing between two
+    would need the preprocessor's view of which is live."""
+    scanned = {p: scan(t) for p, t in texts.items()}
+    scanned = {p: v for p, v in scanned.items() if v is not None}
+    defs = [(p, rows) for p, (body, _o) in scanned.items() for rows in tables(body)]
+    if len(defs) != 1:
+        where = ", ".join(p for p, _r in defs) or "none of the files checked"
+        return None, [f"expected exactly one TASK_EXIT_REASONS definition, found {len(defs)} ({where})"]
+    if defs[0][1] is None:
+        return None, [f"{defs[0][0]}: TASK_EXIT_REASONS is not defined as a one-parameter table"]
+    allowed = MACHINERY | defs[0][1]
+    out = []
+    for p, v in scanned.items():
+        out += findings(v, p, allowed)
+    return allowed, out
+
+
+# A table, then one name that is not in it per bypass shape: a #define and
+# enumerators in any layout, an attributed and a parenthesised declarator, an
+# implicit enumerator, a use with no declaration, a splice inside the name,
+# and a name whose only row is commented out.
+CONTROL_TABLE = """\
+#define TASK_EXIT_REASONS(X) \\
+    X(KNOWN_A, 1) \\
+    X(KNOWN_B, 2) \\
+    /* X(UTEST_PROBE9, 3) reserved for later */
+"""
+CONTROL_BAD = CONTROL_TABLE + """\
+#define TASK_EXIT_UTEST_PROBE (TASK_EXIT_REASON_LAST - 1)
+enum { TASK_EXIT_UTEST_PROBE2
+       = TASK_EXIT_REASON_BASE - 9 };
+static const int TASK_EXIT_UTEST_PROBE3 __attribute__((unused)) = -1007;
+static const int (TASK_EXIT_UTEST_PROBE4) = -1007;
+enum { anchor = TASK_EXIT_REASON_LAST - 2, TASK_EXIT_UTEST_PROBE5 };
+#define /* a reason
+   spread over lines */ TASK_EXIT_UTEST_PROBE6 (-1006)
+if (s == TASK_EXIT_UTEST_PROBE7) return;
+#define TASK_EXIT_\\
+UTEST_PROBE8 (-1006)
+#define TASK_EXIT_UTEST_PROBE9 (TASK_EXIT_REASON_LAST - 1)
+"""
+CONTROL_BAD_COUNT = 9
+# A second definition, inactive or not and however its parameters are
+# spelled, is refused outright; so is one whose parameters cannot be read.
+CONTROL_TWICE = CONTROL_TABLE + """\
+#if 0
+#define TASK_EXIT_REASONS( Y ) Y(KNOWN_A, 1) Y(UTEST_PROBE10, 2)
+#endif
+"""
+CONTROL_UNREAD = """\
+#define TASK_EXIT_REASONS X(KNOWN_A, 1)
+"""
+CONTROL_GOOD = CONTROL_TABLE + """\
+#define TASK_EXIT_REASON_BASE (-1000)
+#define TASK_EXIT_REASON_CONST(name, ord) TASK_EXIT_##name = TASK_EXIT_REASON_BASE - (ord),
+#define TASK_EXIT_REASON_LAST (TASK_EXIT_REASON_BASE - TASK_EXIT_REASON_COUNT)
+if (status == TASK_EXIT_KNOWN_A) t->exit_status = TASK_EXIT_KNOWN_B;
+/* TASK_EXIT_ONLY_IN_A_COMMENT */
+klog(LOG_INFO, "TASK_EXIT_ONLY_IN_A_STRING");
+"""
+
+
+def tree_files(root):
+    for top in ("include", "src", "user"):
+        for d, _dirs, files in os.walk(os.path.join(root, top)):
+            for f in files:
+                if f.endswith((".c", ".h")):
+                    yield os.path.join(d, f)
+
+
+def read(p):
+    with open(p, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def main(argv):
+    if argv[1:] == ["--control"]:
+        _a, bad = judge({"control-bad": CONTROL_BAD})
+        _a, good = judge({"control-good": CONTROL_GOOD})
+        _a, twice = judge({"control-twice": CONTROL_TWICE})
+        _a, unread = judge({"control-unread": CONTROL_UNREAD})
+        _a, spaced = judge({"control-spaced": CONTROL_TABLE.replace("(X)", "( X )")
+                            + "#define TASK_EXIT_UTEST_PROBE11 (-1006)\n"})
+        if len(bad) == CONTROL_BAD_COUNT and not good and len(twice) == 1 \
+                and "exactly one" in twice[0] and len(unread) == 1 \
+                and "one-parameter" in unread[0] and len(spaced) == 1 \
+                and "PROBE11" in spaced[0]:
+            return 0
+        print(f"control misjudged: {len(bad)} of {CONTROL_BAD_COUNT} names flagged, "
+              f"{len(good)} false positives, second table: {twice}, "
+              f"unreadable table: {unread}, spaced parameter: {spaced}", file=sys.stderr)
+        return 1
+    if argv[1:2] == ["--root"] and len(argv) == 3:
+        root = argv[2]
+        paths = list(tree_files(root))
+    elif len(argv) > 1 and not argv[1].startswith("-"):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        paths = argv[1:]
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    # A mutant header passed by name carries its own table; otherwise the
+    # tree's task.h supplies it (and in --root mode it is one of the paths).
+    texts, out = {}, []
+    for p in paths:
+        try:
+            texts[p] = read(p)
+        except OSError as e:
+            out.append(f"{p}: unreadable: {e}")
+    canonical = os.path.normpath(os.path.join(root, TABLE_H))
+    if canonical not in map(os.path.normpath, texts) and not any(
+            "TASK_EXIT_REASONS" in t.replace("\\\n", "") for t in texts.values()):
+        try:
+            texts[canonical] = read(canonical)
+        except OSError as e:
+            out.append(f"{canonical}: unreadable: {e}")
+    _allowed, found = judge(texts)
+    out += found
+    for line in out:
+        print(line)
+    return 1 if out else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,123 @@
+# Build artifacts
+build/
+iso/
+*.o
+*.bin
+*.iso
+*.img
+*.elf
+*.d
+
+# Cross-compiler (built locally)
+cross-compiler/
+
+# Editor / IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# Debug
+serial.log
+*.log
+
+# OS-specific
+.DS_Store
+
+# Python (host-side tooling under scripts/)
+__pycache__/
+*.pyc
+Thumbs.db
+.build_number
+
+# OVMF firmware copies
+OVMF_VARS*.fd
+
+# Colour icon PNGs under resources/icons/color/<size>/ are original work rendered
+# from resources/icons/src/ by scripts/convert-icons.sh and ARE committed.
+
+# Windows WSL zone identifiers
+*:Zone.Identifier
+
+# Secure Boot keys — private key must NEVER be committed
+keys/MOK.key
+*.signed.EFI
+
+# Auto-generated build metadata header
+include/build_info.h
+
+# Bear compilation database (machine-specific absolute paths)
+compile_commands.json
+# ON-flavor DB snapshot preserved for the release seam gate's PART A2 advisory
+compile_commands.on.json
+# Bear's intermediate event stream. Sibling of the two above and just as
+# machine-specific, but it was never listed, so a plain `bash scripts/build.sh`
+# left ~19 MB of untracked artifact in the tree. That is not cosmetic: the ship
+# rollover refuses on an unclean tree, so an unignored build output blocks the
+# unattended run at its next boundary.
+compile_commands.events.json
+
+# clangd background index cache
+.cache/
+
+# SDK tool binaries (compiled on host, not tracked)
+sdk/tools/*
+!sdk/tools/.gitkeep
+
+# SDK downloaded build tools
+sdk/build/
+
+# Extracted debug logs
+/debug/
+
+# Claude Code user-local harness overrides (personal permissions, scratch rules).
+# Shared repo policy lives in .claude/settings.json; per-user overrides go in
+# .claude/settings.local.json (never committed). See
+# docs/infrastructure/ai-system.md "MCP, Permissions, and Extension Boundary".
+.claude/settings.local.json
+
+# .claude/state/ -- runtime state files for hooks (last-codex-review.json etc).
+# Keep .keep + README.md tracked; everything else is per-session/runtime.
+.claude/state/*
+!.claude/state/.keep
+!.claude/state/README.md
+!.claude/state/live-gotchas.md
+.claude/scheduled_tasks.lock
+
+
+# Bootloader build intermediate.  bootx64.so is produced by linking
+# .o files from src/boot/uefi/Makefile, then objcopy'd into
+# build/tools/BOOTX64.EFI which is what ships in the GPT image.
+# The .so embeds BOOT_LOADER_BUILD_TIME (HEAD commit time) so its
+# bytes change after every commit when the post-commit hook rebuilds;
+# tracking the .so created permanent worktree drift.  BOOTX64.EFI is
+# already untracked (it lives under build/tools/), so this aligns the
+# intermediate with the same policy.
+src/boot/uefi/bootx64.so
+src/boot/uefi/*.o
+
+# .claude/overnight/ -- overnight-runner CLI runtime state (never committed).
+.claude/overnight/
+
+# .claude/worktrees/ -- harness-created git worktrees (embedded repos).
+.claude/worktrees/
+
+# Local serial-capture scratch (any suffix, not just *.log)
+debug-tmp/
+
+# Compiler dependency sidecars leaked into the repo root by ad-hoc probes.
+# `*.d` (line 9) already ignores them, but they are DEBRIS, not build output:
+# a probe that compiles a temp TU from /tmp, or a bare header, with -MMD/-MD
+# while cwd is the repo root writes `<target>.d` HERE. Cleaned 2026-07-31
+# (10 files dating to 07-29/07-30); the current tools do not reproduce them --
+# gen-user-abi.py filters DEP_ONLY_FLAGS and test-tooling.sh strips -MMD/-MP.
+# If one reappears, find the probe that forgot to strip rather than widening
+# this ignore: a .d in the root always means a compile ran with the wrong cwd.
+
+# Docs accessibility audit dependencies (scripts/site/a11y/package-lock.json pins them)
+scripts/site/a11y/node_modules/
+
+# boot.conf lock held by every boot of build/system-disk.img (scripts/lib/boot-conf-lock.sh)
+/.boot-conf.lock
+# one build of the tree at a time (scripts/build.sh)
+/.build.lock

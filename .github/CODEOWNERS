@@ -1,0 +1,10 @@
+# Default owner for everything
+*                           @rizonesoft
+
+# Critical paths — require lead review
+src/boot/                   @rizonesoft
+src/kernel/memory/          @rizonesoft
+src/kernel/sched/           @rizonesoft
+linker.ld                   @rizonesoft
+Makefile                    @rizonesoft
+scripts/build.sh            @rizonesoft

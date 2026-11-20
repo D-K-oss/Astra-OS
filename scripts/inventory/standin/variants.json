@@ -1,0 +1,24 @@
+{
+  "charging": {
+    "ac": 1,
+    "state": 2,
+    "rate": 15000,
+    "remaining": 28800
+  },
+  "discharging": {
+    "ac": 0,
+    "state": 1,
+    "rate": 8000,
+    "remaining": 28800
+  },
+  "saver": {
+    "ac": 0,
+    "state": 1,
+    "rate": 8000,
+    "remaining": 7200
+  },
+  "dual": {
+    "displays": 2,
+    "laptop": false
+  }
+}

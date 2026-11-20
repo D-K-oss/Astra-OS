@@ -1,0 +1,172 @@
+#!/bin/bash
+# =============================================================================
+# test-coverage.sh -- Scan kernel test files and report coverage
+#
+# Scans src/kernel/test/test_*.c for TEST_ASSERT* calls (comments excluded) and
+# test_suite_register calls to produce a coverage summary.
+#
+# Usage:
+#   bash scripts/test-coverage.sh           # print table to stdout
+#   bash scripts/test-coverage.sh --save    # also write build/test-coverage.md + .json
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT="$(dirname "$SCRIPT_DIR")"
+TEST_DIR="$PROJECT/src/kernel/test"
+DOCS_DIR="$PROJECT/docs/test-coverage"
+SAVE=false
+QUIET=false
+
+for arg in "$@"; do
+    [ "$arg" = "--save" ] && SAVE=true
+    [ "$arg" = "--quiet" ] && QUIET=true
+done
+
+# Colors (only for terminal, not file output)
+BOLD='\033[1m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RESET='\033[0m'
+
+# Collect data
+declare -a SUITES=()
+declare -a FILES=()
+declare -a ASSERTIONS=()
+declare -a SUITE_NAMES=()
+TOTAL_ASSERTIONS=0
+TOTAL_SUITES=0
+
+# Assertion CALLS per file, computed in ONE python pass (a per-file spawn cost
+# ~2.5s on every build): occurrences of `TEST_ASSERT...(` outside comments.
+declare -A ASSERT_CALLS=()
+while IFS=$'\t' read -r _cf _cn; do ASSERT_CALLS["$_cf"]=$_cn; done < <(python3 - "$TEST_DIR"/test_*.c <<'PYEOF'
+import re, sys
+for path in sys.argv[1:]:
+    t = open(path, errors="replace").read()
+    t = re.sub(r"/\*.*?\*/", " ", t, flags=re.S)
+    t = re.sub(r"//[^\n]*", "", t)
+    n = len(re.findall(r"\bTEST_ASSERT[A-Z0-9_]*\s*\(", t))
+    print(path + "\t" + str(n))
+PYEOF
+)
+
+for f in "$TEST_DIR"/test_*.c; do
+    [ -f "$f" ] || continue
+    basename="$(basename "$f" .c)"
+    # Skip the test runner itself -- it's not a test suite
+    [ "$basename" = "test_runner" ] && continue
+    name="${basename#test_}"
+
+    # Count TEST_ASSERT* CALLS: occurrences of `TEST_ASSERT...(` outside
+    # comments. A plain `grep -c` counted LINES, so a comment naming the macro
+    # counted as an assertion and two asserts on one line counted once
+    # (v19 capture, 2026-09-03; corpus moved 15570 -> 15535 when fixed).
+    asserts=${ASSERT_CALLS[$f]:-0}
+
+    # Count test_suite_register / test_suite_register_cat calls
+    suites=$(grep -c 'test_suite_register' "$f" 2>/dev/null) || suites=0
+
+    # Extract suite names (join with ", "). The canonical multi-line
+    # registration form places the callback on the line AFTER the
+    # string literal (matching the clang-format / readability style
+    # for long string args). A plain line-based `grep -oP` cannot
+    # match across the newline, so pre-join the file into one long
+    # line with `tr '\n' ' '` before running the PCRE. Keeps counting
+    # (via `grep -c 'test_suite_register' "$f"` above) and enumeration
+    # using the same grammar so the coverage report never drops suites
+    # silently.
+    suite_list=$(tr '\n' ' ' < "$f" | grep -oP 'test_suite_register(_cat)?\("[^"]*",\s*\K\w+' 2>/dev/null | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g' || echo "")
+
+    FILES+=("$basename.c")
+    SUITES+=("$suites")
+    ASSERTIONS+=("$asserts")
+    SUITE_NAMES+=("$suite_list")
+    TOTAL_ASSERTIONS=$((TOTAL_ASSERTIONS + asserts))
+    TOTAL_SUITES=$((TOTAL_SUITES + suites))
+done
+
+# Print table (unless --quiet)
+if [ "$QUIET" = false ]; then
+    echo -e "${CYAN}${BOLD}Kernel Test Coverage${RESET}"
+    echo ""
+    printf "%-22s  %6s  %10s  %s\n" "File" "Suites" "Assertions" "Suite Names"
+    printf "%-22s  %6s  %10s  %s\n" "----------------------" "------" "----------" "-------------------------------------------"
+
+    for i in "${!FILES[@]}"; do
+        printf "%-22s  %6s  %10s  %s\n" "${FILES[$i]}" "${SUITES[$i]}" "${ASSERTIONS[$i]}" "${SUITE_NAMES[$i]}"
+    done
+
+    echo ""
+    printf "%-22s  %6s  %10s\n" "TOTAL" "$TOTAL_SUITES" "$TOTAL_ASSERTIONS"
+    echo ""
+fi
+
+# Save to files if requested
+if [ "$SAVE" = true ]; then
+    mkdir -p "$DOCS_DIR"
+
+    # Markdown (tracked in git)
+    # NO TIMESTAMP IS EMITTED (2026-07-28). Pinning it to the HEAD commit time
+    # was an earlier attempt to stop wall-clock churn, and it did not work: HEAD
+    # moves on every commit, so both files were rewritten with a new timestamp
+    # and nothing else on every single commit. The effect was two tracked files
+    # permanently showing as modified in the editor, a meaningless diff in every
+    # commit that touched them, and a tree the overnight rollover had to be
+    # taught to ignore (run_phase_guard._ROLLOVER_AUTOGEN).
+    #
+    # The information was redundant anyway: `git log -1 docs/test-coverage/` says
+    # when these files last changed, and says it correctly. Nothing reads the
+    # emitted value -- the only writer is this script. Without it the files now
+    # change if and only if the COUNTS change, which is what a generated
+    # artifact should do.
+    #
+    # GENERATED/TIMESTAMP_ISO are still computed below because the surrounding
+    # code paths reference them; they are simply not written into the outputs.
+    if GENERATED="$(git -C "$PROJECT" log -1 --format='%cd' --date=format-local:'%Y-%m-%d %H:%M UTC' 2>/dev/null)" \
+       && [ -n "$GENERATED" ]; then
+        :
+    else
+        GENERATED="(no git)"
+    fi
+    if TIMESTAMP_ISO="$(git -C "$PROJECT" log -1 --format='%cI' 2>/dev/null)" \
+       && [ -n "$TIMESTAMP_ISO" ]; then
+        :
+    else
+        TIMESTAMP_ISO="1970-01-01T00:00:00Z"
+    fi
+
+    {
+        echo "# Kernel Test Coverage"
+        echo ""
+        echo "> Auto-generated by \`scripts/test-coverage.sh\` -- do not edit manually."
+        echo ""
+        echo "| File | Suites | Assertions | Suite Names |"
+        echo "|------|--------|------------|-------------|"
+        for i in "${!FILES[@]}"; do
+            echo "| ${FILES[$i]} | ${SUITES[$i]} | ${ASSERTIONS[$i]} | ${SUITE_NAMES[$i]} |"
+        done
+        echo "| **TOTAL** | **$TOTAL_SUITES** | **$TOTAL_ASSERTIONS** | |"
+    } > "$DOCS_DIR/coverage.md"
+
+    # JSON (tracked in git, for trend analysis)
+    {
+        echo "{"
+        echo "  \"total_suites\": $TOTAL_SUITES,"
+        echo "  \"total_assertions\": $TOTAL_ASSERTIONS,"
+        echo "  \"files\": ["
+        for i in "${!FILES[@]}"; do
+            comma=","
+            [ "$i" -eq $((${#FILES[@]} - 1)) ] && comma=""
+            echo "    {\"file\": \"${FILES[$i]}\", \"suites\": ${SUITES[$i]}, \"assertions\": ${ASSERTIONS[$i]}}$comma"
+        done
+        echo "  ]"
+        echo "}"
+    } > "$DOCS_DIR/coverage.json"
+
+    if [ "$QUIET" = false ]; then
+        echo -e "${GREEN}Saved:${RESET} docs/test-coverage/coverage.md, docs/test-coverage/coverage.json"
+    fi
+fi

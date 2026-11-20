@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# run-all.sh -- run every overnight-runner control-plane test and report.
+#
+# Until 2026-07-11 the scripts/overnight/tests/*.py files had NO central runner
+# and were wired into neither test-tooling.sh, the git hooks, nor CI -- so a
+# control-plane regression could commit and push with green hooks (this is how
+# the runner kept breaking). This script is the single entry point the push
+# gate (.githooks/pre-push) and any operator invoke to exercise the whole set:
+#
+#     bash scripts/overnight/tests/run-all.sh
+#
+# It runs every test_*.py in this dir with plain python3, prints one line per file,
+# and exits nonzero if any file fails. Tests plain python3 never calls (fixture
+# tests, a file with no `__main__` runner) then run under pytest, whose count the
+# file's line carries; without pytest such a file fails, never passes.
+set -uo pipefail
+
+# Drop git's per-invocation environment before running anything. When this
+# suite is invoked FROM a git hook -- which is the normal path, since the
+# always-on control-plane gate runs it at pre-commit and pre-push -- git has
+# exported GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE and friends pointing at THIS
+# repo. Several tests create a throwaway repo under /tmp and commit in it;
+# those commits then honour the inherited GIT_INDEX_FILE, try to build a tree
+# from this repo's index inside the temp repo's object database, and die with
+#   error: invalid object 100644 <sha> for 'docs/test-coverage/coverage.json'
+#   error: Error building trees
+# Measured 2026-07-28: test_receipts, test_run_outcome, test_section_checkpoint
+# and test_worktree_hash all pass standalone and all fail under
+# `GIT_INDEX_FILE=.git/index`, which is precisely the hook environment. The
+# failure is therefore a property of HOW the gate is invoked, not of the code
+# under test -- the worst kind of gate failure, because it blocks a correct
+# commit and points at innocent tests.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_AUTHOR_DATE \
+      GIT_COMMITTER_DATE GIT_EDITOR 2>/dev/null || true
+
+# ---- Environment hygiene: never inherit an operator opt-out ----------------
+# PROVEN, not assumed (2026-08-08). `test-tooling.sh` was fixed for this in
+# 3d92831ad and this suite was left as "neither proven to leak nor proven not
+# to". It leaks: under an ambient `SKIP_CITATION_BLOCK=1` the suite returns
+# `68 passed, 1 failed`, because `test_content_lint` asserts the citation gate
+# BLOCKS and the ambient opt-out disabled the gate it was asserting about. Same
+# shape as the tooling-suite incident -- the suite stops testing the gates and
+# starts testing the operator's shell.
+#
+# It fails rather than passes falsely, which is the safe direction, but a red
+# gate that blocks a correct commit and points at an innocent test is the exact
+# failure this file's git-env block below already calls the worst kind.
+#
+# Prefix-matched so an opt-out added later is covered the day it is written.
+# Tests that need one of these set it per-command, which unsetting here does
+# not affect.
+_RA_CLEARED=()
+for _ra_var in $(compgen -v 2>/dev/null | grep -E '^(SKIP_|ATTENDED_REPAIR_OVERRIDE$|CODEX_FLAG_OVERRIDE$)' || true); do
+    _RA_CLEARED+=("$_ra_var")
+    unset "$_ra_var" 2>/dev/null || true
+done
+if [ "${#_RA_CLEARED[@]}" -gt 0 ]; then
+    echo "run-all: cleared inherited opt-out env before gate tests: ${_RA_CLEARED[*]}" >&2
+fi
+unset _ra_var
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+
+# The project every hook under test sees is the tree this suite is in, never
+# the caller's: a session exports CLAUDE_PROJECT_DIR naming its own checkout,
+# and run from a copy of the staged tree (the pre-commit gate, 2026-11-17) the
+# hooks resolved paths against that other checkout, so test_content_lint and
+# test_step19_scope failed in the copy while passing in the primary tree.
+export CLAUDE_PROJECT_DIR="$REPO"
+cd "$REPO" || exit 1
+
+# SAME CLASS AS THE GIT-ENV BLOCK ABOVE: a property of how the suite is
+# invoked, not of the code under test. `test_stub_lint_coverage` exercises
+# lint's stub-behind-stamp COVERAGE line, which needs `build/todo-cache.json`;
+# without it the check reports "cache not found" and the test fails naming a
+# fixture, so the suite announces a regression nobody introduced.
+#
+# The cache goes missing routinely and for good reasons: `build-and-validate.sh`
+# WITHOUT `--keep-cache` deletes the artifact it just validated, and any clean
+# build removes `build/` wholesale. Measured 2026-08-08: 67/69 at pre-commit
+# minutes after the same suite returned 69/69, with nothing between the two runs
+# but a lint rebuild and a smoke-matrix clean build. That is almost certainly
+# the unnamed `68 passed, 1 failed` intermittent this suite has been carrying.
+#
+# Building it costs ~1.2s and is idempotent, so the suite declares its own
+# precondition rather than reporting a phantom failure. If the build fails the
+# suite continues: the affected test will then fail honestly, which is the
+# correct outcome for a cache that cannot be built at all.
+if [ ! -f "$REPO/build/todo-cache.json" ]; then
+  echo "run-all: build/todo-cache.json absent -- building it (suite precondition)"
+  bash "$REPO/scripts/todo-graph/build-and-validate.sh" --keep-cache \
+      >/dev/null 2>&1 || echo "run-all: cache build FAILED -- dependent tests will report it"
+fi
+
+FAIL=0
+PASS=0
+
+run_one() {  # run_one [--pytest] NAME CMD...; --pytest reports pytest's own count
+  local counted=0
+  [ "$1" = --pytest ] && { counted=1; shift; }
+  local name="$1"; shift
+  if out="$("$@" 2>&1)"; then
+    local summary=""
+    # pytest -q ends with e.g. "36 passed, 1 skipped in 0.42s": that count is the
+    # proof the file's fixture tests ran, so the ok line carries it.
+    [ "$counted" = 1 ] && summary="$(printf '%s\n' "$out" | grep -E '^[0-9]+ (passed|skipped)' | tail -1 | sed -E 's/ in [0-9.]+s.*$//')"
+    if [ -n "$summary" ]; then
+      printf '  ok   %s (pytest: %s)\n' "$name" "$summary"
+    else
+      printf '  ok   %s\n' "$name"
+    fi
+    PASS=$((PASS + 1))
+  else
+    printf '  FAIL %s\n' "$name"
+    printf '%s\n' "$out" | sed 's/^/       | /'
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "== overnight-runner test suite =="
+
+# All python contract tests in this directory. Every file runs under plain python3, so
+# a file whose `__main__` block turns its collected check() failures into the exit
+# code keeps doing so. Plain python3 only DEFINES a test it never calls (one taking a
+# fixture such as tmp_path, one after the runner, or any in a file with no runner)
+# and exits 0: until 2026-11-12 test_review_pin.py (65 tests), test_three_pass_gate.py
+# (17) and the last seven of test_commit_gate_script_lines.py passed here without
+# running. pytest runs exactly those tests too; without pytest such a file fails.
+PYTEST=0
+python3 -c 'import pytest' 2>/dev/null && PYTEST=1
+uncalled_tests() {  # the tests in $1 that plain python3 defines and never calls
+  python3 - "$1" <<'PY'
+import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+tests = [(i, n.name) for i, n in enumerate(tree.body)
+         if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")]
+main = next((i for i, n in enumerate(tree.body)
+             if isinstance(n, ast.If) and "__main__" in ast.unparse(n.test)), None)
+def calls(node):  # `test_x(...)` written out; a mere reference (`[test_x]`) proves nothing
+    return {n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+called = set()
+if main is not None:
+    block = tree.body[main]
+    called |= calls(block)
+    if "globals()" in ast.unparse(block):  # the house loop calls each test defined above it
+        called |= {name for i, name in tests if i < main}
+for n in tree.body:  # a module-level call
+    if isinstance(n, ast.Expr):
+        called |= calls(n)
+for i, name in tests:  # one called without its fixture fails the plain run loudly
+    if name not in called or (main is not None and i > main):  # defined after the runner ran
+        print(name)
+PY
+}
+plain_then_pytest() {  # plain python3, then pytest on the tests it did not call
+  local file="$1"; shift
+  python3 "$file" || return 1
+  python3 -m pytest -q -p no:cacheprovider "$@"
+}
+while IFS= read -r t; do
+  [ -n "$t" ] || continue
+  mapfile -t extra < <(uncalled_tests "$t")
+  if [ "${#extra[@]}" -eq 0 ]; then
+    run_one "$(basename "$t")" python3 "$t"
+  elif [ "$PYTEST" = 1 ]; then
+    run_one --pytest "$(basename "$t")" plain_then_pytest "$t" "${extra[@]/#/$t::}"
+  else
+    run_one "$(basename "$t") (holds tests only pytest runs; pytest is not installed)" false
+  fi
+done < <(ls -1 "$HERE"/test_*.py 2>/dev/null)
+
+# The launcher DRYRUN + flock smoke (bash, not python).
+
+echo "== $PASS passed, $FAIL failed =="
+[ "$FAIL" -eq 0 ]

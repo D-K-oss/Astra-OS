@@ -1,0 +1,1461 @@
+/* ============================================================================
+ * test_proc_ext.c -- Process model extensions unit tests (TODO-21)
+ *
+ * Section 1 (Working Directory): pure tests for vfs_resolve_path path
+ * canonicalization + task cwd get/set storage. These exercise behavior without
+ * touching live boot infrastructure (no scheduler, no VFS mounts, no _init).
+ * ============================================================================ */
+
+#ifdef KERNEL_TESTS
+
+#include "kernel/test/test.h"
+#include "kernel/fs/vfs.h"
+#include "kernel/sched/task.h"
+#include "kernel/sched/spinlock.h"
+#include "kernel/nt/ssdt.h"
+#include "kernel/nt/service_numbers.h"
+#include "kernel/nt/ntstatus.h"
+#include "kernel/nt/nt_types.h"
+#include "kernel/nt/nt_file.h"
+#include "kernel/nt/mitigation_policy.h"
+#include "kernel/nt/pledge.h"
+#include "kernel/ob/ob_job.h"
+#include "kernel/ob/handle_table.h"   /* real-job fixture for the generation test */
+#include "kernel/quota/quota.h"       /* charge-gate save/restore around assign */
+#include "kernel/quota/quota_ledger.h" /* QUOTA_GATE_* pack/unpack for that restore */
+#include "kernel/ipc/pgroup.h"
+#include "kernel/errno.h"
+#include "kernel/sched/syscall.h"
+#include "kernel/types.h"
+
+/* Local ASCII string compare (no dependency on live libc in the test TU). */
+static int pe_streq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (*a != *b)
+            return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* --- vfs_resolve_path: canonicalization --- */
+
+static void test_resolve_absolute_passthrough(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\", "D:\\foo\\bar", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "absolute input resolves");
+    TEST_ASSERT(pe_streq(out, "D:\\foo\\bar"), "absolute input keeps its own drive");
+}
+
+static void test_resolve_relative_join(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\Users", "docs", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "relative join resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\Users\\docs"), "relative joins onto cwd");
+}
+
+static void test_resolve_relative_from_root(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\", "System\\Logs", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "relative from root resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\System\\Logs"), "no doubled root separator");
+}
+
+static void test_resolve_dot_collapse(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\a", ".\\b", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "'.' component resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\a\\b"), "'.' is dropped");
+}
+
+static void test_resolve_dotdot_pop(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\a\\b", "..", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "'..' component resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\a"), "'..' pops one component");
+}
+
+static void test_resolve_dotdot_at_root_stays_root(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\", "..", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "'..' at root resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\"), "'..' cannot escape the drive root");
+}
+
+static void test_resolve_dotdot_cannot_escape(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\", "..\\..\\x", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "over-popping resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\x"), "traversal above root is clamped");
+}
+
+static void test_resolve_forward_slash_normalized(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\", "a/b/c", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "forward slashes resolve");
+    TEST_ASSERT(pe_streq(out, "C:\\a\\b\\c"), "'/' normalized to '\\'");
+}
+
+static void test_resolve_root_relative(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("D:\\cur\\dir", "\\foo", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "root-relative resolves");
+    TEST_ASSERT(pe_streq(out, "D:\\foo"), "root-relative takes drive from cwd, resets to root");
+}
+
+static void test_resolve_multi_separator_collapse(void)
+{
+    char out[VFS_MAX_PATH];
+    int r = vfs_resolve_path("C:\\", "a\\\\b", out, sizeof(out));
+    TEST_ASSERT_EQ(r, 0, "doubled separator resolves");
+    TEST_ASSERT(pe_streq(out, "C:\\a\\b"), "empty components collapse");
+}
+
+static void test_resolve_overflow_rejected(void)
+{
+    char out[8];
+    int r = vfs_resolve_path("C:\\", "averylongdirectoryname", out, sizeof(out));
+    TEST_ASSERT_EQ(r, -1, "overflow is rejected, not truncated");
+}
+
+static void test_resolve_invalid_inputs(void)
+{
+    char out[VFS_MAX_PATH];
+    /* Relative input with a non-absolute cwd is invalid. */
+    TEST_ASSERT_EQ(vfs_resolve_path("bogus", "x", out, sizeof(out)), -1,
+                   "relative resolve needs an absolute cwd");
+    /* NULL args are rejected. */
+    TEST_ASSERT_EQ(vfs_resolve_path("C:\\", (const char *)0, out, sizeof(out)), -1,
+                   "NULL input rejected");
+}
+
+/* --- task cwd get/set storage (fixture task, no live scheduler) --- */
+
+static struct task s_cwd_fixture;
+
+static void cwd_fixture_reset(void)
+{
+    spinlock_t init = SPINLOCK_INIT;
+    s_cwd_fixture.cwd[0] = '\0';
+    s_cwd_fixture.cwd_lock = init;
+}
+
+static void test_task_cwd_set_get_roundtrip(void)
+{
+    char out[TASK_CWD_MAX];
+    cwd_fixture_reset();
+    TEST_ASSERT_EQ(task_set_cwd(&s_cwd_fixture, "C:\\Impossible\\System32"), 0,
+                   "set_cwd accepts an in-range path");
+    task_get_cwd(&s_cwd_fixture, out, sizeof(out));
+    TEST_ASSERT(pe_streq(out, "C:\\Impossible\\System32"),
+                "get_cwd returns exactly what set_cwd stored");
+}
+
+static void test_task_cwd_overflow_leaves_unchanged(void)
+{
+    char big[TASK_CWD_MAX + 8];
+    char out[TASK_CWD_MAX];
+    uint32_t i;
+    cwd_fixture_reset();
+    task_set_cwd(&s_cwd_fixture, "C:\\seed");
+    for (i = 0; i < sizeof(big) - 1; i++)
+        big[i] = 'a';
+    big[sizeof(big) - 1] = '\0';
+    TEST_ASSERT_EQ(task_set_cwd(&s_cwd_fixture, big), -1,
+                   "oversized path is rejected");
+    task_get_cwd(&s_cwd_fixture, out, sizeof(out));
+    TEST_ASSERT(pe_streq(out, "C:\\seed"),
+                "rejected set leaves the prior cwd intact");
+}
+
+static void test_task_cwd_get_null_task(void)
+{
+    char out[TASK_CWD_MAX];
+    out[0] = 'x';
+    task_get_cwd((struct task *)0, out, sizeof(out));
+    TEST_ASSERT_EQ((int)out[0], 0, "NULL task yields an empty string");
+}
+
+/* Boundary: a component == VFS_MAX_NAME-1 (255) is the longest walk_path can
+ * look up; a 256-byte component would be silently truncated (alias), so
+ * vfs_resolve_path must reject it (review adversarial A2). */
+static void test_resolve_component_255_ok(void)
+{
+    char comp[256];
+    char out[VFS_MAX_PATH];
+    uint32_t i;
+    for (i = 0; i < 255; i++) comp[i] = 'a';
+    comp[255] = '\0';
+    /* 255-char component (== VFS_MAX_NAME-1) is the max walk_path accepts. */
+    TEST_ASSERT_EQ(vfs_resolve_path("C:\\", comp, out, sizeof(out)), 0,
+                   "255-byte component resolves");
+}
+
+static void test_resolve_component_256_rejected(void)
+{
+    char comp[257];
+    char out[VFS_MAX_PATH];
+    uint32_t i;
+    for (i = 0; i < 256; i++) comp[i] = 'a';
+    comp[256] = '\0';
+    /* 256-char component would be silently truncated by walk_path -> reject. */
+    TEST_ASSERT_EQ(vfs_resolve_path("C:\\", comp, out, sizeof(out)), -1,
+                   "256-byte component rejected (no truncation alias)");
+}
+
+/* Regression: a zero-Length ObjectName must be treated as an empty name --
+ * oa_extract_path must NOT scan Buffer past the declared length (adversarial
+ * round 2). Non-NUL garbage in Buffer + Length 0 -> OBJECT_NAME_NOT_FOUND. */
+static void test_ntcreatefile_zero_length_name(void)
+{
+    HANDLE h = (HANDLE)0;
+    IO_STATUS_BLOCK iosb;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    uint16_t junk[4];
+    NTSTATUS s;
+
+    junk[0] = 0x4141; junk[1] = 0x4242; junk[2] = 0x4343; junk[3] = 0x4444;
+    name.Length = 0;
+    name.MaximumLength = (uint16_t)sizeof(junk);
+    name._pad = 0;
+    name.Buffer = junk;
+
+    oa.Length = sizeof(OBJECT_ATTRIBUTES);
+    oa.RootDirectory = (HANDLE)0;
+    oa._pad1 = 0;
+    oa.ObjectName = &name;
+    oa.Attributes = 0;
+    oa._pad2 = 0;
+    oa.SecurityDescriptor = (void *)0;
+    oa.SecurityQualityOfService = (void *)0;
+
+    iosb.Status = 0;
+    iosb._pad = 0;
+    iosb.Information = 0;
+
+    s = ssdt_dispatch(SSDT_NtCreateFile, (uint64_t)&h, GENERIC_READ,
+                      (uint64_t)&oa, (uint64_t)&iosb, FILE_OPEN, 0);
+    TEST_ASSERT_EQ(s, STATUS_OBJECT_NAME_NOT_FOUND,
+                   "zero-Length name -> NOT_FOUND (Buffer never scanned)");
+}
+
+/* --- Section 9: per-process resource limits (rlimits) ---
+ * Pure tests over the locked accessor API on a stack-local fixture, plus two
+ * read-only oracle queries against the live PID 0 / current task to prove the
+ * boot-time default + create-path inherit ran. No live boot infra touched. */
+
+static struct task s_rlimit_fixture;
+static struct task s_rlimit_child;
+
+/* Seed every resource to a known baseline {cur=1000, max=2000} under a fresh lock. */
+static void rlimit_fixture_reset(void)
+{
+    spinlock_t init = SPINLOCK_INIT;
+    int i;
+    s_rlimit_fixture.rlimit_lock = init;
+    for (i = 0; i < RLIM_NLIMITS; i++) {
+        s_rlimit_fixture.rlimits[i].rlim_cur = 1000;
+        s_rlimit_fixture.rlimits[i].rlim_max = 2000;
+    }
+}
+
+static void test_rlimit_get_set_roundtrip(void)
+{
+    rlimit_t rl;
+    rlimit_t nl = { 500, 1500 };
+    rlimit_fixture_reset();
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIMIT_NOFILE, &nl, 0), RLIMIT_OK,
+                   "moving soft/hard within the cap is unprivileged");
+    TEST_ASSERT_EQ(task_rlimit_get(&s_rlimit_fixture, RLIMIT_NOFILE, &rl), RLIMIT_OK,
+                   "get succeeds");
+    TEST_ASSERT_EQ((int)rl.rlim_cur, 500, "soft limit committed");
+    TEST_ASSERT_EQ((int)rl.rlim_max, 1500, "hard limit committed");
+}
+
+static void test_rlimit_cur_gt_max_rejected(void)
+{
+    rlimit_t nl = { 3000, 2000 };  /* rlim_cur > rlim_max */
+    rlimit_fixture_reset();
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIMIT_AS, &nl, 1), RLIMIT_ERR_INVAL,
+                   "rlim_cur > rlim_max is invalid even for a privileged caller");
+}
+
+static void test_rlimit_raise_hard_needs_priv(void)
+{
+    rlimit_t rl;
+    rlimit_t nl = { 1000, 5000 };  /* raise hard limit 2000 -> 5000 */
+    rlimit_fixture_reset();
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIMIT_AS, &nl, 0), RLIMIT_ERR_PERM,
+                   "unprivileged raise of the hard limit is denied");
+    task_rlimit_get(&s_rlimit_fixture, RLIMIT_AS, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_max, 2000, "denied set leaves the hard limit intact");
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIMIT_AS, &nl, 1), RLIMIT_OK,
+                   "privileged raise of the hard limit is allowed");
+    task_rlimit_get(&s_rlimit_fixture, RLIMIT_AS, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_max, 5000, "privileged raise committed");
+}
+
+static void test_rlimit_lower_hard_unprivileged(void)
+{
+    rlimit_t rl;
+    rlimit_t nl = { 500, 1000 };  /* lower hard limit 2000 -> 1000 */
+    rlimit_fixture_reset();
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIMIT_AS, &nl, 0), RLIMIT_OK,
+                   "unprivileged lowering of the hard limit is allowed (irreversible)");
+    task_rlimit_get(&s_rlimit_fixture, RLIMIT_AS, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_max, 1000, "hard limit lowered");
+}
+
+static void test_rlimit_bad_resource_rejected(void)
+{
+    rlimit_t rl;
+    rlimit_t nl = { 1, 1 };
+    rlimit_fixture_reset();
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIM_NLIMITS, &nl, 1), RLIMIT_ERR_INVAL,
+                   "out-of-range resource index rejected on set");
+    rl.rlim_cur = 7;
+    rl.rlim_max = 7;
+    TEST_ASSERT_EQ(task_rlimit_get(&s_rlimit_fixture, -1, &rl), RLIMIT_ERR_INVAL,
+                   "negative resource index rejected on get");
+    TEST_ASSERT_EQ((int)rl.rlim_cur, 0, "get failure zeroes the output");
+}
+
+static void test_rlimit_pid0_defaults(void)
+{
+    rlimit_t rl;
+    struct task *sys = task_get_by_pid(0);
+    TEST_ASSERT(sys != (struct task *)0, "PID 0 task exists");
+    TEST_ASSERT_EQ(task_rlimit_get(sys, RLIMIT_STACK, &rl), RLIMIT_OK, "get PID0 stack limit");
+    TEST_ASSERT_EQ((int)rl.rlim_cur, (int)RLIMIT_DEFAULT_STACK_CUR,
+                   "PID 0 carries the default 8 MiB soft stack limit");
+    task_rlimit_get(sys, RLIMIT_NOFILE, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_max, (int)RLIMIT_DEFAULT_NOFILE_MAX,
+                   "PID 0 carries the default NOFILE hard limit");
+}
+
+static void test_rlimit_inherit_copies_full_array(void)
+{
+    spinlock_t init = SPINLOCK_INIT;
+    rlimit_t rl;
+    int i;
+    /* Seed the parent with distinctive per-resource values (incl. a lowered hard
+     * limit), then inherit into a poisoned fresh child: a missed entry shows up
+     * as the poison value, and the lowered hard limit must carry over intact. */
+    rlimit_fixture_reset();  /* parent baseline: every resource {1000, 2000} */
+    s_rlimit_fixture.rlimits[RLIMIT_AS].rlim_cur = 111;
+    s_rlimit_fixture.rlimits[RLIMIT_AS].rlim_max = 222;   /* deliberately lowered hard limit */
+    s_rlimit_fixture.rlimits[RLIMIT_NOFILE].rlim_cur = 64;
+    s_rlimit_fixture.rlimits[RLIMIT_STACK].rlim_max = 333;
+
+    s_rlimit_child.rlimit_lock = init;
+    for (i = 0; i < RLIM_NLIMITS; i++) {
+        s_rlimit_child.rlimits[i].rlim_cur = 0xDEAD;
+        s_rlimit_child.rlimits[i].rlim_max = 0xBEEF;
+    }
+
+    task_rlimit_inherit(&s_rlimit_child, &s_rlimit_fixture);
+
+    task_rlimit_get(&s_rlimit_child, RLIMIT_AS, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_cur, 111, "child inherits parent RLIMIT_AS soft");
+    TEST_ASSERT_EQ((int)rl.rlim_max, 222, "child inherits parent's lowered RLIMIT_AS hard limit");
+    task_rlimit_get(&s_rlimit_child, RLIMIT_NOFILE, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_cur, 64, "child inherits parent RLIMIT_NOFILE soft");
+    task_rlimit_get(&s_rlimit_child, RLIMIT_STACK, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_max, 333, "child inherits parent RLIMIT_STACK hard");
+    task_rlimit_get(&s_rlimit_child, RLIMIT_CPU, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_cur, 1000, "child inherits an unmodified baseline entry");
+    TEST_ASSERT_EQ((int)rl.rlim_max, 2000, "no child entry retains its poison value");
+}
+
+/* MEMLOCK ships a FINITE hard ceiling, so an unprivileged raise above it is denied.
+ * The PID 0 check stays READ-ONLY (mutating live PID 0 would poison every later
+ * task via inheritance); the denial semantics are exercised on a stack fixture. */
+static void test_rlimit_memlock_hard_ceiling_default(void)
+{
+    rlimit_t rl;
+    rlimit_t nl;
+    struct task *sys = task_get_by_pid(0);
+    TEST_ASSERT(sys != (struct task *)0, "PID 0 task exists");
+    task_rlimit_get(sys, RLIMIT_MEMLOCK, &rl);
+    TEST_ASSERT_EQ((int)rl.rlim_max, (int)RLIMIT_DEFAULT_MEMLOCK_MAX,
+                   "MEMLOCK default hard limit is finite (not RLIM_INFINITY)");
+    /* Denial on a stack fixture (hard limit 2000): an unprivileged raise to 2001
+     * is rejected. No live-task mutation, no rlim_max+1 overflow risk. */
+    rlimit_fixture_reset();
+    nl.rlim_cur = 2001;
+    nl.rlim_max = 2001;
+    TEST_ASSERT_EQ(task_rlimit_set(&s_rlimit_fixture, RLIMIT_MEMLOCK, &nl, 0), RLIMIT_ERR_PERM,
+                   "unprivileged raise above a finite MEMLOCK hard ceiling is denied");
+}
+
+/* ---- Per-process mitigation policy (section 11) -------------------------
+ * Pure tests over the task_mitigation_* accessors on a stack-local fixture:
+ * monotonic set, no-clear, and the child-policy decision helper. The ring-3
+ * NtSet/QueryInformationProcess(ProcessMitigationPolicy) handlers are deferred
+ * (both return STATUS_NOT_SUPPORTED) pending fault-safe usercopy, so there is
+ * no ring-3 ABI surface to exercise here; MIT_NO_CHILD_PROCESS enforcement is
+ * serial-validated. */
+
+static struct task s_mit_fixture;
+
+static void mit_fixture_reset(void)
+{
+    s_mit_fixture.mitigation_flags = 0;
+}
+
+static void test_mit_fresh_is_zero(void)
+{
+    mit_fixture_reset();
+    TEST_ASSERT_EQ((int)task_mitigation_get(&s_mit_fixture), 0,
+                   "a fresh task carries no mitigation policy");
+}
+
+static void test_mit_apply_sets_bit(void)
+{
+    mit_fixture_reset();
+    task_mitigation_apply(&s_mit_fixture, MIT_NO_CHILD_PROCESS);
+    TEST_ASSERT((task_mitigation_get(&s_mit_fixture) & MIT_NO_CHILD_PROCESS) != 0,
+                "task_mitigation_apply sets MIT_NO_CHILD_PROCESS");
+}
+
+static void test_mit_apply_is_monotonic(void)
+{
+    mit_fixture_reset();
+    task_mitigation_apply(&s_mit_fixture, MIT_NO_CHILD_PROCESS);
+    /* OR-ing an unrelated bit must not clear the first; re-applying is idempotent. */
+    task_mitigation_apply(&s_mit_fixture, (1ull << 5));
+    task_mitigation_apply(&s_mit_fixture, MIT_NO_CHILD_PROCESS);
+    TEST_ASSERT((task_mitigation_get(&s_mit_fixture) & MIT_NO_CHILD_PROCESS) != 0,
+                "monotonic OR preserves an already-set bit across later applies");
+    TEST_ASSERT((task_mitigation_get(&s_mit_fixture) & (1ull << 5)) != 0,
+                "monotonic OR accumulates additional bits");
+}
+
+static void test_mit_child_set_enables(void)
+{
+    mit_fixture_reset();
+    TEST_ASSERT_EQ(task_mitigation_child_set(&s_mit_fixture,
+                       PROC_MIT_CHILD_NO_CHILD_CREATION), 0,
+                   "NoChildProcessCreation request succeeds");
+    TEST_ASSERT((task_mitigation_get(&s_mit_fixture) & MIT_NO_CHILD_PROCESS) != 0,
+                "child-policy request sets MIT_NO_CHILD_PROCESS");
+}
+
+static void test_mit_child_set_noop_when_unset(void)
+{
+    mit_fixture_reset();
+    /* A request that omits the bit while it is not set is a benign no-op. */
+    TEST_ASSERT_EQ(task_mitigation_child_set(&s_mit_fixture, 0), 0,
+                   "omitting the bit while unset is a benign no-op");
+    TEST_ASSERT_EQ((int)(task_mitigation_get(&s_mit_fixture) & MIT_NO_CHILD_PROCESS), 0,
+                   "no-op request leaves the bit clear");
+}
+
+static void test_mit_child_set_clear_denied(void)
+{
+    mit_fixture_reset();
+    task_mitigation_child_set(&s_mit_fixture, PROC_MIT_CHILD_NO_CHILD_CREATION);
+    /* Omitting the bit once it is set is a clear attempt: refused, bit intact. */
+    TEST_ASSERT_EQ(task_mitigation_child_set(&s_mit_fixture, 0), -1,
+                   "clearing an already-set NO_CHILD is refused");
+    TEST_ASSERT((task_mitigation_get(&s_mit_fixture) & MIT_NO_CHILD_PROCESS) != 0,
+                "a refused clear leaves MIT_NO_CHILD_PROCESS set");
+}
+
+/* ============================================================================
+ * Section 12: pledge / unveil pure decision core
+ * ============================================================================ */
+
+static void test_pledge_parse_valid(void)
+{
+    uint64_t m = 0;
+    TEST_ASSERT_EQ(pledge_parse("stdio rpath", &m), 0, "parse of known tokens ok");
+    TEST_ASSERT((m & PLEDGE_STDIO) != 0, "stdio bit set");
+    TEST_ASSERT((m & PLEDGE_RPATH) != 0, "rpath bit set");
+    TEST_ASSERT((m & PLEDGE_WPATH) == 0, "wpath bit not set");
+    TEST_ASSERT((m & PLEDGE_PLEDGED) == 0, "parse yields no sentinel (raw mask)");
+}
+
+static void test_pledge_parse_unknown_rejected(void)
+{
+    uint64_t m = 0;
+    TEST_ASSERT_EQ(pledge_parse("stdio bogus", &m), -1, "unknown token rejects the call");
+}
+
+static void test_pledge_parse_empty(void)
+{
+    uint64_t m = 0xFF;
+    TEST_ASSERT_EQ(pledge_parse("   ", &m), 0, "whitespace-only parses ok");
+    TEST_ASSERT_EQ(m, 0ull, "empty promise yields mask 0");
+}
+
+static void test_pledge_tighten_first(void)
+{
+    uint64_t m = pledge_tighten(0, PLEDGE_STDIO | PLEDGE_RPATH);
+    TEST_ASSERT((m & PLEDGE_PLEDGED) != 0, "first pledge sets the pledged sentinel");
+    TEST_ASSERT((m & PLEDGE_STDIO) != 0 && (m & PLEDGE_RPATH) != 0,
+                "first pledge adopts the requested categories");
+}
+
+static void test_pledge_tighten_intersect_narrows(void)
+{
+    uint64_t first = pledge_tighten(0, PLEDGE_STDIO | PLEDGE_RPATH | PLEDGE_WPATH);
+    uint64_t second = pledge_tighten(first, PLEDGE_STDIO);
+    TEST_ASSERT((second & PLEDGE_STDIO) != 0, "kept the intersected category");
+    TEST_ASSERT((second & PLEDGE_RPATH) == 0, "dropped rpath on tighten");
+    TEST_ASSERT((second & PLEDGE_WPATH) == 0, "dropped wpath on tighten");
+}
+
+static void test_pledge_tighten_cannot_widen(void)
+{
+    uint64_t first = pledge_tighten(0, PLEDGE_STDIO);
+    /* Re-pledging a category not currently held must NOT add it (tighten-only). */
+    uint64_t widened = pledge_tighten(first, PLEDGE_STDIO | PLEDGE_INET);
+    TEST_ASSERT((widened & PLEDGE_INET) == 0, "tighten cannot re-add a dropped category");
+    TEST_ASSERT((widened & PLEDGE_STDIO) != 0, "still holds the surviving category");
+}
+
+static void test_pledge_classify_core_and_deny(void)
+{
+    TEST_ASSERT_EQ(pledge_syscall_category(SSDT_NtClose), PLEDGE_REQ_CORE,
+                   "NtClose is survival-core (always allowed)");
+    TEST_ASSERT((pledge_syscall_category(SSDT_NtCreateProcess) & PLEDGE_PROC) != 0,
+                "NtCreateProcess requires proc");
+    TEST_ASSERT((pledge_syscall_category(SSDT_NtSetInformationThread) & PLEDGE_PROC) != 0,
+                "NtSetInformationThread requires proc (priority escalation gate)");
+    /* An unclassified/unused index defaults to deny (fail-closed allowlist). */
+    TEST_ASSERT((pledge_syscall_category(0x03FF) & PLEDGE_REQ_DENY) != 0,
+                "unclassified syscall defaults to deny");
+}
+
+static void test_pledge_file_categories(void)
+{
+    TEST_ASSERT_EQ(pledge_file_categories(VFS_O_READ), PLEDGE_RPATH, "read -> rpath");
+    TEST_ASSERT_EQ(pledge_file_categories(VFS_O_WRITE), PLEDGE_WPATH, "write -> wpath");
+    TEST_ASSERT_EQ(pledge_file_categories(VFS_O_CREATE), PLEDGE_CPATH, "create -> cpath");
+    TEST_ASSERT_EQ(pledge_file_categories(VFS_O_READ | VFS_O_WRITE | VFS_O_CREATE),
+                   PLEDGE_RPATH | PLEDGE_WPATH | PLEDGE_CPATH, "rw+create -> all three");
+}
+
+static void test_pledge_is_allowed(void)
+{
+    uint64_t mask = PLEDGE_PLEDGED | PLEDGE_STDIO | PLEDGE_RPATH;
+    TEST_ASSERT_EQ(pledge_is_allowed(mask, PLEDGE_REQ_CORE), 1, "core always allowed");
+    TEST_ASSERT_EQ(pledge_is_allowed(mask, PLEDGE_REQ_DENY), 0, "deny sentinel blocks");
+    TEST_ASSERT_EQ(pledge_is_allowed(mask, PLEDGE_RPATH), 1, "held category allowed");
+    TEST_ASSERT_EQ(pledge_is_allowed(mask, PLEDGE_WPATH), 0, "absent category denied");
+    TEST_ASSERT_EQ(pledge_is_allowed(mask, PLEDGE_RPATH | PLEDGE_WPATH), 0,
+                   "AND semantics: one absent category denies");
+}
+
+static void test_unveil_perms_for_vfs(void)
+{
+    TEST_ASSERT_EQ(unveil_perms_for_vfs(VFS_O_READ), UNVEIL_R, "read -> r");
+    TEST_ASSERT_EQ(unveil_perms_for_vfs(VFS_O_WRITE), UNVEIL_W, "write -> w");
+    TEST_ASSERT_EQ(unveil_perms_for_vfs(VFS_O_CREATE), UNVEIL_C, "create -> c");
+}
+
+/* Build a small stack-resident folded unveil list for the pure matcher. Paths
+ * must already be folded (uppercase, backslash-separated) as unveil_add stores. */
+static void test_unveil_covers_exact_and_boundary(void)
+{
+    unveil_entry_t e = { (unveil_entry_t *)0, UNVEIL_R, "C:\\ALLOWED" };
+    TEST_ASSERT_EQ(unveil_list_covers(&e, "C:\\ALLOWED", UNVEIL_R), 1, "exact match allowed");
+    TEST_ASSERT_EQ(unveil_list_covers(&e, "C:\\ALLOWED\\FILE.TXT", UNVEIL_R), 1,
+                   "child at a component boundary allowed");
+    /* Sibling sharing a textual prefix must NOT be treated as a descendant. */
+    TEST_ASSERT_EQ(unveil_list_covers(&e, "C:\\ALLOWEDEVIL", UNVEIL_R), 0,
+                   "sibling prefix is not a descendant");
+}
+
+static void test_unveil_covers_deny_and_perms(void)
+{
+    unveil_entry_t e = { (unveil_entry_t *)0, UNVEIL_R, "C:\\ALLOWED" };
+    TEST_ASSERT_EQ(unveil_list_covers(&e, "C:\\OTHER", UNVEIL_R), 0,
+                   "unmatched path denied");
+    TEST_ASSERT_EQ(unveil_list_covers(&e, "C:\\ALLOWED\\F", UNVEIL_W), 0,
+                   "insufficient perms denied");
+    TEST_ASSERT_EQ(unveil_list_covers((unveil_entry_t *)0, "C:\\ANY", UNVEIL_R), 1,
+                   "NULL list (never unveiled) allows all");
+}
+
+static void test_unveil_longest_match_wins(void)
+{
+    /* A more specific entry (deeper path) overrides a broader one's perms. */
+    unveil_entry_t deep = { (unveil_entry_t *)0, UNVEIL_R | UNVEIL_W, "C:\\A\\B" };
+    unveil_entry_t root = { &deep, UNVEIL_R, "C:\\A" };
+    TEST_ASSERT_EQ(unveil_list_covers(&root, "C:\\A\\B\\F", UNVEIL_W), 1,
+                   "deeper entry's write perm applies under it");
+    TEST_ASSERT_EQ(unveil_list_covers(&root, "C:\\A\\C", UNVEIL_W), 0,
+                   "broader entry (r only) denies write outside the deep subtree");
+}
+
+/* Legacy INT 0x80 ABI pledge gate (fixture task, no live dispatch). */
+static struct task s_pledge_fixture;
+
+static void test_pledge_legacy_gate(void)
+{
+    s_pledge_fixture.pledge_mask = PLEDGE_PLEDGED | PLEDGE_STDIO;  /* no proc */
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_FORK),
+                   STATUS_PLEDGE_VIOLATION, "legacy SYS_FORK without proc is a violation");
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_EXIT),
+                   STATUS_SUCCESS, "legacy SYS_EXIT is survival-core");
+    /* IPC / system-control ops are NOT core: fail-closed under an empty-ish pledge. */
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_SHMEM_CREATE),
+                   STATUS_PLEDGE_VIOLATION, "legacy SYS_SHMEM_CREATE fails closed (not core)");
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_REBOOT),
+                   STATUS_PLEDGE_VIOLATION, "legacy SYS_REBOOT fails closed (not core)");
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_WRITE),
+                   STATUS_SUCCESS, "legacy SYS_WRITE covered by stdio");
+    s_pledge_fixture.pledge_mask = PLEDGE_PLEDGED | PLEDGE_PROC;
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_FORK),
+                   STATUS_SUCCESS, "legacy SYS_FORK with proc is allowed");
+    s_pledge_fixture.pledge_mask = 0;   /* unpledged */
+    TEST_ASSERT_EQ(pledge_check_legacy(&s_pledge_fixture, SYS_FORK),
+                   STATUS_SUCCESS, "unpledged task: legacy path unrestricted");
+}
+
+/* Empty locked unveil set must deny all (fixture task, no boot infra). */
+static void test_unveil_lock_empty_denies(void)
+{
+    struct task fix;
+    spinlock_t init = SPINLOCK_INIT;
+    fix.unveil_lock = init;
+    fix.unveil_list = (struct unveil_entry *)0;
+    fix.unveil_locked = 0;
+    fix.unveil_active = 0;
+    TEST_ASSERT_EQ(unveil_check(&fix, "C:\\Any", UNVEIL_R), STATUS_SUCCESS,
+                   "never-unveiled task allows all paths");
+    unveil_lock(&fix);   /* lock with no entries -> active + empty */
+    TEST_ASSERT_EQ(unveil_check(&fix, "C:\\Any", UNVEIL_R), STATUS_ACCESS_DENIED,
+                   "active empty (lock-before-add) unveil set denies all");
+}
+
+/* Re-unveiling a path is tighten-only: a dropped bit cannot be restored. */
+static void test_unveil_perms_tighten_only(void)
+{
+    struct task fix;
+    spinlock_t init = SPINLOCK_INIT;
+    fix.unveil_lock = init;
+    fix.unveil_list = (struct unveil_entry *)0;
+    fix.unveil_locked = 0;
+    fix.unveil_active = 0;
+    fix.unveil_gen = 0;
+    fix.pledge_mask = 0;
+    unveil_add(&fix, "C:\\P", UNVEIL_R | UNVEIL_W | UNVEIL_C);
+    TEST_ASSERT_EQ(unveil_check(&fix, "C:\\P", UNVEIL_W), STATUS_SUCCESS,
+                   "initial rwc grants write");
+    unveil_add(&fix, "C:\\P", UNVEIL_R);   /* narrow to r */
+    TEST_ASSERT_EQ(unveil_check(&fix, "C:\\P", UNVEIL_W), STATUS_ACCESS_DENIED,
+                   "narrowing to r drops write");
+    unveil_add(&fix, "C:\\P", UNVEIL_R | UNVEIL_W | UNVEIL_C);   /* attempt widen */
+    TEST_ASSERT_EQ(unveil_check(&fix, "C:\\P", UNVEIL_W), STATUS_ACCESS_DENIED,
+                   "re-unveil cannot restore a dropped bit (tighten-only)");
+    pledge_unveil_teardown(&fix);   /* free the list */
+}
+
+/* ==========================================================================
+ * Section 13: Job Objects -- pure-logic tests on the ob_job helpers.
+ *
+ * These exercise the limit-flag validation (the false-containment fix), the
+ * accounting/limit/pid-list marshalling, and the membership scan against a
+ * stack JOB_OBJECT (zero-initialized == unlocked lock, no members). The Ob
+ * reference-counted lifecycle (assign / detach / terminate / fork-inherit /
+ * kill-on-close) needs real multi-process fixtures and is validated by the
+ * boot smoke path, not these in-memory unit tests. No live boot infrastructure.
+ * ========================================================================== */
+
+/* An unenforceable limit flag must be REJECTED, leaving job state unchanged --
+ * a caller can never configure a silent no-op limit (false containment). */
+static void test_job_limits_reject_unsupported(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_LIMIT_INFORMATION lim = {0};
+    NTSTATUS st;
+
+    lim.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;   /* not enforceable */
+    st = ob_job_set_basic_limits(&job, &lim);
+    TEST_ASSERT_EQ(st, STATUS_NOT_SUPPORTED, "unenforceable limit rejected");
+    TEST_ASSERT_EQ(job.limit_flags, 0u, "state unchanged after rejection");
+}
+
+/* ACTIVE_PROCESS is enforceable: accepted and stored, round-tripped by query. */
+static void test_job_limits_accept_active_process(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_LIMIT_INFORMATION lim = {0};
+    JOBOBJECT_BASIC_LIMIT_INFORMATION got = {0};
+    NTSTATUS st;
+
+    lim.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    lim.ActiveProcessLimit = 4;
+    st = ob_job_set_basic_limits(&job, &lim);
+    TEST_ASSERT_EQ(st, STATUS_SUCCESS, "active-process limit accepted");
+
+    ob_job_collect_limits(&job, &got);
+    TEST_ASSERT_EQ(got.LimitFlags, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, "flag stored");
+    TEST_ASSERT_EQ(got.ActiveProcessLimit, 4u, "limit value stored");
+}
+
+/* ACTIVE_PROCESS with a zero limit is nonsensical -> rejected. */
+static void test_job_limits_active_zero_rejected(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_LIMIT_INFORMATION lim = {0};
+
+    lim.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    lim.ActiveProcessLimit = 0;
+    TEST_ASSERT_EQ(ob_job_set_basic_limits(&job, &lim),
+                   STATUS_INVALID_PARAMETER, "zero active-process limit rejected");
+}
+
+/* KILL_ON_JOB_CLOSE is honored (enforced at on_close) -> accepted. */
+static void test_job_limits_kill_on_close_ok(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_LIMIT_INFORMATION lim = {0};
+
+    lim.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    TEST_ASSERT_EQ(ob_job_set_basic_limits(&job, &lim),
+                   STATUS_SUCCESS, "kill-on-close accepted");
+    TEST_ASSERT_EQ(job.limit_flags, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                   "kill-on-close flag stored");
+}
+
+/* Membership scan finds present pids and rejects absent ones. */
+static void test_job_is_member_scan(void)
+{
+    JOB_OBJECT job = {0};
+
+    job.member_pids[0] = 5;
+    job.member_pids[1] = 9;
+    job.num_members = 2;
+    TEST_ASSERT_EQ(ob_job_is_member(&job, 5), 1, "pid 5 is a member");
+    TEST_ASSERT_EQ(ob_job_is_member(&job, 9), 1, "pid 9 is a member");
+    TEST_ASSERT_EQ(ob_job_is_member(&job, 7), 0, "pid 7 is not a member");
+}
+
+/* A pid-list buffer too small for every member returns a partial fill:
+ * written < assigned, and only `capacity` pids are copied in order. */
+static void test_job_pid_list_partial(void)
+{
+    JOB_OBJECT job = {0};
+    uint64_t out[2] = {0, 0};
+    uint32_t written = 99, assigned = 99;
+
+    job.member_pids[0] = 10;
+    job.member_pids[1] = 20;
+    job.member_pids[2] = 30;
+    job.num_members = 3;
+
+    ob_job_collect_pid_list(&job, out, 2, &written, &assigned);
+    TEST_ASSERT_EQ(assigned, 3u, "assigned == total members");
+    TEST_ASSERT_EQ(written, 2u, "written == capacity (partial)");
+    TEST_ASSERT_EQ((uint32_t)out[0], 10u, "first pid copied");
+    TEST_ASSERT_EQ((uint32_t)out[1], 20u, "second pid copied");
+}
+
+/* Accounting reports the live/active/terminated process counts; CPU times are
+ * zero when the (invalid) member pids resolve to no task. */
+static void test_job_accounting_counts(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+
+    /* High, out-of-range pids -> task_get_by_pid returns NULL -> no live sum. */
+    job.member_pids[0] = TASK_MAX + 100;
+    job.member_pids[1] = TASK_MAX + 101;
+    job.member_pids[2] = TASK_MAX + 102;
+    job.num_members = 3;         /* currently live */
+    job.total_processes = 5;     /* ever associated (monotonic) */
+    job.total_terminated = 2;    /* killed by a limit / TerminateJobObject */
+    job.acc_user_ns = 100 * 100; /* departed-member CPU: 100 units of 100ns */
+    job.acc_read_ops = 7;        /* departed-member I/O persists */
+
+    ob_job_collect_accounting(&job, &acct, &io);
+    TEST_ASSERT_EQ(acct.TotalProcesses, 5u, "total == ever-associated (not live)");
+    TEST_ASSERT_EQ(acct.ActiveProcesses, 3u, "active == live members");
+    TEST_ASSERT_EQ(acct.TotalTerminatedProcesses, 2u, "terminated count");
+    TEST_ASSERT_EQ((uint32_t)acct.TotalUserTime, 100u, "departed CPU time persists");
+    TEST_ASSERT_EQ((uint32_t)io.ReadOperationCount, 7u, "departed I/O persists");
+}
+
+/* --- Membership generation + the mostly-unlocked collector (TODO-25 s19) ---
+ *
+ * The collector no longer holds job->lock across the per-member live-counter
+ * reads: it snapshots membership plus the join-time baselines under the lock,
+ * sums the live counters with the lock released, then re-reads member_gen and
+ * retries if it moved. These tests prove the three things that makes safe --
+ * that churn is DETECTED, that detection is BOUNDED, and that neither outcome
+ * changes the published totals.
+ *
+ * Churn is injected rather than raced. ob_job_test_inject_gen_churn bumps the
+ * generation from inside the collector's re-check window, which is exactly where
+ * a concurrent join or departure would land; a genuine two-CPU race needs the
+ * per-CPU run queues the SMP phase-2 roadmap owns. The injector is the only way to
+ * reach the retry and fallback branches deterministically on this harness.
+ * ----------------------------------------------------------------------- */
+
+/* Restore the charge gate's STATE without clobbering its in-flight count. A blind
+ * write-back is a lost update: the word packs {state, in-flight charger count},
+ * so restoring a snapshot would erase an increment another agent made inside the
+ * window and its later gate_exit would decrement a count it no longer owns. Same
+ * helper (and same reasoning) as the one guarding the assign-unwind test in
+ * test_quota_ledger.c. */
+static void proc_ext_gate_restore_state(struct task *t, int64_t saved)
+{
+    uint32_t want = QUOTA_GATE_STATE(saved);
+
+    for (;;) {
+        int64_t now = atomic64_read(&t->quota_gate);
+
+        if (QUOTA_GATE_STATE(now) == want)
+            return;
+        if (atomic64_cmpxchg(&t->quota_gate, now,
+                             QUOTA_GATE_PACK(want, QUOTA_GATE_COUNT(now))) == now)
+            return;
+    }
+}
+
+/* Injected churn must be consumed by the RETRY path, not the fallback, while it
+ * stays inside the bound -- and the totals must be identical to the unchurned
+ * answer. Out-of-range pids keep the live sum provably zero, so the expected
+ * totals are exactly the persistent (departed-member) sums and nothing in the
+ * fixture can drift between the two collections. */
+static void test_job_collect_retries_within_bound(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+    uint64_t retries_before  = ob_job_collect_retry_count();
+    uint64_t fallback_before = ob_job_collect_fallback_count();
+    uint32_t churn = JOB_COLLECT_MAX_RETRIES - 1U;   /* one short of the bound */
+
+    job.member_pids[0] = TASK_MAX + 100;
+    job.num_members     = 1;
+    job.total_processes = 3;
+    job.acc_user_ns     = 250 * 100;
+    job.acc_read_ops    = 11;
+
+    ob_job_test_inject_gen_churn(churn);
+    ob_job_collect_accounting(&job, &acct, &io);
+    ob_job_test_inject_gen_churn(0);
+
+    TEST_ASSERT_EQ((uint32_t)(ob_job_collect_retry_count() - retries_before),
+                   churn, "one retry per churn event, no more");
+    TEST_ASSERT_EQ((uint32_t)(ob_job_collect_fallback_count() - fallback_before),
+                   0u, "churn inside the bound never reaches the fallback");
+    /* The published answer is the point: a detected mismatch discards the
+     * attempt, it does not degrade the result. */
+    TEST_ASSERT_EQ((uint32_t)acct.TotalUserTime, 250u,
+                   "retried collection still reports exact CPU total");
+    TEST_ASSERT_EQ((uint32_t)io.ReadOperationCount, 11u,
+                   "retried collection still reports exact I/O total");
+    TEST_ASSERT_EQ(acct.TotalProcesses, 3u, "counts survive the retry");
+}
+
+/* Churn that outlasts the bound must take the fully-locked walk -- ONCE -- and
+ * still publish the same totals. This is the anti-livelock assertion: the
+ * collector returns void, so "give up and report a torn sum" is not an option it
+ * has, and "keep retrying" would hang the caller. */
+static void test_job_collect_falls_back_past_bound(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+    uint64_t retries_before  = ob_job_collect_retry_count();
+    uint64_t fallback_before = ob_job_collect_fallback_count();
+
+    job.member_pids[0] = TASK_MAX + 101;
+    job.num_members      = 1;
+    job.total_processes  = 4;
+    job.total_terminated = 1;
+    job.acc_kernel_ns    = 700 * 100;
+    job.acc_write_bytes  = 4096;
+
+    /* Every attempt invalidated, including the last one. */
+    ob_job_test_inject_gen_churn(JOB_COLLECT_MAX_RETRIES);
+    ob_job_collect_accounting(&job, &acct, &io);
+    ob_job_test_inject_gen_churn(0);
+
+    TEST_ASSERT_EQ((uint32_t)(ob_job_collect_retry_count() - retries_before),
+                   JOB_COLLECT_MAX_RETRIES,
+                   "every attempt inside the bound was retried");
+    TEST_ASSERT_EQ((uint32_t)(ob_job_collect_fallback_count() - fallback_before),
+                   1u, "exactly one locked-walk fallback, not a loop");
+    TEST_ASSERT_EQ((uint32_t)acct.TotalKernelTime, 700u,
+                   "fallback reports the same CPU total as the fast path");
+    TEST_ASSERT_EQ((uint32_t)io.WriteTransferCount, 4096u,
+                   "fallback reports the same I/O total as the fast path");
+    TEST_ASSERT_EQ(acct.TotalTerminatedProcesses, 1u, "counts survive the fallback");
+}
+
+/* An accounting READ must not move the generation. If it did, two collections in
+ * a row would each invalidate the other and the fast path would be dead code that
+ * always degraded to the fallback. */
+static void test_job_gen_still_across_accounting_read(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+    uint64_t gen_before;
+    uint64_t fallback_before = ob_job_collect_fallback_count();
+
+    job.member_pids[0] = TASK_MAX + 102;
+    job.num_members    = 1;
+    gen_before = ob_job_member_gen(&job);
+
+    ob_job_collect_accounting(&job, &acct, &io);
+    ob_job_collect_accounting(&job, &acct, &io);
+
+    TEST_ASSERT_EQ(ob_job_member_gen(&job), gen_before,
+                   "a pure accounting read leaves the generation alone");
+    TEST_ASSERT_EQ((uint32_t)(ob_job_collect_fallback_count() - fallback_before),
+                   0u, "back-to-back reads both take the fast path");
+    /* A limit write is not a membership event either. */
+    {
+        JOBOBJECT_BASIC_LIMIT_INFORMATION lim = {0};
+
+        lim.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        TEST_ASSERT_EQ(ob_job_set_basic_limits(&job, &lim), STATUS_SUCCESS,
+                       "limit write accepted");
+        TEST_ASSERT_EQ(ob_job_member_gen(&job), gen_before,
+                       "a limit write is not a membership event");
+    }
+}
+
+/* One live member's membership-interval CONTROL-I/O delta, computed the same way
+ * the collector computes it. The control ("Other") columns are the only ones that
+ * cannot drift underneath an assertion: CPU time advances on every scheduler tick
+ * and read/write counters move whenever anything touches the VFS, but
+ * task_acct_note_control_io fires only on a device-control operation, which nothing
+ * in this suite performs. Asserting on a column that cannot move is what makes the
+ * expected value exact rather than approximately right. */
+static uint64_t proc_ext_member_other_ops(struct task *t)
+{
+    struct task_acct_base live;
+
+    task_acct_delta_since(t, &t->job_acct_base, &live);
+    return live.io_other_count;
+}
+
+/* A MIXED member list must contribute the resolvable member exactly ONCE and the
+ * unresolvable ones not at all, while ActiveProcesses still reports every entry the
+ * body holds. The resolvable pid deliberately sits at a NON-ZERO index, surrounded
+ * by unresolvable ones: a compaction that mis-indexed would then either drop it or
+ * duplicate it, and the exact-once total is what distinguishes those from correct
+ * behaviour. (All-invalid fixtures cannot: both walks skip a NULL member anyway.) */
+static void test_job_collect_mixed_membership_compaction(void)
+{
+    struct task *t = task_current();
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+    uint64_t one_member;
+    uint64_t retries_before, fallback_before;
+
+    if (!t) {
+        TEST_SKIP("needs a current task as the resolvable member");
+        return;
+    }
+    one_member = proc_ext_member_other_ops(t);
+    retries_before  = ob_job_collect_retry_count();
+    fallback_before = ob_job_collect_fallback_count();
+
+    job.member_pids[0] = TASK_MAX + 200;   /* unresolvable */
+    job.member_pids[1] = t->pid;           /* resolvable, at a non-zero index */
+    job.member_pids[2] = TASK_MAX + 201;   /* unresolvable */
+    job.num_members     = 3;
+    job.total_processes = 3;
+    job.acc_other_ops   = 5;               /* departed-member control I/O persists */
+
+    ob_job_collect_accounting(&job, &acct, &io);
+    TEST_ASSERT_EQ(acct.ActiveProcesses, 3u,
+                   "ActiveProcesses reports every body entry, resolvable or not");
+    TEST_ASSERT_EQ(io.OtherOperationCount, 5ull + one_member,
+                   "the resolvable member contributes exactly once, the others not at all");
+
+    /* The attempt is validated by the task PUBLICATION SEQUENCE as well as the
+     * generation, so a member that is unresolvable throughout must not read as
+     * churn. If it did, every job holding one would retry to exhaustion and take
+     * the locked fallback on every single query -- the publication check silently
+     * undoing the whole point of the unlocked walk. */
+    TEST_ASSERT_EQ(ob_job_collect_retry_count(), retries_before,
+                   "a stably-unresolvable member is not churn: no retry");
+    TEST_ASSERT_EQ(ob_job_collect_fallback_count(), fallback_before,
+                   "and no fallback");
+}
+
+/* The EXACT JOB_MAX_MEMBERS boundary. The collector fills a JOB_MAX_MEMBERS stack
+ * array, so a last-slot omission or an off-by-one in the snapshot, the retry or the
+ * fallback walk would otherwise be invisible. The same resolvable pid fills every
+ * slot -- the collector places no distinctness requirement on member_pids, and
+ * N copies of a known delta is precisely what makes the expected total exact. */
+static void test_job_collect_at_member_cap(void)
+{
+    struct task *t = task_current();
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+    uint64_t one_member;
+    uint32_t i;
+
+    if (!t) {
+        TEST_SKIP("needs a current task as the resolvable member");
+        return;
+    }
+    one_member = proc_ext_member_other_ops(t);
+
+    for (i = 0; i < JOB_MAX_MEMBERS; i++)
+        job.member_pids[i] = t->pid;
+    job.num_members = JOB_MAX_MEMBERS;
+
+    ob_job_collect_accounting(&job, &acct, &io);
+    TEST_ASSERT_EQ(acct.ActiveProcesses, (uint32_t)JOB_MAX_MEMBERS,
+                   "a full job reports every member");
+    TEST_ASSERT_EQ(io.OtherOperationCount,
+                   one_member * (uint64_t)JOB_MAX_MEMBERS,
+                   "every slot including the last contributes to the aggregate");
+
+    /* The fallback walk must agree with the fast path at the same boundary. */
+    ob_job_test_inject_gen_churn(JOB_COLLECT_MAX_RETRIES);
+    ob_job_collect_accounting(&job, &acct, &io);
+    ob_job_test_inject_gen_churn(0);
+    TEST_ASSERT_EQ(io.OtherOperationCount,
+                   one_member * (uint64_t)JOB_MAX_MEMBERS,
+                   "the locked fallback agrees with the fast path at the cap");
+}
+
+/* Nullable inputs. A NULL job must leave the caller's buffers fully zeroed rather
+ * than faulting or leaking stack, and `io` is optional -- an unconditional write
+ * through it would be a NULL dereference on the accounting-only query path. */
+static void test_job_collect_null_inputs(void)
+{
+    JOB_OBJECT job = {0};
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acct;
+    IO_COUNTERS io;
+    uint32_t i;
+
+    /* Poison both, so "zeroed" is a real observation and not the initial state. */
+    for (i = 0; i < sizeof(acct); i++)
+        ((uint8_t *)&acct)[i] = 0xA5;
+    for (i = 0; i < sizeof(io); i++)
+        ((uint8_t *)&io)[i] = 0xA5;
+
+    ob_job_collect_accounting((JOB_OBJECT *)0, &acct, &io);
+    TEST_ASSERT_EQ(acct.TotalProcesses, 0u, "a NULL job zeroes the accounting block");
+    TEST_ASSERT_EQ((uint64_t)acct.TotalUserTime, 0ull, "including the CPU columns");
+    TEST_ASSERT_EQ(io.OtherOperationCount, 0ull, "and the I/O block");
+    TEST_ASSERT_EQ(io.ReadTransferCount, 0ull, "every I/O column");
+
+    /* Optional io: a zero-member job with no I/O buffer must still answer. */
+    job.total_processes = 2;
+    job.num_members     = 0;
+    ob_job_collect_accounting(&job, &acct, (IO_COUNTERS *)0);
+    TEST_ASSERT_EQ(acct.TotalProcesses, 2u,
+                   "a NULL io pointer is optional, not a fault");
+    TEST_ASSERT_EQ(acct.ActiveProcesses, 0u, "a zero-member job reports no members");
+
+    TEST_ASSERT_EQ(ob_job_member_gen((JOB_OBJECT *)0), 0ull,
+                   "the generation of a NULL job is zero, not a fault");
+}
+
+/* The generation MOVES on a real join and on a real departure.
+ *
+ * A REAL Object-Manager-allocated job, never a stack JOB_OBJECT: ob_job_assign
+ * calls ObReferenceObject, which writes to the OBJECT_HEADER immediately BEFORE
+ * the body, so a stack fixture would corrupt unrelated stack memory. Same
+ * reasoning and same fixture shape as the ob_job_assign unwind test in
+ * test_quota_ledger.c.
+ *
+ * Assign/detach run against the LIVE current task, so the teardown restores the
+ * charge-gate state and detaches defensively -- assertions record failure and
+ * CONTINUE, so a regression must not leave this task a member or its gate shut
+ * for the rest of the boot. */
+static void test_job_gen_moves_on_assign_and_detach(void)
+{
+    struct task *t = task_current();
+    HANDLE h;
+    HANDLE_TABLE_ENTRY *ent;
+    JOB_OBJECT *job;
+    int64_t saved_gate;
+    uint64_t gen_created, gen_assigned;
+
+    /* Skip LOUDLY rather than returning silently: an unavailable fixture must not
+     * look like a passing assertion. The only legitimate skip is a task already in
+     * a job -- assign would then report ACCESS_DENIED for a reason that has nothing
+     * to do with the generation. */
+    if (!t || t->job) {
+        TEST_SKIP("needs a jobless current task to assign");
+        return;
+    }
+    saved_gate = atomic64_read(&t->quota_gate);
+
+    h = ob_job_create(&t->handle_table, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        TEST_SKIP("job object could not be allocated");
+        return;
+    }
+    ent = ObpLookupHandle(&t->handle_table, h);
+    if (!ent || !ent->object) {
+        (void)ObpFreeHandle(&t->handle_table, h);
+        TEST_SKIP("job handle did not resolve to a body");
+        return;
+    }
+    job = (JOB_OBJECT *)ent->object;
+
+    gen_created = ob_job_member_gen(job);
+    /* ASSERTED, not branched on: a refused assign here means every assertion below
+     * would silently not run, and the test would report success having proved
+     * nothing about the generation at all. */
+    TEST_ASSERT_EQ(ob_job_assign(job, t), STATUS_SUCCESS,
+                   "the live task joins a fresh job");
+    gen_assigned = ob_job_member_gen(job);
+    TEST_ASSERT_EQ((uint32_t)(gen_assigned - gen_created), 1u,
+                   "a join bumps the membership generation exactly once");
+
+    ob_job_detach_task(t);
+    TEST_ASSERT_EQ((uint32_t)(ob_job_member_gen(job) - gen_assigned), 1u,
+                   "a departure bumps it exactly once more");
+
+    ob_job_detach_task(t);              /* defensive: idempotent, never stay a member */
+    proc_ext_gate_restore_state(t, saved_gate);
+    (void)ObpFreeHandle(&t->handle_table, h);
+}
+
+/* --- Process groups + sessions: pure POSIX decision cores --- */
+
+/* Convenience: caller sid=1, target is the caller (own group) -> allow. */
+static void test_pgrp_setpgid_self_own_group(void)
+{
+    /* caller_sid=1, target pid=5 sid=1, is_caller=1, new_pgid=5 (own group) */
+    int rc = pgroup_setpgid_decide(1, 5, 1, 1, 0, 0, 5, 0, 0);
+    TEST_ASSERT_EQ(rc, 0, "self creating own group is allowed");
+}
+
+static void test_pgrp_setpgid_child_join_same_session(void)
+{
+    /* child pid=6 sid=1, join existing group pgid=5 present in session 1 */
+    int rc = pgroup_setpgid_decide(1, 6, 1, 0, 1, 0, 5, 1, 1);
+    TEST_ASSERT_EQ(rc, 0, "child joining a same-session group is allowed");
+}
+
+static void test_pgrp_setpgid_not_child_esrch(void)
+{
+    /* target is neither the caller nor a child */
+    int rc = pgroup_setpgid_decide(1, 9, 1, 0, 0, 0, 9, 0, 0);
+    TEST_ASSERT_EQ(rc, -ESRCH, "non-child target is ESRCH");
+}
+
+static void test_pgrp_setpgid_execed_child_eacces(void)
+{
+    /* child that has already exec'd */
+    int rc = pgroup_setpgid_decide(1, 6, 1, 0, 1, 1, 6, 0, 0);
+    TEST_ASSERT_EQ(rc, -EACCES, "exec'd child cannot be moved (EACCES)");
+}
+
+static void test_pgrp_setpgid_cross_session_eperm(void)
+{
+    /* child in a different session (target_sid=2 != caller_sid=1) */
+    int rc = pgroup_setpgid_decide(1, 6, 2, 0, 1, 0, 6, 0, 0);
+    TEST_ASSERT_EQ(rc, -EPERM, "cross-session target is EPERM");
+}
+
+static void test_pgrp_setpgid_session_leader_eperm(void)
+{
+    /* target is a session leader: target_sid == target_pid (7) */
+    int rc = pgroup_setpgid_decide(7, 7, 7, 0, 1, 0, 7, 0, 0);
+    TEST_ASSERT_EQ(rc, -EPERM, "moving a session leader is EPERM");
+}
+
+static void test_pgrp_setpgid_dest_absent_eperm(void)
+{
+    /* join a group that does not exist (dest_present=0), new_pgid != target */
+    int rc = pgroup_setpgid_decide(1, 6, 1, 0, 1, 0, 5, 0, 0);
+    TEST_ASSERT_EQ(rc, -EPERM, "unknown destination group is EPERM");
+}
+
+static void test_pgrp_setpgid_dest_other_session_eperm(void)
+{
+    /* dest group present but in a different session (dest_sid=2) */
+    int rc = pgroup_setpgid_decide(1, 6, 1, 0, 1, 0, 5, 1, 2);
+    TEST_ASSERT_EQ(rc, -EPERM, "destination group in another session is EPERM");
+}
+
+static void test_pgrp_setsid_leader_denied(void)
+{
+    /* caller is a process-group leader: pgid == pid */
+    int rc = pgroup_setsid_decide(4, 4, 0);
+    TEST_ASSERT_EQ(rc, -EPERM, "a group leader cannot setsid (EPERM)");
+}
+
+static void test_pgrp_setsid_nonleader_ok(void)
+{
+    /* caller is not a group leader (pgid 2 != pid 4), no colliding group members */
+    int rc = pgroup_setsid_decide(4, 2, 0);
+    TEST_ASSERT_EQ(rc, 0, "a non-leader with no colliding group may setsid");
+}
+
+static void test_pgrp_setsid_nonleader_group_members_denied(void)
+{
+    /* non-leader, but a group named caller_pid still has other live members */
+    int rc = pgroup_setsid_decide(4, 2, 1);
+    TEST_ASSERT_EQ(rc, -EPERM, "a populated caller-pid group blocks setsid (EPERM)");
+}
+
+static void test_pgrp_setpgid_negative_pgid_einval(void)
+{
+    /* A negative pgid (0xFFFFFFFF == -1 as int32) is EINVAL (POSIX). */
+    int rc = pgroup_setpgid_decide(1, 5, 1, 1, 0, 0, 0xFFFFFFFFu, 0, 0);
+    TEST_ASSERT_EQ(rc, -EINVAL, "negative pgid is EINVAL");
+}
+
+static void test_pgrp_orphan_link_alive(void)
+{
+    /* Live parent in a different group, same session -> keeps the group alive. */
+    int rc = pgroup_orphan_link_keeps_alive(5, 1, 1, 3, 1);
+    TEST_ASSERT_EQ(rc, 1, "in-session parent outside the group prevents orphaning");
+}
+
+static void test_pgrp_orphan_link_not_alive(void)
+{
+    /* Parent in the SAME group does not disqualify orphaning. */
+    int rc = pgroup_orphan_link_keeps_alive(5, 1, 1, 5, 1);
+    TEST_ASSERT_EQ(rc, 0, "a same-group parent does not keep the group non-orphaned");
+}
+
+static void test_pgrp_getpgid_unknown_esrch(void)
+{
+    /* A pid at/above the task table cannot exist. */
+    int rc = pgroup_getpgid(0x7fffffffu);
+    TEST_ASSERT_EQ(rc, -ESRCH, "getpgid of an unknown pid is ESRCH");
+}
+
+static void test_pgrp_setpgid_self_after_exec_ok(void)
+{
+    /* A process may always setpgid ITSELF, even after it has exec'd; the EACCES
+     * rule only bars a PARENT from moving an exec'd CHILD (target_is_caller=1). */
+    int rc = pgroup_setpgid_decide(1, 5, 1, 1, 0, 1, 5, 0, 0);
+    TEST_ASSERT_EQ(rc, 0, "self setpgid allowed even after exec");
+}
+
+static void test_pgrp_genconsolectrl_bad_event(void)
+{
+    /* An unsupported control event returns FALSE (0) without delivering. */
+    int rc = GenerateConsoleCtrlEvent(99u, 1u);
+    TEST_ASSERT_EQ(rc, 0, "unsupported console control event returns FALSE");
+}
+
+static void test_pgrp_genconsolectrl_empty_group(void)
+{
+    /* CTRL_C for a group with no live members returns FALSE (nothing delivered);
+     * 0x7fffffff cannot name a live pgid (bounded by TASK_MAX). */
+    int rc = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0x7fffffffu);
+    TEST_ASSERT_EQ(rc, 0, "CTRL_C to an empty group returns FALSE");
+}
+
+static void test_pgrp_genconsole_auth_ok(void)
+{
+    /* Caller in the controlling session, target group present in that session. */
+    int rc = pgroup_genconsole_authorized(5, 1, 5, 1, 5);
+    TEST_ASSERT_EQ(rc, 1, "same-session console control event is authorized");
+}
+
+static void test_pgrp_genconsole_auth_foreign_target(void)
+{
+    /* Target group is in a DIFFERENT session than the controlling console. */
+    int rc = pgroup_genconsole_authorized(5, 1, 5, 1, 7);
+    TEST_ASSERT_EQ(rc, 0, "cross-session target group is denied");
+}
+
+static void test_pgrp_genconsole_auth_no_owner(void)
+{
+    /* No session controls the console yet. */
+    int rc = pgroup_genconsole_authorized(5, 0, 0, 1, 5);
+    TEST_ASSERT_EQ(rc, 0, "no console owner denies control events");
+}
+
+void test_register_proc_ext(void)
+{
+    test_suite_register_cat("ProcExt: resolve absolute passthrough",
+                            test_resolve_absolute_passthrough, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve relative join",
+                            test_resolve_relative_join, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve relative from root",
+                            test_resolve_relative_from_root, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve '.' collapse",
+                            test_resolve_dot_collapse, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve '..' pop",
+                            test_resolve_dotdot_pop, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve '..' at root stays root",
+                            test_resolve_dotdot_at_root_stays_root, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve '..' cannot escape drive",
+                            test_resolve_dotdot_cannot_escape, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve '/' normalized to '\\'",
+                            test_resolve_forward_slash_normalized, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve root-relative",
+                            test_resolve_root_relative, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve multi-separator collapse",
+                            test_resolve_multi_separator_collapse, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve overflow rejected",
+                            test_resolve_overflow_rejected, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve invalid inputs",
+                            test_resolve_invalid_inputs, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: cwd set/get roundtrip",
+                            test_task_cwd_set_get_roundtrip, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: cwd overflow leaves unchanged",
+                            test_task_cwd_overflow_leaves_unchanged, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: cwd get NULL task",
+                            test_task_cwd_get_null_task, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve 255-byte component ok",
+                            test_resolve_component_255_ok, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: resolve 256-byte component rejected",
+                            test_resolve_component_256_rejected, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: NtCreateFile zero-Length name",
+                            test_ntcreatefile_zero_length_name, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit get/set roundtrip",
+                            test_rlimit_get_set_roundtrip, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit cur>max rejected",
+                            test_rlimit_cur_gt_max_rejected, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit raise hard needs privilege",
+                            test_rlimit_raise_hard_needs_priv, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit lower hard unprivileged",
+                            test_rlimit_lower_hard_unprivileged, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit bad resource rejected",
+                            test_rlimit_bad_resource_rejected, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit PID0 defaults",
+                            test_rlimit_pid0_defaults, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit inherit copies full array",
+                            test_rlimit_inherit_copies_full_array, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: rlimit MEMLOCK hard ceiling default",
+                            test_rlimit_memlock_hard_ceiling_default, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: mitigation fresh is zero",
+                            test_mit_fresh_is_zero, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: mitigation apply sets bit",
+                            test_mit_apply_sets_bit, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: mitigation apply is monotonic",
+                            test_mit_apply_is_monotonic, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: mitigation child-set enables",
+                            test_mit_child_set_enables, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: mitigation child-set no-op when unset",
+                            test_mit_child_set_noop_when_unset, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: mitigation child-set clear denied",
+                            test_mit_child_set_clear_denied, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge parse valid tokens",
+                            test_pledge_parse_valid, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge parse unknown rejected",
+                            test_pledge_parse_unknown_rejected, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge parse empty",
+                            test_pledge_parse_empty, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge tighten first adopts",
+                            test_pledge_tighten_first, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge tighten narrows",
+                            test_pledge_tighten_intersect_narrows, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge tighten cannot widen",
+                            test_pledge_tighten_cannot_widen, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge classify core/proc/deny",
+                            test_pledge_classify_core_and_deny, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge file categories",
+                            test_pledge_file_categories, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge is-allowed decision",
+                            test_pledge_is_allowed, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: unveil perms for vfs flags",
+                            test_unveil_perms_for_vfs, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: unveil exact + component boundary",
+                            test_unveil_covers_exact_and_boundary, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: unveil deny + insufficient perms",
+                            test_unveil_covers_deny_and_perms, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: unveil longest match wins",
+                            test_unveil_longest_match_wins, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: pledge legacy INT 0x80 gate",
+                            test_pledge_legacy_gate, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: unveil empty-locked denies all",
+                            test_unveil_lock_empty_denies, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: unveil perms tighten-only",
+                            test_unveil_perms_tighten_only, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job limits reject unenforceable",
+                            test_job_limits_reject_unsupported, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job limits accept active-process",
+                            test_job_limits_accept_active_process, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job active-process zero rejected",
+                            test_job_limits_active_zero_rejected, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job kill-on-close accepted",
+                            test_job_limits_kill_on_close_ok, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job membership scan",
+                            test_job_is_member_scan, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job pid-list partial fill",
+                            test_job_pid_list_partial, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job accounting counts",
+                            test_job_accounting_counts, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job collect retries within bound",
+                            test_job_collect_retries_within_bound, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job collect falls back past bound",
+                            test_job_collect_falls_back_past_bound, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job generation still across accounting read",
+                            test_job_gen_still_across_accounting_read, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job generation moves on assign and detach",
+                            test_job_gen_moves_on_assign_and_detach, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job collect mixed membership compaction",
+                            test_job_collect_mixed_membership_compaction, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job collect at member cap",
+                            test_job_collect_at_member_cap, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: job collect null inputs",
+                            test_job_collect_null_inputs, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid self own-group ok",
+                            test_pgrp_setpgid_self_own_group, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid child join same-session ok",
+                            test_pgrp_setpgid_child_join_same_session, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid non-child ESRCH",
+                            test_pgrp_setpgid_not_child_esrch, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid exec'd child EACCES",
+                            test_pgrp_setpgid_execed_child_eacces, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid cross-session EPERM",
+                            test_pgrp_setpgid_cross_session_eperm, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid session-leader EPERM",
+                            test_pgrp_setpgid_session_leader_eperm, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid dest-absent EPERM",
+                            test_pgrp_setpgid_dest_absent_eperm, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid dest other-session EPERM",
+                            test_pgrp_setpgid_dest_other_session_eperm, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setsid group-leader denied",
+                            test_pgrp_setsid_leader_denied, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setsid non-leader ok",
+                            test_pgrp_setsid_nonleader_ok, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setsid non-leader populated group denied",
+                            test_pgrp_setsid_nonleader_group_members_denied, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid negative pgid EINVAL",
+                            test_pgrp_setpgid_negative_pgid_einval, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: orphan link in-session parent keeps alive",
+                            test_pgrp_orphan_link_alive, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: orphan link same-group parent no-op",
+                            test_pgrp_orphan_link_not_alive, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: getpgid unknown ESRCH",
+                            test_pgrp_getpgid_unknown_esrch, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: setpgid self after exec ok",
+                            test_pgrp_setpgid_self_after_exec_ok, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: GenerateConsoleCtrlEvent bad event FALSE",
+                            test_pgrp_genconsolectrl_bad_event, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: GenerateConsoleCtrlEvent empty group FALSE",
+                            test_pgrp_genconsolectrl_empty_group, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: GenerateConsoleCtrlEvent same-session authorized",
+                            test_pgrp_genconsole_auth_ok, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: GenerateConsoleCtrlEvent cross-session denied",
+                            test_pgrp_genconsole_auth_foreign_target, TEST_CAT_SCHED);
+    test_suite_register_cat("ProcExt: GenerateConsoleCtrlEvent no-owner denied",
+                            test_pgrp_genconsole_auth_no_owner, TEST_CAT_SCHED);
+}
+
+#endif /* KERNEL_TESTS */

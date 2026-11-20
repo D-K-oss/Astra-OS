@@ -1,0 +1,47 @@
+#!/bin/bash
+# =============================================================================
+# pre-push — Run kernel unit tests before pushing
+#
+# Blocks push if tests fail. Install via: bash scripts/install-hooks.sh
+# Remove via: bash scripts/install-hooks.sh --remove
+# =============================================================================
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+echo -e "${YELLOW}[pre-push]${RESET} Running kernel tests before push..."
+
+# TODO graph validation (TODO-06 §6). Cheap fast-fail before the full
+# build + test cycle: rebuild build/todo-cache.json and run the 7-check
+# validator. Catches stale XREFs, dangling sections, orphan rows, dep
+# cycles, missing test bats, and status mismatches that would otherwise
+# be surfaced only at PR time via .github/workflows/todo-graph.yml.
+# --keep-cache leaves the cache on disk so subsequent local queries
+# (make todo-graph-ready / blocked) do not need a rebuild.
+if ! bash scripts/todo-graph/build-and-validate.sh --keep-cache --quiet; then
+    echo -e "${RED}${BOLD}[pre-push] TODO GRAPH VALIDATION FAILED${RESET}: push blocked"
+    echo "  Run 'bash scripts/todo-graph/build-and-validate.sh' to see details."
+    exit 1
+fi
+
+# Build first, fast fail
+if ! bash scripts/hooks/heavy.sh bash scripts/build.sh > /dev/null 2>&1; then
+    echo -e "${RED}${BOLD}[pre-push] BUILD FAILED${RESET}: push blocked"
+    echo "  Run 'bash scripts/build.sh' to see errors."
+    exit 1
+fi
+
+# Run tests via test.sh (handles boot.conf patching, QEMU, parsing)
+if bash scripts/hooks/heavy.sh bash scripts/test.sh > /dev/null 2>&1; then
+    echo -e "${GREEN}[pre-push]${RESET} All tests passed — push allowed"
+    exit 0
+else
+    echo -e "${RED}${BOLD}[pre-push] TESTS FAILED${RESET} -- push blocked"
+    echo "  Run 'bash scripts/test.sh' to see details."
+    exit 1
+fi

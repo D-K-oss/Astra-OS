@@ -1,0 +1,385 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Impossible OS — Automated Release
+#
+# Triggered when a version tag (v*) is pushed.
+# Builds the OS, converts to VDI, packages everything into a versioned zip,
+# and publishes a GitHub Release.
+#
+# Stable releases (no suffix) auto-delete old pre-releases (alpha/beta/rc).
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write          # Needed to create/delete releases and upload assets
+  packages: read
+
+env:
+  LLVM_VERSION: "19"
+  # Node 20 runtime removed from runners 2026-09-16; opt in to Node 24 now.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-26.04
+    # The pinned CI image holds the whole toolchain (scripts/ci/image/Dockerfile);
+    # this job installs nothing, so a package-mirror outage cannot fail it.
+    container:
+      image: ghcr.io/rizonesoft/impossible-os-ci@sha256:d5d684cc6bc2740e127b72c56189f9a424c800041db489844d1939e39b019176
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --init: GitHub makes `tail -f /dev/null` PID 1, which never reaps an orphan.
+      options: --init --user 1001:1001
+    timeout-minutes: 40
+    # A release is compiled from source: no cache is restored (check-compile-cache.py),
+    # and the image's ccache is not used either, as before the image held one.
+    env:
+      BUILD_NO_CCACHE: "1"
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
+      # ── Extract version from tag ─────────────────────────────────────────
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+          # Detect pre-release (alpha, beta, rc)
+          if [[ "$TAG" =~ -(alpha|beta|rc) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "✅ Tag: $TAG (pre-release: $(echo "$TAG" | grep -qE '-(alpha|beta|rc)' && echo yes || echo no))"
+
+      # ── Verify toolchain matches scripts/setup.sh sentinel contract ─────
+      - name: Verify toolchain sentinels and version floors
+        run: bash scripts/setup.sh --verify
+
+      # ── Style lint (release gate) ───────────────────────────────────────
+      # Same checks as build.yml: include-guards, line length, trailing
+      # whitespace, snake_case names, numeric-TODO-shorthand drift. The
+      # legacy-XREF sweep drained the pre-existing allowlist, so a release
+      # cut now fails if any new numeric-TODO shorthand slipped in outside
+      # todo/**.
+      - name: Run style lint
+        run: bash scripts/lint.sh
+
+      # ── Build ───────────────────────────────────────────────────────────
+      - name: Build OS (clean)
+        run: bash scripts/build.sh clean
+
+      # ── Unit tests (release gate) ───────────────────────────────────────
+      # A tag push off main should already be green, but this catches the
+      # case where main was tagged between a regression landing and the
+      # post-commit test advisory surfacing. Do NOT `|| true` this.
+      - name: Run unit tests
+        run: bash scripts/test.sh QUIET=1
+
+      # ── Verify build success ────────────────────────────────────────────
+      - name: Verify build sentinel
+        run: |
+          LAST_LINE=$(tail -1 build/build.log)
+          echo "Build log last line: $LAST_LINE"
+          if [ "$LAST_LINE" != "=== BUILD OK ===" ]; then
+            echo "::error::Build did not complete successfully"
+            tail -30 build/build.log
+            exit 1
+          fi
+          echo "✅ Build succeeded"
+
+      # Preserve the ON-flavor (KERNEL_TESTS=on) compile database before the
+      # off rebuild overwrites it: the seam gate's advisory PART A2 needs the
+      # test-object compile commands (the release/off DB prunes them) to derive
+      # its "referenced only by pruned test objects" candidate inventory.
+      # (release test-surface exclusion -- advisory only, never blocks the release.)
+      - name: Preserve ON-flavor compile DB for the test-ref audit
+        run: |
+          # Write to the repo root (not build/): the off `build.sh clean` wipes
+          # build/ but leaves the root, and the seam gate looks for
+          # compile_commands.on.json there.
+          if [ -s compile_commands.json ]; then
+            cp compile_commands.json compile_commands.on.json
+            echo "✅ saved ON-flavor compile DB ($(python3 -c 'import json;print(len(json.load(open("compile_commands.json"))))') entries)"
+          else
+            echo "::warning::compile_commands.json absent after ON build; PART A2 advisory will skip"
+          fi
+
+      # ── Release-flavor rebuild + seam-inventory gate ────────────────────
+      # The build + unit tests above ran the TEST flavor (KERNEL_TESTS=on) so
+      # the suite could execute. A SHIPPED image must not carry that surface,
+      # so clean-rebuild the pruned release flavor and PROVE it is clean before
+      # anything is packaged. build.sh reads KERNEL_TESTS from the environment;
+      # a clean rebuild also regenerates the release-flavor system-disk.img that
+      # the packaging steps below consume. (Release-flavor proof gate.)
+      - name: Rebuild release flavor (KERNEL_TESTS=off)
+        run: KERNEL_TESTS=off bash scripts/build.sh clean
+
+      - name: Verify release build sentinel
+        run: |
+          LAST_LINE=$(tail -1 build/build.log)
+          echo "Release build log last line: $LAST_LINE"
+          if [ "$LAST_LINE" != "=== BUILD OK ===" ]; then
+            echo "::error::Release-flavor build did not complete successfully"
+            tail -30 build/build.log
+            exit 1
+          fi
+          echo "✅ Release-flavor build succeeded"
+
+      # Prove no test symbol, no test link input, and a provenance stamp. This
+      # gate runs A+B+C (including --verify-provenance on build/kernel.exe), so
+      # release.yml independently REFUSES to package an unattested kernel. The
+      # gate's PART A needs compile_commands.json (bear-generated during the
+      # clean build); assert it exists so a missing Bear fails loudly here rather
+      # than silently skipping the proof.
+      - name: Prove release image carries no test surface
+        run: |
+          if [ ! -s compile_commands.json ]; then
+            echo "::error::compile_commands.json missing -- Bear did not run; the seam gate cannot derive its inventory"
+            exit 1
+          fi
+          bash scripts/check-release-symbols.sh
+
+      # Surface the ADVISORY PART A2 inventory (release test-surface exclusion): the gate
+      # prints only a sample, so retain the FULL candidate list as an artifact
+      # and emit a warning with the count -- otherwise a newly leaked helper
+      # outside the printed sample produces no durable signal (Codex adversarial
+      # F2). It is advisory: a non-empty list never fails the release.
+      - name: Surface test-only-reference advisory (PART A2)
+        if: always()
+        run: |
+          AUDIT=build/test-only-ref-audit.txt
+          if [ -s "$AUDIT" ]; then
+            N=$(wc -l < "$AUDIT")
+            echo "::warning::PART A2 advisory: $N shipped symbol(s) referenced only by pruned test objects (see the test-only-ref-audit artifact). Audit each; guard a genuine test-only helper with #ifdef KERNEL_TESTS. Over-reports by design -- never release-blocking."
+          else
+            echo "PART A2 advisory: no candidate inventory produced (empty or skipped)."
+          fi
+
+      - name: Upload test-only-reference advisory inventory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-only-ref-audit
+          path: build/test-only-ref-audit.txt
+          if-no-files-found: ignore
+
+      # Bind the gate to the SHIPPED image: extract every kernel copy from
+      # system-disk.img and prove it is byte-identical to the gated kernel.exe
+      # and carries the provenance stamp. Without this, the gate could pass on a
+      # detached build/kernel.exe while a stale or substituted kernel rides
+      # inside the packaged image. (Release-flavor proof, image binding.)
+      - name: Bind gated kernel to the packaged disk image
+        run: bash scripts/check-release-image-binding.sh build/system-disk.img build/kernel.exe
+
+      # ── Verify disk image ──────────────────────────────────────────────
+      - name: Verify disk image
+        run: |
+          if [ ! -f build/system-disk.img ]; then
+            echo "::error::build/system-disk.img not found"
+            exit 1
+          fi
+          SIZE=$(stat -c%s build/system-disk.img)
+          echo "✅ system-disk.img: $(( SIZE / 1024 / 1024 )) MiB"
+
+      # ── Convert to VDI (VirtualBox format) ──────────────────────────────
+      - name: Convert disk image to VDI
+        run: |
+          qemu-img convert -f raw -O vdi build/system-disk.img build/system-disk.vdi
+          SIZE=$(stat -c%s build/system-disk.vdi)
+          echo "✅ system-disk.vdi: $(( SIZE / 1024 / 1024 )) MiB"
+
+      # ── Generate full changelog ────────────────────────────────────────
+      - name: Generate categorized changelog
+        run: |
+          bash scripts/generate-changelog.sh
+          echo "✅ Full CHANGELOG.md generated"
+
+      # ── Package release zip ─────────────────────────────────────────────
+      - name: Package release archive
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          RELEASE_DIR="build/release"
+          ZIP_NAME="impossible-os-${TAG}.zip"
+
+          mkdir -p "$RELEASE_DIR"
+
+          # Copy assets into release staging directory
+          cp build/system-disk.img "$RELEASE_DIR/system-disk.img"
+          cp build/system-disk.vdi "$RELEASE_DIR/system-disk.vdi"
+          cp docs/getting-started/qemu.md "$RELEASE_DIR/QEMU-Setup-Guide.md"
+          cp docs/getting-started/virtualbox.md "$RELEASE_DIR/VirtualBox-Setup-Guide.md"
+          cp build/build.log "$RELEASE_DIR/build.log"
+          cp CHANGELOG.md "$RELEASE_DIR/CHANGELOG.md"
+
+          # Create zip from the release directory
+          cd build
+          zip -9 -j "$ZIP_NAME" \
+            release/system-disk.img \
+            release/system-disk.vdi \
+            release/QEMU-Setup-Guide.md \
+            release/VirtualBox-Setup-Guide.md \
+            release/build.log \
+            release/CHANGELOG.md
+          cd ..
+
+          SIZE=$(stat -c%s "build/$ZIP_NAME")
+          echo "✅ $ZIP_NAME: $(( SIZE / 1024 / 1024 )) MiB"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_path=build/$ZIP_NAME" >> "$GITHUB_OUTPUT"
+        id: package
+
+      # ── Generate release notes (summary for GitHub page) ────────────────
+      - name: Generate release notes
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          ZIP_NAME="${{ steps.package.outputs.zip_name }}"
+
+          # Get most recent 20 commits since previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            BODY=$(git log --pretty=format:"- %s (\`%h\`)" "$PREV_TAG"..HEAD | head -20)
+            COUNT=$(git rev-list --count "$PREV_TAG"..HEAD)
+          else
+            BODY=$(git log --pretty=format:"- %s (\`%h\`)" -20 HEAD)
+            COUNT=$(git rev-list --count HEAD)
+          fi
+
+          # Add overflow notice
+          if [ "$COUNT" -gt 20 ]; then
+            BODY="$BODY"$'\n'"- ... and $(( COUNT - 20 )) more commits — see \`CHANGELOG.md\` in the zip for the full categorized list"
+          fi
+
+          # Extract build info (build number from tag, rest from build_info.h)
+          BUILD_NUM=$(echo "$TAG" | grep -oP '\.\K[0-9]+$' || echo "0")
+          BUILD_COMMIT=$(grep '#define BUILD_COMMIT' include/build_info.h | awk '{print $3}' | tr -d '"')
+          BUILD_TIME=$(grep '#define BUILD_TIMESTAMP' include/build_info.h | awk '{print $3}' | tr -d '"')
+
+          # Write release notes
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$BODY"
+            echo ""
+            echo "---"
+            echo ""
+            echo "### 📦 Download"
+            echo ""
+            echo "Download **\`$ZIP_NAME\`** — it contains everything you need:"
+            echo ""
+            echo "| File | Description |"
+            echo "|------|-------------|"
+            echo "| \`system-disk.img\` | Raw GPT disk image — use with QEMU or write to USB |"
+            echo "| \`system-disk.vdi\` | VirtualBox native format — import directly |"
+            echo "| \`CHANGELOG.md\` | Full categorized changelog (grouped by component) |"
+            echo "| \`QEMU-Setup-Guide.md\` | Step-by-step QEMU installation and configuration |"
+            echo "| \`VirtualBox-Setup-Guide.md\` | Step-by-step VirtualBox setup |"
+            echo "| \`build.log\` | Build log for this release |"
+            echo ""
+            echo "### 🔧 Build Info"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Build** | #${BUILD_NUM} |"
+            echo "| **Commit** | \`${BUILD_COMMIT}\` |"
+            echo "| **Built** | ${BUILD_TIME} |"
+            echo "| **Toolchain** | clang-19 / lld-19 |"
+          } > build/RELEASE_NOTES.md
+
+          echo "✅ Release notes generated ($COUNT commits, showing $(echo "$BODY" | wc -l))"
+
+      # ── Create GitHub Release ───────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Impossible OS ${{ steps.version.outputs.tag }}"
+          body_path: build/RELEASE_NOTES.md
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          files: ${{ steps.package.outputs.zip_path }}
+
+      # A tag is the only way its release's docs reach the docs-releases store
+      # (docs-release.yml renders from tags), so the cleanup below deletes a tag
+      # only when it is POSITIVELY known safe: the store holds its docs, or it is
+      # older than the docs site. Any other tag, including one pushed after this
+      # checkout, is kept. A failed lookup leaves the output empty and keeps all.
+      - name: Find release tags safe to delete
+        id: docs_deletable
+        if: steps.version.outputs.prerelease == 'false'
+        continue-on-error: true
+        run: |
+          deletable=$(python3 scripts/site/releases.py deletable)
+          echo "tags=$deletable" >> "$GITHUB_OUTPUT"
+
+      # ── Clean up old pre-releases (only on stable release) ──────────────
+      - name: Clean up old pre-releases
+        if: steps.version.outputs.prerelease == 'false'
+        uses: actions/github-script@v7
+        env:
+          DOCS_DELETABLE: ${{ steps.docs_deletable.outputs.tags }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            // {tag: ref object}; empty unless the lookup succeeded, and then no tag is deleted
+            let deletable = {};
+            try {
+              const map = JSON.parse(process.env.DOCS_DELETABLE);
+              if (!map || typeof map !== 'object' || Array.isArray(map)) throw new Error('not a map');
+              deletable = map;
+            }
+            catch (e) { console.log('Docs retention unknown: keeping every pre-release tag'); }
+            const releases = await github.rest.repos.listReleases({ owner, repo, per_page: 100 });
+
+            const preReleases = releases.data.filter(r => r.prerelease);
+            let deleted = 0;
+
+            for (const release of preReleases) {
+              console.log(`Deleting pre-release: ${release.tag_name} (${release.name})`);
+
+              // Delete the release
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: release.id });
+
+              // Delete the tag, unless its docs are not frozen yet
+              // Deleted only while the ref still names the object that was judged safe.
+              // A push lease makes that check and the delete one atomic step on the
+              // server, so a tag moved in between is kept (the REST API has no
+              // conditional delete).
+              const expected = Object.prototype.hasOwnProperty.call(deletable, release.tag_name)
+                ? deletable[release.tag_name] : null;
+              if (!expected) {
+                console.log(`  Keeping tag ${release.tag_name}: its docs are not in docs-releases yet`);
+              } else {
+                try {
+                  require('child_process').execFileSync('git', ['push',
+                    `--force-with-lease=refs/tags/${release.tag_name}:${expected}`,
+                    'origin', `:refs/tags/${release.tag_name}`], { stdio: 'inherit' });
+                } catch (e) {
+                  console.log(`  Keeping tag ${release.tag_name}: it moved since it was judged safe, or is already gone`);
+                }
+              }
+
+              deleted++;
+            }
+
+            console.log(`✅ Cleaned up ${deleted} pre-release(s)`);
+
+      # ── Also update CHANGELOG.md in repo ────────────────────────────────
+      - name: Update CHANGELOG.md
+        run: bash scripts/generate-changelog.sh

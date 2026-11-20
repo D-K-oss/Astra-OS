@@ -1,0 +1,1355 @@
+/* ============================================================================
+ * syscall.c -- System call dispatcher and implementations
+ *
+ * Handles INT 0x80 from user-mode code.
+ * Syscall number in RAX, arguments in RDI, RSI, RDX.
+ * Return value placed back in frame->rax.
+ * ============================================================================ */
+
+#include "kernel/sched/syscall.h"
+#include "kernel/abi_hash.h"   /* IMPOSSIBLE_OS_ABI_HASH -- static facade over the
+                                * generated abi/generated/abi_contract.h; regenerating does
+                                * NOT rewrite this header (--write-shims repairs it) */
+#include "kernel/idt.h"
+#include "kernel/vectors.h"
+#include "kernel/nt/ntstatus.h"
+#include "kernel/nt/zw.h"
+#include "kernel/security/privileges.h"  /* SeSinglePrivilegeCheck, SeShutdownPrivilege */
+#include "kernel/nt/syscall_filter.h"   /* syscall_filter_task_dead on SYS_KILL */
+#include "kernel/nt/pledge.h"           /* pledge/unveil enforcement on the legacy ABI */
+#include "kernel/sched/task.h"
+#include "kernel/test/test_usermode.h"  /* test_usermode_capture_start/_byte/_end -- KERNEL_TESTS
+                                          * no-op in release builds */
+#include "kernel/env.h"                 /* task_set_argv / env_adopt_block / argv_frame_bytes */
+#include "kernel/sched/irql.h"
+#include "kernel/smp.h"
+#include "kernel/sched/irql_store.h"
+#include "kernel/klog.h"
+#include "kernel/drivers/keyboard.h"
+#include "kernel/drivers/serial.h"
+
+#include "kernel/exec.h"       /* EXEC_KMALLOC_STAGE_MAX -- heap staging cap */
+#include "kernel/fs/vfs.h"
+#include "kernel/mm/heap.h"
+#include "kernel/mm/pmm.h"
+#include "kernel/mm/vmm.h"
+#include "kernel/cpu_security.h"
+#include "kernel/timer.h"
+#include "kernel/net/net.h"
+#include "kernel/acpi.h"
+#include "kernel/ipc/pipe.h"
+#include "kernel/ipc/signal.h"
+#include "kernel/ipc/pgroup.h"          /* setpgid/setsid/getpgid/getsid/getpgrp/tc*pgrp */
+#include "kernel/ipc/shmem.h"
+#include "kernel/ob/ob_file.h"
+#include "kernel/ob/ob_section.h"
+#include "kernel/ob/ob.h"
+#include "kernel/ob/teb.h"
+#include "kernel/boot_info.h"
+#include "desktop/terminal.h"
+
+/* --- Port I/O helper --- */
+static inline __attribute__((unused)) void outb_sc(uint16_t port, uint8_t val)
+{
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline __attribute__((unused)) void outw_sc(uint16_t port, uint16_t val)
+{
+    __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+/* --- Input helper: try both keyboard and serial --- */
+static char input_trygetchar(void)
+{
+    char c;
+    c = keyboard_trygetchar();
+    if (c) return c;
+    c = serial_trygetchar();
+    return c;
+}
+
+/* --- Syscall implementations (NTSTATUS return type) ---
+ * These are the legacy INT 0x80 implementations, now returning NTSTATUS.
+ * The INT 0x80 handler converts NTSTATUS + bytes_out to int64_t for
+ * backward compatibility with existing user-mode binaries. */
+
+/* SYS_WRITE: write data to a file descriptor. Returns bytes via *bytes_out. */
+static NTSTATUS sys_write(uint64_t fd, uint64_t buf, uint64_t len,
+                          uint64_t *bytes_out)
+{
+    uint64_t i;
+    const char *str = (const char *)buf;
+
+    if (fd != STDOUT_FD)
+        return STATUS_INVALID_HANDLE;
+    if (!str || len == 0) {
+        *bytes_out = 0;
+        return STATUS_SUCCESS;
+    }
+
+    {
+        /* Resolved ONCE per write(), not per byte -- ctx is a local on
+         * THIS call's own stack, so staging into it needs no lock even
+         * if another thread of this task is concurrently inside its own
+         * write(). See test_usermode.h for why the buffer lives here
+         * rather than on struct task. */
+        struct utest_capture_ctx cap_ctx;
+        test_usermode_capture_start(&cap_ctx);
+
+        for (i = 0; i < len; i++) {
+            /* Single read of this ring-3 byte: `c` feeds the NUL check,
+             * the terminal echo, and (via test_usermode_capture_byte)
+             * the source-level capture pipeline. str is a raw,
+             * unvalidated ring-3 pointer with no copy_from_user --
+             * re-dereferencing str[i] a second or third time would let
+             * a concurrently mutating buffer present different bytes to
+             * each sink. */
+            char c = str[i];
+
+            if (c == '\0')
+                break;
+            /* Buffer into terminal window -- sets term_dirty=1.
+             * Do NOT call terminal_render() here: rendering happens in
+             * the main compositor loop (main.c) which calls
+             * terminal_render() before wm_composite() + fb_swap().
+             * Calling terminal_render() from inside a syscall races
+             * with that loop and causes:
+             *   1. Text artifacts outside the window (partial composite)
+             *   2. VBE Y-offset oscillation (fb_swap called from two paths) */
+            if (terminal_is_open())
+                terminal_putchar(c);
+            /* test_usermode_capture_byte() consumes the byte into a
+             * framed, escaped, non-forgeable record when this write is
+             * capture-owned; it returns 0 (release builds always;
+             * KERNEL_TESTS builds when not capture-owned) for the
+             * untouched raw serial echo below. The payload crosses serial
+             * AT MOST once -- never both ways, and zero times once the
+             * owner has spent its producer emission budget, where the byte
+             * is consumed and dropped. That case must NOT reach the raw
+             * fallback: echoing it here would put the very payload the
+             * budget stopped back on the wire unframed. */
+            if (!test_usermode_capture_byte(&cap_ctx, c))
+                serial_putchar(c);
+        }
+        test_usermode_capture_end(&cap_ctx);
+    }
+
+    *bytes_out = i;
+    return STATUS_SUCCESS;
+}
+
+/* SYS_READ: blocking read from stdin. Returns bytes via *bytes_out. */
+static NTSTATUS sys_read(uint64_t fd, uint64_t buf, uint64_t len,
+                         uint64_t *bytes_out)
+{
+    uint64_t i;
+    char *dst = (char *)buf;
+    char c;
+
+    if (fd != STDIN_FD)
+        return STATUS_INVALID_HANDLE;
+    if (!dst || len == 0) {
+        *bytes_out = 0;
+        return STATUS_SUCCESS;
+    }
+
+    /* Wait for the first byte */
+    for (;;) {
+        if (terminal_is_open()) {
+            c = terminal_trygetchar();
+        } else {
+            c = input_trygetchar();
+        }
+        if (c != 0)
+            break;
+        yield();
+    }
+    dst[0] = c;
+
+    /* Fill remaining bytes non-blocking */
+    for (i = 1; i < len; i++) {
+        if (terminal_is_open())
+            c = terminal_trygetchar();
+        else
+            c = input_trygetchar();
+        if (c == 0)
+            break;
+        dst[i] = c;
+    }
+    *bytes_out = i;
+    return STATUS_SUCCESS;
+}
+
+/* SYS_EXIT: terminate the current task. */
+static void sys_exit(uint64_t code)
+{
+    task_exit((int32_t)code);
+}
+
+/* SYS_READFILE: read a file from C:\ by name. Returns bytes via *bytes_out. */
+static NTSTATUS sys_readfile(uint64_t name_ptr, uint64_t buf_ptr,
+                             uint64_t buf_size, uint64_t *bytes_out)
+{
+    const char *name = (const char *)name_ptr;
+    uint8_t *buf = (uint8_t *)buf_ptr;
+    struct vfs_node *root = vfs_get_drive_root('C');
+    struct task *t = task_current();
+    struct vfs_node *file;
+    char resolved[VFS_MAX_PATH];
+    uint64_t to_read;
+    int opened = 0;
+
+    if (!root || !name || !buf || buf_size == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Reading a file by name opens it for read: rpath pledge + unveil 'r'. */
+    if (pledge_check_file(t, VFS_O_READ) != STATUS_SUCCESS)
+        pledge_terminate((uint32_t)SYS_READFILE);   /* noreturn */
+
+    if (t && __atomic_load_n(&t->unveil_active, __ATOMIC_ACQUIRE)) {
+        /* Resolve root-relative (matching the C:\ read below), require unveil
+         * 'r' on the EXACT path, and read THAT canonical path -- never validate
+         * one path and read another, and deny on any resolution failure. */
+        if (vfs_resolve_path("C:\\", name, resolved, sizeof(resolved)) != 0 ||
+            unveil_check(t, resolved, UNVEIL_R) != STATUS_SUCCESS)
+            return STATUS_ACCESS_DENIED;
+        file = vfs_open(resolved, VFS_O_READ);
+        opened = 1;
+    } else {
+        file = vfs_finddir(root, name);
+    }
+    if (!file)
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    /* NOT instrumented with the task_acct_note_read_io seam, deliberately.
+     * This primitive is slated for RETIREMENT in favour of NtReadFile (which
+     * already routes through the canonical seam), and it hands the caller's
+     * ring-3 `buf` straight to vfs_read for the filesystem to write through in
+     * kernel mode. Adding accounting here would both instrument a path being
+     * deleted and imply this syscall is a supported, reviewed I/O route. The
+     * missing accounting, the unvalidated destination pointer, the 64->32-bit
+     * length narrowing, and the partial-read-reported-as-success behavior are
+     * filed together on the retirement item. */
+    to_read = file->size < buf_size ? file->size : buf_size;
+    vfs_read(file, 0, (uint32_t)to_read, buf);
+    if (opened)
+        vfs_close(file);
+    *bytes_out = to_read;
+    return STATUS_SUCCESS;
+}
+
+/* SYS_READDIR: read a directory entry at index from the C:\ root. */
+static NTSTATUS sys_readdir(uint64_t buf_ptr, uint64_t buf_size,
+                            uint64_t index)
+{
+    char *buf = (char *)buf_ptr;
+    struct vfs_node *root = vfs_get_drive_root('C');
+    struct vfs_dirent *entry;
+    uint64_t i;
+
+    if (!root || !buf || buf_size == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Listing the C:\ root reads directory metadata: rpath pledge + unveil 'r'. */
+    {
+        struct task *t = task_current();
+        if (pledge_check_file(t, VFS_O_READ) != STATUS_SUCCESS)
+            pledge_terminate((uint32_t)SYS_READDIR);   /* noreturn */
+        if (unveil_check(t, "C:\\", UNVEIL_R) != STATUS_SUCCESS)
+            return STATUS_ACCESS_DENIED;
+    }
+
+    entry = vfs_readdir(root, (uint32_t)index);
+    if (!entry)
+        return STATUS_NO_MORE_FILES;
+
+    for (i = 0; i < buf_size - 1 && entry->name[i]; i++)
+        buf[i] = entry->name[i];
+    buf[i] = '\0';
+    return STATUS_SUCCESS;
+}
+
+/* Process info structure -- must match user/include/syscall.h */
+struct proc_info {
+    uint32_t pid;
+    uint32_t state;
+    char     name[32];
+};
+
+/* SYS_GETPROCS: fill buffer with process info. Returns count via *count_out. */
+static NTSTATUS sys_getprocs(uint64_t buf_ptr, uint64_t buf_size,
+                             uint64_t *count_out)
+{
+    struct proc_info *out = (struct proc_info *)buf_ptr;
+    uint32_t count = task_count();
+    uint32_t max = (uint32_t)(buf_size / sizeof(struct proc_info));
+    uint32_t i, j;
+
+    *count_out = (uint64_t)count;
+
+    if (!out || max == 0)
+        return STATUS_SUCCESS;
+
+    for (i = 0; i < count && i < max; i++) {
+        struct task *t = task_get_by_pid(i);
+        if (!t) {
+            out[i].pid = i;
+            out[i].state = 0xFF;
+            out[i].name[0] = '\0';
+            continue;
+        }
+        out[i].pid = t->pid;
+        out[i].state = t->state;
+        if (t->name) {
+            for (j = 0; j < 31 && t->name[j]; j++)
+                out[i].name[j] = t->name[j];
+            out[i].name[j] = '\0';
+        } else {
+            out[i].name[0] = '\0';
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+/* --- INT 0x80 handler ---
+ * Preserves backward compatibility: existing user-mode binaries use
+ * int64_t returns (bytes transferred or -1 for error). The internal
+ * sys_* functions now return NTSTATUS; this handler converts:
+ *   - Functions with byte counts: return bytes_out on success, -1 on error
+ *   - Functions with 0/-1:       return 0 on NT_SUCCESS, -1 on error */
+
+/* ---- SYS_FAULT_INJECT dispatch (user-mode fault-injection bridge) - *
+ *
+ * Bridges the kernel-test-harness allocator countdowns (kmalloc,
+ * PMM, VMM, copy_user) to user-mode tests. Two hard security gates:
+ *   1. boot.conf test=1 required  (g_boot_info.config.test)
+ *   2. countdown is armed with the caller's own PID as the task filter,
+ *      so a test can ONLY fault-inject for itself -- sibling kthreads
+ *      and the launcher task never consume the trap.
+ *
+ * Exposed non-static so kernel unit tests can invoke the dispatch
+ * directly (with a save/restore wrapper around config.test) without
+ * re-implementing the gate logic. Not part of the public kernel API.
+ *
+ * KERNEL_TESTS-gated: every allocator countdown this forwards to is a
+ * KERNEL_TESTS seam, so the release flavor has no definition to call. The
+ * boot.conf test=1 gate above is a RUNTIME gate; this is the compile-time
+ * one. Under `make KERNEL_TESTS=off` the SYS_FAULT_INJECT case is dropped
+ * from syscall_handler() too, so syscall 44 falls to the unknown-syscall
+ * default and returns -1 -- the same value the runtime gate returns on a
+ * production (test=0) boot, now guaranteed by the compiler. The SYS_
+ * number itself stays reserved in syscall.h: it is an ABI promise and
+ * feeds IMPOSSIBLE_OS_ABI_HASH, which must not differ between flavors.
+ * ------------------------------------------------------------------ */
+
+#ifdef KERNEL_TESTS
+int64_t sys_fault_inject_dispatch(uint32_t kind, uint32_t countdown)
+{
+    uint32_t pid;
+
+    /* Gate: deny unless boot.conf test=1. NT_STATUS_ACCESS_DENIED
+     * surfaces to user mode as -1 via the syscall return-value path;
+     * the klog line names the denied kind so a hostile caller shows up
+     * in the boot log instead of silently bouncing. */
+    if (!g_boot_info.config.test) {
+        klog(LOG_WARN, "sys",
+             "SYS_FAULT_INJECT denied (test=0) kind=%u pid=%u",
+             (uint64_t)kind, (uint64_t)task_current()->pid);
+        return -1;
+    }
+
+    pid = task_current()->pid;
+
+    /* Every ORDINAL arm below clears the site arm first, and every SITE arm
+     * clears the matching ordinal state. That gives one tagged program per
+     * allocator with replacement semantics, so the caller never depends on
+     * the order it armed them in.
+     *
+     * SCOPE: the invariant is per-CPU, not global. The ordinal countdowns
+     * live in per_cpu_data, so a clear reaches only THIS CPU -- a countdown
+     * armed before a migration can still sit on the old CPU. The site arm
+     * is task-owned precisely so it does not inherit that; making the
+     * ordinal selectors migration-safe is tracked in the user-mode test
+     * framework TODO (child-targeted fault arming). */
+    switch (kind) {
+    case FAULT_KMALLOC_NEXT:
+        fault_site_arm_clear(FI_ALLOC_KMALLOC);
+        kmalloc_fail_task_filter_set(pid);
+        kmalloc_fail_next();
+        return 0;
+    case FAULT_KMALLOC_COUNTDOWN:
+        if (countdown == 0)
+            return -1;
+        fault_site_arm_clear(FI_ALLOC_KMALLOC);
+        kmalloc_fail_task_filter_set(pid);
+        kmalloc_fail_countdown_set(countdown);
+        return 0;
+    case FAULT_PMM_NEXT:
+        /* Same self-PID isolation contract as the other selectors:
+         * without the filter, a foreign task_*.exe, a sibling kthread,
+         * or the launcher's own kmalloc calls on the same CPU would
+         * consume the pending trap. */
+        fault_site_arm_clear(FI_ALLOC_PMM);
+        pmm_alloc_fail_task_filter_set(pid);
+        pmm_alloc_fail_next();
+        return 0;
+    case FAULT_VMM_MAP_NEXT:
+        vmm_map_fail_task_filter_set(pid);
+        vmm_map_fail_next();
+        return 0;
+    case FAULT_COPY_USER_NEXT:
+        copy_user_fail_task_filter_set(pid);
+        copy_user_fail_next();
+        return 0;
+    case FAULT_PMM_COUNTDOWN:
+        if (countdown == 0)
+            return -1;
+        /* Ordinal arm replaces any site arm: at most one program is live
+         * per allocator, so the caller never has to reason about which of
+         * two modes wins. */
+        fault_site_arm_clear(FI_ALLOC_PMM);
+        pmm_alloc_fail_task_filter_set(pid);
+        pmm_alloc_fail_countdown_set(countdown);
+        return 0;
+    case FAULT_KMALLOC_SITE:
+    case FAULT_PMM_SITE: {
+        uint32_t alloc_tag = (kind == FAULT_KMALLOC_SITE)
+                                 ? FI_ALLOC_KMALLOC : FI_ALLOC_PMM;
+        /* countdown carries the site id for these selectors. */
+        if (fault_site_arm_set(alloc_tag, countdown) != 0) {
+            klog(LOG_WARN, "sys",
+                 "SYS_FAULT_INJECT bad site id=%u kind=%u pid=%u",
+                 (uint64_t)countdown, (uint64_t)kind, (uint64_t)pid);
+            return -1;
+        }
+        /* Replacement semantics in the other direction: installing a site
+         * arm cancels this allocator's ordinal countdown so a site that
+         * fires cannot then fall through to a stale N-th-allocation trap.
+         * NOTE: this clears the CURRENT CPU's countdown; a countdown armed
+         * on a different CPU before a migration is the pre-existing
+         * per-CPU limitation documented in include/kernel/smp.h. */
+        if (alloc_tag == FI_ALLOC_KMALLOC) {
+            kmalloc_fail_countdown_clear();
+            kmalloc_fail_task_filter_clear();
+        } else {
+            pmm_alloc_fail_countdown_clear();
+            pmm_alloc_fail_task_filter_clear();
+        }
+        return 0;
+    }
+    case FAULT_SITE_QUERY:
+        /* Consumed receipt. A ring-3 regression arms a site, drives the
+         * path, and then requires this to read 0 -- proving the injection
+         * fired at the named allocation rather than the path merely
+         * failing for some unrelated reason, which is otherwise
+         * indistinguishable from the outside.
+         *
+         * An invalid allocator tag returns -1, NOT 0: zero is the
+         * consumed sentinel, so answering 0 to a malformed query would let
+         * a mistyped test read "it fired" out of "I asked nonsense". */
+        if (countdown < FAULT_ALLOC_KMALLOC || countdown > FAULT_ALLOC_PMM) {
+            klog(LOG_WARN, "sys",
+                 "SYS_FAULT_INJECT bad query tag=%u pid=%u",
+                 (uint64_t)countdown, (uint64_t)pid);
+            return -1;
+        }
+        return (int64_t)(uint64_t)fault_site_arm_peek(countdown);
+    case FAULT_CLEAR_ALL:
+        fault_site_arm_clear(FI_ALLOC_KMALLOC);
+        fault_site_arm_clear(FI_ALLOC_PMM);
+        kmalloc_fail_countdown_clear();
+        kmalloc_fail_task_filter_clear();
+        pmm_alloc_fail_countdown_clear();
+        pmm_alloc_fail_task_filter_clear();
+        vmm_map_fail_countdown_clear();
+        vmm_map_fail_task_filter_clear();
+        copy_user_fail_countdown_clear();
+        copy_user_fail_task_filter_clear();
+        return 0;
+    default:
+        klog(LOG_WARN, "sys", "SYS_FAULT_INJECT unknown kind=%u pid=%u",
+             (uint64_t)kind, (uint64_t)pid);
+        return -1;
+    }
+}
+
+/* ---- SYS_TEST_REPORT dispatch (ring-3 harness self-report) --------- *
+ *
+ * One submission per binary, from UTEST_END, carrying what the harness
+ * counted: assertions passed, assertions failed, and skip BLOCKS taken.
+ * The launcher reads the record off the dead child's TCB and threads it
+ * into TAP / JUnit XML / JSON, which is the only way a partially skipped
+ * binary can report a third outcome -- the exit code has room for two.
+ *
+ * Everything here is ring-3 supplied, so the ladder is fail-closed and
+ * every refusal is STICKY: a rejected submission leaves the record
+ * INVALID rather than NONE, so a binary cannot probe for an accepted
+ * shape by calling again, and cannot silently fall back to the legacy
+ * path it was trying to escape. The launcher escalates INVALID to FAIL.
+ *
+ * Consistency against the exit status is NOT checked here -- the exit
+ * status does not exist yet at report time. That check lives in the
+ * launcher's reap path (test_usermode.c), which sees both.
+ *
+ * `t` is a parameter rather than task_current() so kernel unit tests can
+ * drive the ladder against a scratch TCB; the syscall path passes
+ * task_current().
+ * ------------------------------------------------------------------ */
+
+int64_t sys_test_report_dispatch(struct task *t, uint64_t passed,
+                                 uint64_t failed, uint64_t skipped)
+{
+    uint32_t expected = TASK_UTEST_REPORT_NONE;
+
+    if (!t)
+        return -1;
+
+    /* Claim the single-submission slot ATOMICALLY. The harness calls this
+     * exactly once, so a repeat is either a corrupt binary or one trying
+     * to overwrite an earlier, less flattering report -- both the
+     * false-green shape this section exists to remove.
+     *
+     * A plain check-then-set would not hold that. A process CAN own
+     * several user threads today (NtCreateThread, SSDT 0x0036), and two
+     * of them could both observe NONE, both succeed, and let the last
+     * writer replace a skip-bearing report with a zero-skip one. What
+     * makes that unreachable at present is the DISPATCH model, not the
+     * absence of threads: INT 0x80 is an interrupt gate so IF stays clear
+     * across this handler, and APs do not yet schedule tasks. Both are
+     * properties of other subsystems that are expected to change, and the
+     * exchange costs one instruction. The loser of the exchange, and any
+     * later submitter, drives the record to INVALID and it stays there. */
+    if (!__atomic_compare_exchange_n(&t->utest_report.state, &expected,
+                                     TASK_UTEST_REPORT_CLAIMED, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* Log the TRANSITION only. A binary that keeps calling after its
+         * record went INVALID would otherwise re-enter this branch every
+         * time and burn the shared "sys" klog rate budget for its whole
+         * timeout window, suppressing unrelated diagnostics. */
+        if (expected != TASK_UTEST_REPORT_INVALID)
+            klog(LOG_WARN, "sys",
+                 "SYS_TEST_REPORT repeat submission pid=%u (state=%u) -- INVALID",
+                 (uint64_t)t->pid, (uint64_t)expected);
+        __atomic_store_n(&t->utest_report.state, TASK_UTEST_REPORT_INVALID,
+                         __ATOMIC_RELEASE);
+        return -1;
+    }
+
+    /* Out-of-range counts would wrap the launcher's 32-bit aggregates.
+     * Refuse rather than clamp: a clamped count is a wrong number that
+     * still looks like a measurement.
+     *
+     * The skip-block count carries a MUCH tighter bound than the assertion
+     * counts, and for a different reason: the launcher emits one TAP point,
+     * one <testcase> and one JSON record per skip block, so this field
+     * governs artifact fan-out. Bounding it only against arithmetic wrap
+     * would let one binary demand millions of log records and starve the
+     * rest of the run. */
+    if (passed > TASK_UTEST_REPORT_MAX || failed > TASK_UTEST_REPORT_MAX) {
+        klog(LOG_WARN, "sys",
+             "SYS_TEST_REPORT out-of-range pid=%u p=%u f=%u (max=%u)",
+             (uint64_t)t->pid, passed, failed,
+             (uint64_t)TASK_UTEST_REPORT_MAX);
+        __atomic_store_n(&t->utest_report.state, TASK_UTEST_REPORT_INVALID,
+                         __ATOMIC_RELEASE);
+        return -1;
+    }
+    if (skipped > TASK_UTEST_REPORT_SKIP_MAX) {
+        klog(LOG_WARN, "sys",
+             "SYS_TEST_REPORT skip_blocks=%u exceeds artifact bound %u "
+             "pid=%u -- refused",
+             skipped, (uint64_t)TASK_UTEST_REPORT_SKIP_MAX,
+             (uint64_t)t->pid);
+        __atomic_store_n(&t->utest_report.state, TASK_UTEST_REPORT_INVALID,
+                         __ATOMIC_RELEASE);
+        return -1;
+    }
+
+    /* Counts first, then PUBLISH -- and publish with a compare-exchange
+     * from CLAIMED, not a plain store.
+     *
+     * A plain store would be fail-OPEN in the very race this ladder
+     * exists to close: a second submitter that lost the claim writes
+     * INVALID, and if it does so while the winner is still filling its
+     * counts, the winner's store would overwrite that INVALID with VALID
+     * and the double submission would end up trusted. Publishing only
+     * from CLAIMED means any INVALID written in the meantime survives.
+     * The release ordering still guarantees a reader that acquires VALID
+     * sees the counts that go with it, never a half-written record. */
+    t->utest_report.asserts_passed = (uint32_t)passed;
+    t->utest_report.asserts_failed = (uint32_t)failed;
+    t->utest_report.skip_blocks    = (uint32_t)skipped;
+    expected = TASK_UTEST_REPORT_CLAIMED;
+    if (!__atomic_compare_exchange_n(&t->utest_report.state, &expected,
+                                     TASK_UTEST_REPORT_VALID, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* Someone invalidated the record while we were filling it. Their
+         * verdict stands -- the launcher will fail this binary. */
+        klog(LOG_WARN, "sys",
+             "SYS_TEST_REPORT pid=%u invalidated mid-submission (state=%u)",
+             (uint64_t)t->pid, (uint64_t)expected);
+        return -1;
+    }
+    return 0;
+}
+#endif /* KERNEL_TESTS */
+
+/* ---- Shared syscall-entry IRQL wrappers -------------------------- *
+ *
+ * Both INT 0x80 (Linux-style) and INT 0x2E (NT compatibility) are
+ * software interrupts, not hardware IRQs. The shared IDT isr_handler
+ * raises `pcpu->current_irql` to vector_to_irql(vec) for every vector
+ * >= 32, so syscalls land with current_irql == 8 (INT 0x80) or
+ * DISPATCH_LEVEL (INT 0x2E). Both are higher than mutex_lock's
+ * APC_LEVEL ceiling and higher than the fault-injection hook's
+ * PASSIVE_LEVEL gate. Neither is correct for a syscall body -- syscalls
+ * run on behalf of a user thread and should execute at its logical
+ * IRQL. Lower on entry, restore software bookkeeping on exit WITHOUT
+ * reprogramming TPR (the IDT raise is pure software bookkeeping, TPR
+ * was never actually raised). Leaked-raise guard detects a callee
+ * that called KeRaiseIrql and missed its matching lower -- without
+ * this, the direct restore would mask a stuck TPR and silently
+ * reintroduce the "low-priority IRQs masked after a syscall" class
+ * of failure.
+ *
+ * History: split out of the INT 0x80 body (2026-04-20 adjacent fix)
+ * after Codex quality review identified that INT 0x2E had the same
+ * bug and factoring prevents drift between the two paths. */
+
+static KIRQL syscall_lower_entry_irql(void)
+{
+    KIRQL entry_irql = KeGetCurrentIrql();
+    if (entry_irql > PASSIVE_LEVEL)
+        KeLowerIrql(PASSIVE_LEVEL);
+    return entry_irql;
+}
+
+static void syscall_restore_entry_irql(KIRQL entry_irql, uint64_t syscall_nr)
+{
+    struct per_cpu_data *pc;
+
+    if (entry_irql <= PASSIVE_LEVEL)
+        return;
+
+    pc = smp_this_cpu();
+    if (pc->current_irql != PASSIVE_LEVEL) {
+        /* Leaked-raise invariant violated: a callee raised IRQL and
+         * never matched-lower. Force TPR back to PASSIVE before we
+         * overwrite the software bookkeeping so we don't leave the
+         * CPU's low-priority IRQs masked. */
+        klog(LOG_ERROR, "sys",
+             "IRQL leaked through syscall body: current=%u expected=PASSIVE"
+             " (syscall_nr=%u, pid=%u) -- forcing lower",
+             (uint64_t)pc->current_irql, syscall_nr,
+             (uint64_t)task_current()->pid);
+        KeLowerIrql(PASSIVE_LEVEL);
+    }
+    irql_store(pc, entry_irql);
+}
+
+/* ---- SYS_EXEC argv/envp ingestion ---------------------------------------- */
+
+/* Snapshot a NULL-terminated user char** vector (argv or envp) into a freshly
+ * kmalloc'd kernel array of kmalloc'd NUL-terminated strings, so the exec path
+ * never dereferences a raw user pointer. Bounds: at most `max_entries` entries,
+ * each string < ARG_STRING_MAX bytes, and the running aggregate <= *budget
+ * (decremented as strings are accepted). ProbeForRead gates every user access
+ * (range check only); the in-range-unmapped page fault is the kernel-wide
+ * non-recoverable copy_from_user gap owned by the memory-security syscall-handler
+ * retrofit, not this feature. On success *out is a NULL-terminated kernel array
+ * and *out_count is set; the caller frees via exec_free_vec. Returns 0, or:
+ *   EXEC_VEC_FAULT (-1) probe/copy failure, EXEC_VEC_NOMEM (-2) allocation,
+ *   EXEC_VEC_QUOTA (-3) too many entries / string too long / over budget. */
+#define EXEC_VEC_FAULT (-1)
+#define EXEC_VEC_NOMEM (-2)
+#define EXEC_VEC_QUOTA (-3)
+
+static void exec_free_vec(char **arr, uint32_t count)
+{
+    uint32_t i;
+    if (!arr)
+        return;
+    for (i = 0; i < count; i++)
+        if (arr[i])
+            kfree(arr[i]);
+    kfree(arr);
+}
+
+static int exec_snapshot_vec(const char *const *user_vec, uint32_t max_entries,
+                             uint64_t *budget, char ***out, uint32_t *out_count)
+{
+    char **arr;
+    uint32_t n = 0;
+    uint32_t i;
+
+    *out = (char **)0;
+    *out_count = 0;
+    if (!user_vec)
+        return 0;                       /* NULL vector -> empty (inherit / no-arg) */
+
+    arr = (char **)kmalloc((max_entries + 1u) * sizeof(char *));
+    if (!arr)
+        return EXEC_VEC_NOMEM;
+    for (i = 0; i <= max_entries; i++)
+        arr[i] = (char *)0;
+
+    for (;;) {
+        const char *uptr = (const char *)0;
+        uint32_t len = 0;
+        char *ks;
+
+        /* Next slot pointer. */
+        if (ProbeForRead(&user_vec[n], sizeof(char *), 8) != STATUS_SUCCESS)
+            { exec_free_vec(arr, n); return EXEC_VEC_FAULT; }
+        if (copy_from_user(&uptr, &user_vec[n], sizeof(char *)) != 0)
+            { exec_free_vec(arr, n); return EXEC_VEC_FAULT; }
+        if (!uptr)
+            break;                      /* NULL terminator */
+        if (n >= max_entries)
+            { exec_free_vec(arr, n); return EXEC_VEC_QUOTA; }
+
+        /* Length: bounded probe+copy per byte, reject if no NUL within cap. */
+        for (;;) {
+            char c;
+            if (len >= ARG_STRING_MAX)
+                { exec_free_vec(arr, n); return EXEC_VEC_QUOTA; }
+            if (ProbeForRead(uptr + len, 1, 1) != STATUS_SUCCESS)
+                { exec_free_vec(arr, n); return EXEC_VEC_FAULT; }
+            if (copy_from_user(&c, uptr + len, 1) != 0)
+                { exec_free_vec(arr, n); return EXEC_VEC_FAULT; }
+            if (c == '\0')
+                break;
+            len++;
+        }
+        if ((uint64_t)len + 1u > *budget)
+            { exec_free_vec(arr, n); return EXEC_VEC_QUOTA; }
+
+        ks = (char *)kmalloc(len + 1u);
+        if (!ks)
+            { exec_free_vec(arr, n); return EXEC_VEC_NOMEM; }
+        /* Single bulk copy of the validated [uptr, uptr+len] range; force NUL so
+         * a concurrent length change cannot leave the kernel string unterminated. */
+        if (ProbeForRead(uptr, len + 1u, 1) != STATUS_SUCCESS)
+            { kfree(ks); exec_free_vec(arr, n); return EXEC_VEC_FAULT; }
+        if (copy_from_user(ks, uptr, len + 1u) != 0)
+            { kfree(ks); exec_free_vec(arr, n); return EXEC_VEC_FAULT; }
+        ks[len] = '\0';
+        arr[n] = ks;
+        *budget -= (uint64_t)len + 1u;
+        n++;
+    }
+
+    *out = arr;
+    *out_count = n;
+    return 0;
+}
+
+static uint64_t syscall_handler(struct interrupt_frame *frame)
+{
+    uint64_t syscall_nr = frame->rax;
+    uint64_t arg1 = frame->rdi;
+    uint64_t arg2 = frame->rsi;
+    uint64_t arg3 = frame->rdx;
+    int64_t ret = -1;
+    KIRQL entry_irql = syscall_lower_entry_irql();
+
+    /* Ring-3 execution evidence for the user-mode test launcher. Recorded
+     * from the saved CS rather than from the gate's DPL: the selector is
+     * the CPU's own record of where the caller was executing. */
+    TASK_UTEST_NOTE_USER_ENTRY(frame->cs);
+
+    /* pledge gate for the legacy INT 0x80 ABI. Without this, a pledged process
+     * could bypass pledge/unveil entirely by using this second ring-3 entry
+     * path instead of the SSDT. INT 0x80 is a user-only gate (DPL 3; the kernel
+     * never issues it), so no previous-mode check is needed. No audit session
+     * runs here, so a violation terminates immediately. */
+    {
+        struct task *pt = task_current();
+        if (pt && __atomic_load_n(&pt->pledge_mask, __ATOMIC_ACQUIRE) != 0 &&
+            pledge_check_legacy(pt, syscall_nr) != STATUS_SUCCESS)
+            pledge_terminate((uint32_t)syscall_nr);
+    }
+
+    switch (syscall_nr) {
+    case SYS_WRITE: {
+        uint64_t bytes = 0;
+        NTSTATUS s = sys_write(arg1, arg2, arg3, &bytes);
+        ret = NT_SUCCESS(s) ? (int64_t)bytes : -1;
+        break;
+    }
+    case SYS_READ: {
+        uint64_t bytes = 0;
+        NTSTATUS s = sys_read(arg1, arg2, arg3, &bytes);
+        ret = NT_SUCCESS(s) ? (int64_t)bytes : -1;
+        break;
+    }
+    case SYS_EXIT:
+        sys_exit(arg1);
+        break;
+    case SYS_YIELD:
+        yield();
+        ret = 0;
+        break;
+    case SYS_FORK:
+        ret = (int64_t)task_fork(frame);
+        break;
+    case SYS_EXEC: {
+        /* SYS_EXEC(path, argv, envp): arg1=path (NUL-terminated user string,
+         * resolved under C:\), arg2=user argv[] (char**, NULL-terminated, may be
+         * NULL), arg3=user envp[] (char**, NULL-terminated, NULL = inherit). */
+        const char *filename = (const char *)arg1;
+        const char *const *user_argv = (const char *const *)arg2;
+        const char *const *user_envp = (const char *const *)arg3;
+        struct vfs_node *root = vfs_get_drive_root('C');
+        struct task *t = task_current();
+        struct vfs_node *file;
+        char resolved[VFS_MAX_PATH];
+        int opened = 0;
+        char **kargv = (char **)0; uint32_t kargc = 0;
+        char **kenvp = (char **)0; uint32_t kenvc = 0;
+        uint64_t arg_budget = ARG_MAX;
+        int snap_rc;
+
+        if (!root || !filename) { ret = -1; break; }
+
+        /* Fail closed: exec replaces the process image + rebuilds the main
+         * stack/PEB and (below) argv/environ, but there is no sibling-thread
+         * exec barrier yet -- a running sibling could execute overwritten
+         * old-image code or observe torn process-wide state. Reject exec while
+         * any thread other than the main thread is live (fork-then-exec runs in
+         * a single-threaded child, so the common path is unaffected).
+         * XREF 03-memory-concurrency/TODO-02-memory-security (exec barrier). */
+        if (t && t->num_threads > 1) {
+            klog(LOG_WARN, "sys",
+                 "exec rejected: %u live threads (no sibling-exec barrier)",
+                 (uint64_t)t->num_threads);
+            ret = -1; break;
+        }
+
+        /* Snapshot argv/envp out of user space into kernel storage BEFORE any
+         * image mutation, so a failure here leaves the caller unchanged and the
+         * loader never dereferences raw user pointers. */
+        snap_rc = exec_snapshot_vec(user_argv, ARG_ARGC_MAX, &arg_budget,
+                                    &kargv, &kargc);
+        if (snap_rc == 0)
+            snap_rc = exec_snapshot_vec(user_envp, ENV_MAX_ENTRIES, &arg_budget,
+                                        &kenvp, &kenvc);
+        if (snap_rc != 0) {
+            exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+            ret = -1; break;                /* STATUS_QUOTA_EXCEEDED / fault / OOM */
+        }
+
+        /* Exact argv frame must fit the fixed 16 KiB user stack (argv strings +
+         * pointer array + fixed auxv/AT_RANDOM/terminator reserve). */
+        if (kargc > 0 &&
+            (uint64_t)argv_frame_bytes((int)kargc, (const char *const *)kargv) +
+                ARGV_FRAME_RESERVE > USER_STACK_SIZE) {
+            exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+            klog(LOG_WARN, "sys", "exec rejected: argv frame exceeds user stack");
+            ret = -1; break;
+        }
+
+        /* A filesystem-restricted task must have unveil 'x' on the exact image
+         * path it executes (UNVEIL_X's only enforcement site). Resolve
+         * root-relative (matching the C:\ lookup), fail closed, and read THAT
+         * canonical path. */
+        if (t && __atomic_load_n(&t->unveil_active, __ATOMIC_ACQUIRE)) {
+            if (vfs_resolve_path("C:\\", filename, resolved, sizeof(resolved)) != 0 ||
+                unveil_check(t, resolved, UNVEIL_X) != STATUS_SUCCESS) {
+                exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+                ret = -1; break;
+            }
+            file = vfs_open(resolved, VFS_O_READ);
+            opened = 1;
+        } else {
+            file = vfs_finddir(root, filename);
+        }
+        if (!file) {
+            klog(LOG_DEBUG, "sys", "File not found: %s", filename);
+            exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+            ret = -1;
+            break;
+        }
+
+        {
+            /* Snapshot the size ONCE and validate it BEFORE allocating, then
+             * use that one local for the allocation, the read, and the exec.
+             * This used to size the buffer from file->size and then re-read
+             * file->size for the read length: a concurrent writer growing the
+             * vfs_node between the two reads made vfs_read write past the
+             * allocation, and the read's return value was discarded so a short
+             * read handed task_exec a length describing bytes it never got.
+             * Same shape shell_loader.c already documents for the same job. */
+            uint64_t fsz = file->size;
+            uint8_t *buf;
+            int nread;
+
+            if (fsz == 0 || fsz > EXEC_KMALLOC_STAGE_MAX) {
+                klog(LOG_WARN, "sys",
+                     "exec: image size %u out of range (1..%u)",
+                     fsz, (uint64_t)EXEC_KMALLOC_STAGE_MAX);
+                if (opened) vfs_close(file);
+                exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+                ret = -1; break;
+            }
+            buf = (uint8_t *)kmalloc((uint32_t)fsz);
+            if (!buf) {
+                if (opened) vfs_close(file);
+                exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+                ret = -1; break;
+            }
+            nread = vfs_read(file, 0, (uint32_t)fsz, buf);
+            if (opened) vfs_close(file);
+            if (nread < 0 || (uint64_t)nread != fsz) {
+                klog(LOG_ERROR, "sys",
+                     "exec: short read (%d of %u bytes)",
+                     (int64_t)nread, fsz);
+                kfree(buf);
+                exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+                ret = -1; break;
+            }
+
+            /* Commit argv (always resets it: empty argv -> frame builder falls
+             * back to argc=1/name), then -- ONLY if argv succeeded -- replace
+             * environ from envp (NULL envp inherits, execv semantics). Ordering
+             * argv-before-env means an argv failure never leaves a new env with
+             * an old argv; both deep-copy the snapshot (freed right after) and
+             * unwind on failure leaving the prior value intact. An install
+             * failure fails the exec BEFORE task_exec so the loader never runs
+             * against a half-updated argv/env. Full transactionality across the
+             * whole exec (roll back / terminate on a task_exec failure after
+             * commit, and stage the commit at task_exec's no-return point) is
+             * tracked as a follow-up in the argv-array-handoff TODO -- today
+             * every exec caller returns -1 to a child that sys_exit()s, so no
+             * surviving process observes the transient state. */
+            {
+                int as = task_set_argv(t, (int)kargc, (const char *const *)kargv);
+                int es = (as == ENV_OK && user_envp)
+                    ? env_adopt_block(t, (const char *const *)kenvp, kenvc)
+                    : ENV_OK;
+                exec_free_vec(kargv, kargc); exec_free_vec(kenvp, kenvc);
+                if (as != ENV_OK || es != ENV_OK) {
+                    kfree(buf);
+                    klog(LOG_WARN, "sys",
+                         "exec: argv/env install failed (argv=%d env=%d)",
+                         (uint64_t)as, (uint64_t)es);
+                    ret = -1; break;
+                }
+            }
+
+            /* Hand task_exec the ownership token so the SUCCESS-path release
+             * happens inside it, before publication. The unconditional kfree
+             * that used to sit here worked only because INT 0x80 is an
+             * interrupt gate (IF=0), so no tick could switch this task into
+             * the new image before the free; the token makes the ordering
+             * explicit instead of load-bearing on the gate type. */
+            {
+                struct task_exec_staging st = {
+                    .release = task_exec_staging_kfree, .ptr = buf
+                };
+                ret = (int64_t)task_exec(buf, fsz, &st);
+                /* No-op when task_exec already released (success); frees on
+                 * every failure return, where the caller still owns it. */
+                task_exec_staging_release(&st);
+            }
+            if (ret == TASK_EXEC_IMAGE_DESTROYED) {
+                /* The image this syscall would return to no longer exists --
+                 * task_exec replaced it with zeroed private frames past its
+                 * commit point. Returning ret to ring 3 would iretq into that.
+                 * The buffer is already released above, so terminate.
+                 *
+                 * The status NAMES the cause: a plain -1 here is also what a
+                 * kill produces, so a parent could not tell an exec-destroyed
+                 * child from a killed one. */
+                task_exit(TASK_EXIT_EXEC_IMAGE_DESTROYED);  /* no return */
+            }
+        }
+        break;
+    }
+    case SYS_WAITPID:
+        ret = (int64_t)task_waitpid((uint32_t)arg1);
+        break;
+    case SYS_READFILE: {
+        uint64_t bytes = 0;
+        NTSTATUS s = sys_readfile(arg1, arg2, arg3, &bytes);
+        ret = NT_SUCCESS(s) ? (int64_t)bytes : -1;
+        break;
+    }
+    case SYS_READDIR: {
+        NTSTATUS s = sys_readdir(arg1, arg2, arg3);
+        ret = NT_SUCCESS(s) ? 0 : -1;
+        break;
+    }
+    case SYS_GETPROCS: {
+        uint64_t count = 0;
+        sys_getprocs(arg1, arg2, &count);
+        ret = (int64_t)count;
+        break;
+    }
+    case SYS_KILL:
+        if (arg1 > 0 && arg1 < task_count()) {
+            struct task *t = task_get_by_pid((uint32_t)arg1);
+            if (t == task_current()) {
+                /* Self-kill is an exit: route through the NON-RETURNING
+                 * task_exit so the caller never resumes in ring 3. A returning
+                 * self-kill (marking the current task DEAD but returning) leaves
+                 * a logically dead task still issuing syscalls until the next
+                 * tick evicts it -- and TASK_DEAD is not terminal (task_waitpid
+                 * flips it to WAITING, then wake -> READY -> RUNNING), so no
+                 * DEAD-state syscall guard can contain it. task_exit does the
+                 * full teardown (incl. Job detach + timer-resolution reap) and
+                 * forever-yields. */
+                task_exit(-1);          /* does not return */
+            } else if (t && t->state != TASK_DEAD) {
+                /* Remote kill: centralized TASK_DEAD transition + teardown
+                 * (syscall-filter count, OB process object, Job Object detach,
+                 * timer-resolution reap). The target notices at its next entry. */
+                task_terminate_remote(t, -1);
+                klog(LOG_DEBUG, "sys", "Task %u killed", (uint64_t)arg1);
+                ret = 0;
+            } else {
+                ret = -1;
+            }
+        } else {
+            ret = -1;
+        }
+        break;
+    case SYS_UPTIME:
+        ret = (int64_t)uptime();
+        break;
+    case SYS_REBOOT:
+        /* Legacy INT 0x80 reboot: gate on SeShutdownPrivilege like the SSDT
+         * NtShutdownSystem wrapper, else this is an unprivileged bypass to a
+         * full-machine reboot. These SYS_* entries are ring-3-initiated, so the
+         * mode is UserMode. */
+        if (!SeSinglePrivilegeCheck(&SeShutdownPrivilege, SSDT_USER_MODE)) {
+            ret = -1;
+            break;
+        }
+        acpi_reboot();
+        break;
+    case SYS_SHUTDOWN:
+        if (!SeSinglePrivilegeCheck(&SeShutdownPrivilege, SSDT_USER_MODE)) {
+            ret = -1;
+            break;
+        }
+        acpi_shutdown();
+        break;
+    case SYS_PING: {
+        /* arg1 = IP address (big-endian), arg2 = seq number */
+        icmp_send_echo((uint32_t)arg1, 1, (uint16_t)arg2, "ImpOS", 5);
+        ret = 0;
+        break;
+    }
+    case SYS_NETINFO: {
+        /* arg1 = user buffer, arg2 = buffer size */
+        uint8_t *ubuf = (uint8_t *)arg1;
+        uint64_t sz = arg2 < sizeof(net_cfg) ? arg2 : sizeof(net_cfg);
+        uint64_t k;
+        const uint8_t *src = (const uint8_t *)&net_cfg;
+        if (ubuf) {
+            for (k = 0; k < sz; k++)
+                ubuf[k] = src[k];
+        }
+        ret = 0;
+        break;
+    }
+    case SYS_GETPID: {
+        /* Returns the calling task's PID. Trivial read-only query,
+         * no arg validation needed. Mirrors Win32 GetCurrentProcessId
+         * semantics -- the Win32 shim in user/lib/win32.c routes
+         * through this syscall instead of reading TEB.ClientId.
+         * UniqueProcess via gs:0x40 so the path only depends on the
+         * proven INT 0x80 surface. */
+        struct task *t = task_current();
+        ret = t ? (int64_t)t->pid : 0;
+        break;
+    }
+    case SYS_SETPGID:
+        /* setpgid(pid, pgid): move a task into a process group (POSIX). */
+        ret = (int64_t)pgroup_setpgid((uint32_t)arg1, (uint32_t)arg2);
+        break;
+    case SYS_GETPGID:
+        ret = (int64_t)pgroup_getpgid((uint32_t)arg1);
+        break;
+    case SYS_SETSID:
+        /* setsid(): the caller leads a new session + process group. */
+        ret = (int64_t)pgroup_setsid();
+        break;
+    case SYS_GETSID:
+        ret = (int64_t)pgroup_getsid((uint32_t)arg1);
+        break;
+    case SYS_GETPGRP:
+        ret = (int64_t)pgroup_getpgrp();
+        break;
+    case SYS_TCSETPGRP:
+        /* tcsetpgrp(pgid): set the console's foreground process group. */
+        ret = (int64_t)pgroup_tcsetpgrp((uint32_t)arg1);
+        break;
+    case SYS_TCGETPGRP:
+        ret = (int64_t)pgroup_tcgetpgrp();
+        break;
+    case SYS_GENCONSOLECTRL:
+        /* GenerateConsoleCtrlEvent(dwCtrlEvent, dwProcessGroupId) -> BOOL. */
+        ret = (int64_t)GenerateConsoleCtrlEvent((uint32_t)arg1, (uint32_t)arg2);
+        break;
+    case SYS_PIPE: {
+        HANDLE *user_handles = (HANDLE *)arg1;
+        HANDLE pipe_handles[2];
+        if (!user_handles) { ret = -1; break; }
+        ret = (int64_t)ob_create_pipe_handles(
+            &task_current()->handle_table, pipe_handles);
+        if (ret == 0) {
+            user_handles[0] = pipe_handles[0];  /* read end */
+            user_handles[1] = pipe_handles[1];  /* write end */
+        }
+        break;
+    }
+    case SYS_SIGNAL: {
+        signal_handler_t old = signal_handler((int)arg1, (signal_handler_t)arg2);
+        ret = (int64_t)(uint64_t)old;
+        break;
+    }
+    case SYS_SHMEM_CREATE: {
+        const char *name = (const char *)arg1;
+        uint32_t size = (uint32_t)arg2;
+        ret = (int64_t)ObCreateSection(&task_current()->handle_table,
+                                       size, SECTION_ALL_ACCESS, name);
+        break;
+    }
+    case SYS_SHMEM_MAP: {
+        HANDLE sh = (HANDLE)(int32_t)arg1;
+        uintptr_t addr = ObMapViewOfSection(&task_current()->handle_table, sh,
+                                            task_current()->pid);
+        ret = (int64_t)(uint64_t)addr;
+        break;
+    }
+    case SYS_LOG: {
+        /* arg1 = level (LOG_DEBUG..LOG_ERROR ONLY for user mode);
+         * arg2 = msg pointer; arg3 = msg length.
+         *
+         * SECURITY: LOG_FATAL is REJECTED from user mode because
+         * klog(LOG_FATAL, ...) enters an infinite hlt loop in
+         * src/kernel/klog.c:1023-1028, which any unprivileged user
+         * process could otherwise weaponize as a one-line OS halt.
+         * Kernel-only callers that legitimately need fatal-halt
+         * semantics call panic()/KeBugCheckEx() directly, not
+         * SYS_LOG. The cap is `>= LOG_FATAL` (not `> LOG_FATAL`)
+         * so a future user-mode fault-injection bridge probe (the
+         * SYS_FAULT_INJECT design tracked under the user-mode test
+         * framework roadmap) cannot escalate by passing 4 instead
+         * of 5. */
+        log_level_t lvl = (log_level_t)arg1;
+        const char *msg = (const char *)arg2;
+        uint32_t len = (uint32_t)arg3;
+        if (lvl >= LOG_FATAL || !msg || len == 0) { ret = -1; break; }
+        if (len > 120) len = 120;
+        /* Copy to temp buffer and null-terminate */
+        {
+            char tmp[128];
+            uint32_t k;
+            for (k = 0; k < len && msg[k]; k++)
+                tmp[k] = msg[k];
+            tmp[k] = '\0';
+            klog(lvl, "user", "%s", tmp);
+        }
+        ret = 0;
+        break;
+    }
+    case SYS_OPENFILE: {
+        const char *path = (const char *)arg1;
+        uint32_t access = (uint32_t)arg2;
+        struct task *t = task_current();
+        char resolved[VFS_MAX_PATH];
+        /* Fine pledge (rpath/wpath/cpath), mirroring the NT NtCreateFile path
+         * (this legacy open bypasses that handler). */
+        if (pledge_check_file(t, access) != STATUS_SUCCESS)
+            pledge_terminate((uint32_t)SYS_OPENFILE);   /* noreturn */
+        /* ALWAYS canonicalize (collapse "." / "..") before opening so the handle
+         * stores the same canonical path vfs_open resolves. Otherwise a lexical
+         * path like C:\Allowed\..\Secret would open Secret while fo->path retains
+         * a string that later folds under an unveiled C:\Allowed -- a traversal
+         * bypass of a same-handle path-mutating setinfo. Deny on resolve failure
+         * (never fall through to the raw, possibly-truncated input). */
+        if (!path || task_resolve_path(path, resolved, sizeof(resolved)) != 0) {
+            ret = -1;
+            break;
+        }
+        if (t && __atomic_load_n(&t->unveil_active, __ATOMIC_ACQUIRE) &&
+            unveil_check(t, resolved, unveil_perms_for_vfs(access)) != STATUS_SUCCESS) {
+            ret = -1;
+            break;
+        }
+        ret = (int64_t)ob_create_file_handle(resolved, access);
+        break;
+    }
+    case SYS_CLOSEHANDLE: {
+        HANDLE handle = (HANDLE)(int32_t)arg1;
+        ret = (int64_t)NtClose(&task_current()->handle_table, handle);
+        break;
+    }
+    case SYS_READHANDLE: {
+        HANDLE handle = (HANDLE)(int32_t)arg1;
+        void *buf = (void *)arg2;
+        uint32_t size = (uint32_t)arg3;
+        ret = ob_file_read(&task_current()->handle_table, handle, buf, size);
+        break;
+    }
+    case SYS_WRITEHANDLE: {
+        HANDLE handle = (HANDLE)(int32_t)arg1;
+        const void *buf = (const void *)arg2;
+        uint32_t size = (uint32_t)arg3;
+        ret = ob_file_write(&task_current()->handle_table, handle, buf, size);
+        break;
+    }
+    case SYS_UNMAPVIEW: {
+        uintptr_t base = (uintptr_t)arg1;
+        ret = (int64_t)ObUnmapViewOfSectionByBase(
+                   &task_current()->handle_table,
+                   task_current()->pid, base);
+        break;
+    }
+    case SYS_OPENDIROBJ: {
+        const char *path = (const char *)arg1;
+        uint32_t access = (uint32_t)arg2;
+        HANDLE out_h;
+        if (NtOpenDirectoryObject(&task_current()->handle_table, path,
+                                  access, &out_h) == 0)
+            ret = (int64_t)out_h;
+        else
+            ret = -1;
+        break;
+    }
+    case SYS_QUERYDIROBJ: {
+        HANDLE dh = (HANDLE)(int32_t)arg1;
+        OBJECT_DIRECTORY_INFORMATION *buf = (OBJECT_DIRECTORY_INFORMATION *)arg2;
+        /* This legacy ABI carries no byte-length for `buf`, so it cannot tell
+         * how big the caller's buffer is. Force single-entry enumeration: the
+         * write is then exactly one 96-byte row and the caller iterates by
+         * advancing the packed context. (The SSDT NtQueryDirectoryObject handler
+         * carries a real buf_len and is the path for multi-row reads.) */
+        uint32_t ctx = (uint32_t)(arg3 >> 16);
+        uint32_t ret_count = 0;
+        /* The INT 0x80 dispatcher does not set previous-mode to UserMode, so the
+         * ProbeForWriteIfUser inside NtQueryDirectoryObject would no-op. This
+         * path is always from ring 3, so probe the single-row destination here
+         * before the kernel writes it -- a kernel-range `buf` is rejected. */
+        if (!buf || ProbeForWrite(buf, sizeof(OBJECT_DIRECTORY_INFORMATION), 1)
+                        != STATUS_SUCCESS) {
+            ret = -1;
+            break;
+        }
+        if (NtQueryDirectoryObject(&task_current()->handle_table, dh,
+                                   buf, 1, &ctx, &ret_count) == 0)
+            ret = (int64_t)((uint64_t)ctx << 16 | ret_count);
+        else
+            ret = -1;
+        break;
+    }
+#ifdef KERNEL_TESTS
+    /* Release flavor drops this case: syscall 44 then falls to the
+     * unknown-syscall default and returns -1. See the dispatch banner. */
+    case SYS_FAULT_INJECT:
+        ret = sys_fault_inject_dispatch((uint32_t)arg1, (uint32_t)arg2);
+        break;
+    /* Same flavor gate, same reason: the launcher that consumes this
+     * record is itself KERNEL_TESTS-only, so the release flavor has no
+     * reader and syscall 48 falls to the unknown-syscall default. Args
+     * are scalars -- no user pointer, so no probe/copy is needed. */
+    case SYS_TEST_REPORT:
+        ret = sys_test_report_dispatch(task_current(), (uint64_t)arg1,
+                                       (uint64_t)arg2, (uint64_t)arg3);
+        break;
+#endif /* KERNEL_TESTS */
+    case SYS_ABI_HANDSHAKE:
+        /* -18 ABI fingerprint runtime gate: returns the 64-bit hash the
+         * kernel was compiled with. User crt0 calls this as the first
+         * syscall and aborts with EX_ABI_MISMATCH=0x42 on disagreement.
+         * Pure read-only constant; no arg validation. */
+        ret = (int64_t)IMPOSSIBLE_OS_ABI_HASH;
+        break;
+    default:
+        klog(LOG_WARN, "sys", "Unknown syscall %u from PID %u",
+               syscall_nr, (uint64_t)task_current()->pid);
+        ret = -1;
+        break;
+    }
+
+    syscall_restore_entry_irql(entry_irql, syscall_nr);
+
+    frame->rax = (uint64_t)ret;
+    /* SYS_EXEC publishes a new ring-3 frame instead of returning to this one.
+     * Route the return through the exec handoff so the new image is entered
+     * deterministically; a no-op (returns 'frame') for every other syscall. */
+    return task_exec_take_pending_frame(frame);
+}
+
+/* --- INT 0x2E handler: NT syscall compatibility path ---
+ * Uses RAX as SSDT service number, Windows x64 arg passing:
+ * R10=arg1 (RCX clobbered by SYSCALL, so ntdll copies to R10),
+ * RDX=arg2, R8=arg3, R9=arg4.
+ * Returns NTSTATUS in RAX via frame->rax. */
+static uint64_t syscall_handler_2e(struct interrupt_frame *frame)
+{
+    extern NTSTATUS ssdt_dispatch(uint32_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t);
+    extern void ssdt_syscall_enter(void);
+    extern void ssdt_syscall_leave(void);
+    extern uint32_t RtlNtStatusToDosError(NTSTATUS);
+    extern struct thread *thread_current(void);
+    NTSTATUS result;
+    /* Same syscall-entry IRQL wrap as INT 0x80 -- INT 0x2E is a
+     * software interrupt too. Without this, ssdt_dispatch runs at
+     * DISPATCH_LEVEL (vector_to_irql(0x2E) = 2 via the ISA-legacy
+     * range branch), blocking mutex_lock on any NT path and blocking
+     * the fault-injection hooks from firing on NT-mediated
+     * allocator calls. (Codex quality review 2026-04-20.) */
+    KIRQL entry_irql = syscall_lower_entry_irql();
+    /* Same ring-3 evidence as the INT 0x80 path; the saved CS is checked
+     * here too rather than trusting the always-from-ring-3 property, so
+     * the evidence stays unforgeable if that ever stops holding. */
+    TASK_UTEST_NOTE_USER_ENTRY(frame->cs);
+    ssdt_syscall_enter();       /* UserMode + in_system_service (INT 0x2E always from ring 3) */
+    result = ssdt_dispatch(
+        (uint32_t)frame->rax,   /* service number */
+        frame->r10,             /* arg1 (Windows: R10 = original RCX) */
+        frame->rdx,             /* arg2 */
+        frame->r8,              /* arg3 */
+        frame->r9,              /* arg4 */
+        0, 0);                  /* arg5, arg6 (from user stack, future) */
+    ssdt_syscall_leave();       /* restore KernelMode + clear in_system_service */
+    /* Propagate Win32 error code to TEB->LastErrorValue on failure */
+    if (NT_ERROR(result)) {
+        struct thread *thr = thread_current();
+        if (thr && thr->teb) {
+            TEB *teb = (TEB *)thr->teb;
+            teb->LastErrorValue = RtlNtStatusToDosError(result);
+        }
+    }
+    syscall_restore_entry_irql(entry_irql, (uint64_t)frame->rax);
+    /* -19 NTSTATUS zero-extension fix: NTSTATUS is a signed 32-bit
+     * type; writing `(uint64_t)result` into a 64-bit frame slot
+     * sign-extends the top bit. For negative NTSTATUS values (every
+     * STATUS_* error in the 0xC0000000+ range), the user-mode
+     * reader saw 0xFFFFFFFF<code> instead of 0x00000000<code>. The
+     * SYSCALL fast path avoids this because its C function returns
+     * NTSTATUS as a 32-bit value and the x86-64 ABI's `mov eax, ...`
+     * zero-extends into rax. Match that behavior by explicitly
+     * truncating + zero-extending here. Found by -19 3-way fuzz
+     * (test_fastpath_fuzz.exe detecting the int2e vs SYSCALL
+     * divergence). */
+    frame->rax = (uint64_t)(uint32_t)result;
+    return (uint64_t)frame;
+}
+
+void syscall_init(void)
+{
+    /* INT 0x80: legacy Linux-style syscall path (existing user-mode binaries) */
+    idt_register_handler(VECTOR_LINUX_SYSCALL, syscall_handler);
+
+    /* INT 0x2E: NT syscall compatibility path (SSDT dispatch) */
+    idt_register_handler(VECTOR_NT_SYSCALL, syscall_handler_2e);
+
+    klog(LOG_INFO, "sys", "Syscall handler registered (INT 0x80 + INT 0x2E)");
+}

@@ -1,0 +1,114 @@
+# Impossible OS user-mode test manifest
+# =====================================
+#
+# Deployed by `make userland` to C:\tests\usermode.manifest.
+# Read by the kernel-side launcher in src/kernel/test/test_usermode.c
+# (TODO-04 §3 + §4 + §8). One filename per line, `#` starts a comment,
+# blank lines are ignored. Order in this file is the priority order
+# WITHIN a phase -- the launcher runs smokes (phase 0) then non-smokes
+# (phase 1), so a smoke listed below a correctness test still runs first.
+#
+# §8 test-type taxonomy: the type is inferred from the filename prefix
+#   test_smoke_*.exe   -> UTEST_TYPE_SMOKE       (phase 0; FAIL aborts run)
+#   test_stress_*.exe  -> UTEST_TYPE_STRESS      (phase 1; looped stress_iters times)
+#   test_perf_*.exe    -> UTEST_TYPE_PERF        (phase 1; emits [PERF] lines)
+#   anything else      -> UTEST_TYPE_CORRECTNESS (phase 1; default)
+# A `test_optin_` stem marks an opt-in binary: planned only when
+# utest_filter= names it exactly, which adds it to the default plan; the
+# rest of the name types it (`test_optin_smoke_*` is a smoke).
+# An optional `type=<name>` attribute on the line overrides the
+# filename-derived default, e.g.:
+#   test_foo.exe type=smoke     # force `test_foo.exe` into the smoke phase
+#
+# Kernel error lines (TODO-03 section 13). Each binary runs inside its own
+# kernel error window: a kernel LOG_ERROR line logged while it runs (by it,
+# by a fork descendant, or by anything else in the kernel) fails THAT binary
+# unless its line declares it:
+#   expects_klog=<tag>:<text>   the line must appear (a provoked failure)
+#   allows_klog=<tag>:<text>    the line may appear (a probe whose path varies)
+# <tag> is the klog tag; <text> is a substring of the message, percent-encoded
+# because a token ends at whitespace (`%20` is a space, `%25` a percent sign).
+# The value splits at its first `:` before decoding. At most 8 a line; a value
+# that does not decode refuses the whole line, like an unusable type=.
+#
+# To restrict the run to ONE binary, set `utest_filter=test_foo.exe`
+# in boot.conf (TODO-04 §4). Glob matching is supported: `test_smoke_*.exe`.
+
+# §8 smoke phase -- one fast-fail gate for catastrophic boot regressions.
+# Opt-in fixture (UTEST_OPT_IN_PREFIX): never runs unless utest_filter=
+# names it exactly, and then it runs FIRST, ahead of the default plan, so its
+# deliberate smoke FAIL proves the abort path (scripts/test-abort-path.sh).
+test_optin_smoke_abort.exe
+# Opt-in identity pair: swap runs first and rewrites victim in place after
+# the plan froze victim's identity, so victim must be refused as "planned
+# binary replaced" and never run (scripts/test-identity-path.sh). Name both:
+# utest_filter=test_optin_swap.exe:test_optin_victim.exe
+test_optin_swap.exe
+test_optin_victim.exe
+# Opt-in hang: reaches ring 3 and never exits, so it must be reaped with the
+# launcher's timeout status (scripts/test-timeout-path.sh).
+test_optin_hang.exe
+test_smoke_boot.exe
+
+# -17 fast-path transport probes (gs:TEB, KUSD, syscall->SSDT).
+# Runs early in the correctness phase so a broken ring-3 transition
+# surfaces as FAIL on this binary, not as a silent hang in a later
+# test that depends on any of the three fast paths. Exit code is a
+# bitmap of failing probes (0 = all PASS); launcher reports the
+# bitmap in its verdict line.
+test_fastpath.exe
+
+# -19 3-way transport fuzz (1000 iters each of INT 0x80 / SYSCALL /
+# INT 0x2E calling NtClose(INVALID_HANDLE)). Any transport-level
+# regression surfaces as FAIL on THIS binary with the specific
+# iter + transport in the UTEST line; §19 transition ring captures
+# the last 64 ring-3 crossings at the next panic for replay.
+test_fastpath_fuzz.exe
+
+# §1 harness self-test + correctness suites.
+test_harness_smoke.exe
+
+# Adversarial input, not a unit test: prints launcher-shaped records on
+# fd 1 (a fake legacy summary, a fake JUnit testcase, a fake JSON record,
+# a wrong-nonce frame terminator) so the HOST gates are asserted against
+# real ring-3 forgery attempts rather than a synthetic log. It passes; the
+# proof is that none of its output reaches an artifact or a verdict.
+test_forge.exe
+test_syscall.exe
+test_libc.exe
+test_ipc.exe
+# test_process.exe forks eight children: three for fork/exec/kill and five for
+# the exec commit-point lifecycle (post-commit termination, injected kmalloc
+# OOM, oversized argv, the allocation-depth sweep, injected PMM OOM).
+# Tell the launcher's pre-flight budget check so fork-heavy binaries
+# count for 1 (launcher task) + 8 (forked children) = 9 slots. Keep this in
+# step with the TASK-SLOT BUDGET comment at the top of test_process.c: a stale
+# value here reports capacity the run does not have, and the binary then
+# exhausts TASK_MAX and destabilises whatever runs after it.
+test_process.exe expects_tasks=9 expects_klog=sched:exec:%20post-commit%20failure allows_klog=sys:exec:%20short%20read
+test_fileio.exe
+test_win32.exe
+# §15 binary-format loader coverage: one binary per registered format.
+# Launcher emits `UTEST: <name>: format=<NAME>` before the verdict so a
+# regression that silently routes the wrong loader surfaces even when
+# the binary exits 0. ELF + EIF target USER_ELF_BASE (0x800000) via
+# the per-process cr3's pre-split PT; PE targets its ImageBase via
+# vmm_map_page which now propagates User at every intermediate
+# table level (fix in src/kernel/mm/vmm.c get_or_create_table,
+# 2026-04-22). Three-format coverage runs here as a unit so a
+# kernel regression in any loader surfaces on the same boot.
+test_loader_elf.exe
+test_loader_pe.exe
+test_loader_eif.exe
+# Forks one child per kmalloc-backed exec site probe (2), one disarmed
+# control fork for the fork-PML4 site probe (1), plus itself. The fork that
+# the PML4 site REFUSES consumes no slot, because task_fork now fails closed
+# before num_tasks++ publishes the child. PIDs are allocated monotonically
+# and task_cleanup does not return slots, so the budget must name all four or
+# the launcher's TASK_MAX pre-flight undercounts and a later stress test
+# fails without the capacity warning.
+test_faultinject.exe expects_tasks=4 expects_klog=sched:task_exec:%20OOM%20allocating%20argv%20address%20table expects_klog=sched:task_exec:%20OOM%20allocating%20private-frame%20table expects_klog=sched:task_fork:%20per-process%20PML4%20allocation%20failed
+
+# §8 stress + perf phase -- run after all correctness passes.
+test_stress_libc.exe
+test_perf_syscall.exe

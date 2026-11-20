@@ -1,0 +1,104 @@
+{
+  "battery-charging": {
+    "variant": "charging",
+    "page": "ms-settings:batterysaver",
+    "expect": {
+      "power": {
+        "ac": 1,
+        "percent": 60,
+        "saver": 0
+      }
+    },
+    "shows": "Power & battery at 60 percent on AC, charging, with the time until fully charged",
+    "proof": {
+      "file": "stand-ins/battery-charging.png",
+      "sha256": "9a487265a0a28772e48e7f41fd02c455d9b2e2befc5edc753be7c487bc72aef9",
+      "size": 2505429,
+      "date": "2026-11-16"
+    },
+    "marker": "Power Mode"
+  },
+  "battery-discharging": {
+    "variant": "discharging",
+    "page": "ms-settings:batterysaver",
+    "expect": {
+      "power": {
+        "ac": 0,
+        "percent": 60,
+        "saver": 0
+      }
+    },
+    "shows": "Power & battery at 60 percent on battery, with the time remaining",
+    "proof": {
+      "file": "stand-ins/battery-discharging.png",
+      "sha256": "8a19f7fe46655811a1a5397ea51769b2992c85f0a236714c12b180110c586da1",
+      "size": 2504901,
+      "date": "2026-11-16"
+    },
+    "marker": "Power Mode"
+  },
+  "battery-saver": {
+    "variant": "saver",
+    "page": "ms-settings:batterysaver",
+    "expect": {
+      "power": {
+        "ac": 0,
+        "percent": 15,
+        "saver": 1
+      }
+    },
+    "shows": "Power & battery at 15 percent with Energy saver on",
+    "proof": {
+      "file": "stand-ins/battery-saver.png",
+      "sha256": "bd56f136d6fc75781ee3fbaba6db73657bf98985ad8b775b51eeb69f6eea272f",
+      "size": 2506248,
+      "date": "2026-11-16"
+    },
+    "marker": "Power Mode"
+  },
+  "lid-and-power-buttons": {
+    "variant": "charging",
+    "page": "ms-settings:batterysaver",
+    "expect": {
+      "device": "ACPI\\PNP0C0D\\*"
+    },
+    "shows": "Lid & power button controls on Power & battery, from the ACPI lid",
+    "proof": {
+      "file": "stand-ins/lid-and-power-buttons.png",
+      "sha256": "9a487265a0a28772e48e7f41fd02c455d9b2e2befc5edc753be7c487bc72aef9",
+      "size": 2505429,
+      "date": "2026-11-16"
+    },
+    "marker": "Power Mode"
+  },
+  "brightness": {
+    "variant": "charging",
+    "page": "ms-settings:display",
+    "expect": {
+      "brightness": true
+    },
+    "shows": "Brightness for the built-in display, from the panel's ACPI backlight methods",
+    "proof": {
+      "file": "stand-ins/brightness.png",
+      "sha256": "8663a43164ad00225434c3ce28792c52f89779c4ef4a2ca78b6f630a392b5be4",
+      "size": 2447457,
+      "date": "2026-11-16"
+    },
+    "marker": "Brightness"
+  },
+  "sound-output": {
+    "variant": "discharging",
+    "page": "ms-settings:sound",
+    "expect": {
+      "device": "HDAUDIO\\FUNC_01*\\*"
+    },
+    "shows": "Sound settings with the emulated HD Audio speakers as the output device, which gives Quick Settings a live volume row",
+    "marker": "Output",
+    "proof": {
+      "file": "stand-ins/sound-output.png",
+      "sha256": "a4a1174c3cfb2c2650bf68644147ce71e555d628e60dbddb046861d93fbc54e3",
+      "size": 2499014,
+      "date": "2026-11-17"
+    }
+  }
+}

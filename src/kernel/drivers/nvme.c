@@ -1,0 +1,1031 @@
+/* ============================================================================
+ * nvme.c -- NVMe storage driver
+ *
+ * §1: PCI scan, BAR0 UC mapping, CAP/VS read, controller disable/enable.
+ * Admin Queue setup, Identify Controller + Identify Namespace.
+ * I/O Queue creation, sector read/write via polled completion.
+ * ============================================================================ */
+
+#include "kernel/drivers/nvme.h"
+#include "kernel/drivers/pci.h"
+#include "kernel/mm/vmm.h"
+#include "kernel/mm/pmm.h"
+#include "kernel/klog.h"
+#include "kernel/boot_init.h"
+#include "kernel/timer.h"
+#include "kernel/barrier.h"
+#include "libc/string.h"
+
+/* ---- Static state ---- */
+static struct nvme_controller controllers[NVME_MAX_CONTROLLERS];
+static int num_controllers;
+
+/* Probe accounting for the boot load-status log.
+ *
+ * `num_controllers` counts controllers that reached ENABLED, and it is
+ * incremented BEFORE Identify and I/O-queue setup run -- so it answers "how
+ * many controllers came out of reset", not "how many can carry I/O". A
+ * controller whose Identify times out, whose namespace sector size is
+ * unsupported, or whose I/O queue creation fails still lands in that count
+ * while `blkdev_adapters.c` registers no usable namespace behind it.
+ *
+ * s_probe_attempted counts every PCI function that matched the NVMe class code
+ * and was handed to nvme_init_controller; s_probe_usable counts only those
+ * that finished with a valid namespace AND live I/O queues. The pair is what
+ * the load-status record classifies, so a partial multi-controller failure is
+ * DEGRADED rather than a clean BOOT_OK. */
+static uint32_t s_probe_attempted;
+static uint32_t s_probe_usable;
+
+/* ---- MMIO helpers ---- */
+
+static inline uint32_t nvme_read32(volatile uint8_t *base, uint32_t off)
+{
+    return *(volatile uint32_t *)(base + off);
+}
+
+static inline void nvme_write32(volatile uint8_t *base, uint32_t off,
+                                uint32_t val)
+{
+    *(volatile uint32_t *)(base + off) = val;
+}
+
+static inline uint64_t nvme_read64(volatile uint8_t *base, uint32_t off)
+{
+    uint32_t lo = *(volatile uint32_t *)(base + off);
+    uint32_t hi = *(volatile uint32_t *)(base + off + 4);
+    return (uint64_t)lo | ((uint64_t)hi << 32);
+}
+
+static inline void nvme_write64(volatile uint8_t *base, uint32_t off,
+                                uint64_t val)
+{
+    *(volatile uint32_t *)(base + off)     = (uint32_t)val;
+    *(volatile uint32_t *)(base + off + 4) = (uint32_t)(val >> 32);
+}
+
+static void nvme_memset(void *dst, uint8_t val, uint64_t n)
+{
+    uint8_t *p = (uint8_t *)dst;
+    while (n--)
+        *p++ = val;
+}
+
+/* ---- Admin command submission ---- */
+
+static int nvme_submit_admin_cmd(struct nvme_controller *nc,
+                                 struct nvme_sqe *cmd,
+                                 uint32_t timeout_ms)
+{
+    volatile struct nvme_sqe *sqe;
+    volatile struct nvme_cqe *cqe;
+    uint32_t db_stride, elapsed;
+    uint16_t status;
+
+    /* Doorbell stride in bytes: 4 << DSTRD */
+    db_stride = 4u << nc->dstrd;
+
+    /* Write command into SQ at tail */
+    sqe = &nc->admin_sq[nc->admin_sq_tail];
+    {
+        const uint32_t *src = (const uint32_t *)cmd;
+        volatile uint32_t *dst = (volatile uint32_t *)sqe;
+        uint32_t i;
+        for (i = 0; i < 16; i++)
+            dst[i] = src[i];
+    }
+
+    /* Advance tail and ring SQ 0 tail doorbell.
+     * wmb() ensures SQ entry stores are visible before the MMIO doorbell
+     * write (NVMe spec requirement; x86 TSO provides this naturally, but
+     * the barrier makes the contract explicit and portable). */
+    nc->admin_sq_tail = (nc->admin_sq_tail + 1) % NVME_ADMIN_QUEUE_DEPTH;
+    wmb();
+    nvme_write32(nc->mmio_base, NVME_REG_DOORBELL_BASE, nc->admin_sq_tail);
+
+    /* Poll CQ for completion (volatile CQE access prevents compiler CSE) */
+    elapsed = 0;
+    while (elapsed < timeout_ms) {
+        cqe = &nc->admin_cq[nc->admin_cq_head];
+        status = cqe->status;
+
+        /* Phase bit is bit 0 of status word */
+        if ((status & 1) == nc->admin_cq_phase)
+            goto done;
+
+        sleep_ms(1);
+        elapsed++;
+    }
+    return -1;  /* timeout */
+
+done:
+    /* Check status (bits 15:1, shift right 1 to get SCT+SC) */
+    if ((status >> 1) != 0) {
+        klog(LOG_ERROR, "nvme", "admin cmd failed: status=0x%x",
+             (uint64_t)(status >> 1));
+        /* Still advance CQ head to keep queue in sync */
+    }
+
+    /* Advance CQ head, flip phase on wrap */
+    nc->admin_cq_head = (nc->admin_cq_head + 1) % NVME_ADMIN_QUEUE_DEPTH;
+    if (nc->admin_cq_head == 0)
+        nc->admin_cq_phase ^= 1;
+
+    /* Ring CQ 0 head doorbell */
+    nvme_write32(nc->mmio_base, NVME_REG_DOORBELL_BASE + db_stride, nc->admin_cq_head);
+
+    return (status >> 1) != 0 ? -1 : 0;
+}
+
+/* ---- Identify Controller + Namespace ---- */
+
+static void nvme_identify(struct nvme_controller *nc, uint32_t timeout_ms)
+{
+    struct nvme_sqe cmd;
+    uintptr_t data_phys;
+    uint8_t *data;
+    uint32_t i;
+
+    POST16(POST16_NVME_ADMIN);
+
+    /* Allocate 4 KiB page for Identify data */
+    data_phys = pmm_alloc_contiguous(1);
+    if (!data_phys) {
+        klog(LOG_WARN, "nvme", "failed to allocate Identify buffer");
+        POST16(POST16_NVME_ADMIN_OK);
+        return;
+    }
+    data = (uint8_t *)data_phys;
+
+    /* ---- Identify Controller (CNS=1) ---- */
+    nvme_memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_IDENTIFY;  /* opcode in bits 7:0 */
+    cmd.nsid = 0;
+    cmd.prp1 = (uint64_t)data_phys;
+    cmd.cdw10 = NVME_IDENTIFY_CNS_CTRL;
+
+    nvme_memset(data, 0, 4096);
+    if (nvme_submit_admin_cmd(nc, &cmd, timeout_ms) != 0) {
+        klog(LOG_WARN, "nvme", "Identify Controller timeout");
+        POST16(POST16_NVME_ADMIN_OK);
+        return;
+    }
+
+    /* Parse serial number (bytes 4–23, 20 chars) */
+    for (i = 0; i < 20; i++)
+        nc->serial[i] = (char)data[4 + i];
+    nc->serial[20] = '\0';
+    /* Trim trailing spaces */
+    for (i = 19; i < 20 && nc->serial[i] == ' '; i--)
+        nc->serial[i] = '\0';
+
+    /* Parse model number (bytes 24–63, 40 chars) */
+    for (i = 0; i < 40; i++)
+        nc->model[i] = (char)data[24 + i];
+    nc->model[40] = '\0';
+    /* Trim trailing spaces */
+    for (i = 39; i < 40 && nc->model[i] == ' '; i--)
+        nc->model[i] = '\0';
+
+    klog(LOG_DEBUG, "nvme", "Identify: serial=\"%s\" model=\"%s\"",
+         nc->serial, nc->model);
+
+    /* ---- Identify Namespace (CNS=0, NSID=1) ---- */
+    nvme_memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_IDENTIFY;
+    cmd.nsid = 1;
+    cmd.prp1 = (uint64_t)data_phys;
+    cmd.cdw10 = NVME_IDENTIFY_CNS_NS;
+
+    nvme_memset(data, 0, 4096);
+    if (nvme_submit_admin_cmd(nc, &cmd, timeout_ms) != 0) {
+        klog(LOG_WARN, "nvme", "Identify Namespace timeout");
+        POST16(POST16_NVME_ADMIN_OK);
+        return;
+    }
+
+    /* NSZE: namespace size in LBAs (bytes 0–7, 64-bit LE) */
+    nc->ns_lba_count = *(uint64_t *)&data[0];
+
+    /* FLBAS: formatted LBA size (byte 26, bits 3:0 = active format index).
+     * DS is the LBA Data Size exponent from untrusted controller data; only
+     * DS=9 (512) and DS=12 (4096) are supported and PRP-encodable. Map those
+     * directly and reject everything else WITHOUT a 1<<ds shift -- ds can be
+     * >= 32, which is undefined behavior on a 32-bit shift. */
+    {
+        uint8_t flbas_idx = data[26] & 0x0F;
+        /* LBAF[n] at offset 128 + n*4, DS field in bits 23:16 */
+        uint32_t lbaf = *(uint32_t *)&data[128 + flbas_idx * 4];
+        uint8_t ds = (uint8_t)((lbaf >> 16) & 0xFF);
+        if (ds == 9)
+            nc->ns_sector_size = 512;
+        else if (ds == 12)
+            nc->ns_sector_size = 4096;
+        else {
+            klog(LOG_ERROR, "nvme",
+                 "unsupported LBA data size DS=%u -- namespace not usable",
+                 (uint64_t)ds);
+            nc->ns_sector_size = 0;
+        }
+    }
+
+    /* Log summary */
+    {
+        uint64_t total_bytes = nc->ns_lba_count * (uint64_t)nc->ns_sector_size;
+        uint64_t gib = total_bytes / (1024ULL * 1024 * 1024);
+        klog(LOG_INFO, "nvme", "\"%s\" %u GiB, %u-byte sectors, %llu LBAs",
+             nc->model, gib, (uint64_t)nc->ns_sector_size,
+             nc->ns_lba_count);
+    }
+
+    /* ns_sector_size is now 512, 4096, or 0 (rejected above); a 0 leaves the
+     * I/O queue inactive and blkdev registration skips this namespace, instead
+     * of issuing a wrapped cdw12 = (4096/size)-1 = 0xFFFFFFFF (4 G-block). */
+
+    POST16(POST16_NVME_ADMIN_OK);
+}
+
+/* Forward declaration */
+static int nvme_submit_io_cmd(struct nvme_controller *nc,
+                              struct nvme_sqe *cmd,
+                              uint32_t timeout_ms);
+
+/* ---- I/O Queue creation ----
+ * Returns 0 when the queue pair is live AND a sector-0 read through it
+ * completed successfully, NVME_IOQ_UNVERIFIED when the queue was created but
+ * that read failed (error completion, timeout, or no buffer to read into), and
+ * -1 when creation itself failed. The queue is left as the read left it: an
+ * error completion keeps it active, a timeout poisons it. */
+#define NVME_IOQ_UNVERIFIED  (-2)
+
+static int nvme_create_io_queues(struct nvme_controller *nc, uint32_t timeout_ms)
+{
+    struct nvme_sqe cmd;
+    uint32_t db_stride = 4u << nc->dstrd;
+    uint16_t io_depth;
+
+    POST16(POST16_NVME_IO);
+
+    /* Cap I/O queue depth to controller's MQES+1 */
+    io_depth = NVME_IO_QUEUE_DEPTH;
+    if (io_depth > (nc->mqes + 1))
+        io_depth = nc->mqes + 1;
+    nc->io_queue_depth = (uint16_t)io_depth;   /* submit path wraps on this */
+
+    /* Allocate I/O SQ and CQ pages */
+    nc->io_sq_phys = pmm_alloc_contiguous(1);
+    nc->io_cq_phys = pmm_alloc_contiguous(1);
+    if (!nc->io_sq_phys || !nc->io_cq_phys) {
+        klog(LOG_ERROR, "nvme", "failed to allocate I/O queues");
+        POST16(POST16_NVME_IO_OK);
+        return -1;
+    }
+    nc->io_sq = (volatile struct nvme_sqe *)nc->io_sq_phys;
+    nc->io_cq = (volatile struct nvme_cqe *)nc->io_cq_phys;
+    nvme_memset((void *)nc->io_sq_phys, 0, 4096);
+    nvme_memset((void *)nc->io_cq_phys, 0, 4096);
+    nc->io_sq_tail  = 0;
+    nc->io_cq_head  = 0;
+    nc->io_cq_phase = 1;
+
+    /* ---- Create I/O Completion Queue (QID=1) ---- */
+    nvme_memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_CREATE_IOCQ;
+    cmd.prp1 = (uint64_t)nc->io_cq_phys;
+    cmd.cdw10 = ((uint32_t)(io_depth - 1) << 16) | 1;  /* size[31:16] | QID[15:0] */
+    cmd.cdw11 = (1 << 0);  /* PC=1 (physically contiguous) */
+
+    if (nvme_submit_admin_cmd(nc, &cmd, timeout_ms) != 0) {
+        klog(LOG_ERROR, "nvme", "Create I/O CQ failed");
+        POST16(POST16_NVME_IO_OK);
+        return -1;
+    }
+
+    /* ---- Create I/O Submission Queue (QID=1, CQID=1) ---- */
+    nvme_memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_CREATE_IOSQ;
+    cmd.prp1 = (uint64_t)nc->io_sq_phys;
+    cmd.cdw10 = ((uint32_t)(io_depth - 1) << 16) | 1;  /* size[31:16] | QID[15:0] */
+    cmd.cdw11 = (1 << 16) | (1 << 0);  /* CQID=1[31:16] | PC=1[0] */
+
+    if (nvme_submit_admin_cmd(nc, &cmd, timeout_ms) != 0) {
+        klog(LOG_ERROR, "nvme", "Create I/O SQ failed");
+        POST16(POST16_NVME_IO_OK);
+        return -1;
+    }
+
+    nc->io_queue_active = 1;
+
+    klog(LOG_INFO, "nvme", "I/O Queue created (QID=1, depth=%u, db_stride=%u, SQ=0x%llx CQ=0x%llx)",
+         (uint64_t)io_depth, (uint64_t)db_stride,
+         (uint64_t)nc->io_sq_phys, (uint64_t)nc->io_cq_phys);
+
+    /* ---- Verify: read sector 0 ---- */
+    {
+        int verified = 0;
+        uintptr_t test_phys = pmm_alloc_contiguous(1);
+        if (!test_phys)
+            klog(LOG_WARN, "nvme", "sector 0 read skipped (no buffer) -- unverified");
+        if (test_phys) {
+            struct nvme_sqe rd;
+            uint8_t *test_buf = (uint8_t *)test_phys;
+            nvme_memset(test_buf, 0, 512);
+
+            nvme_memset(&rd, 0, sizeof(rd));
+            rd.cdw0 = NVME_IO_READ;
+            rd.nsid = 1;
+            rd.prp1 = (uint64_t)test_phys;
+            rd.cdw10 = 0;  /* LBA 0 */
+            rd.cdw11 = 0;
+            rd.cdw12 = 0;  /* 1 sector (0-based) */
+
+            if (nvme_submit_io_cmd(nc, &rd, timeout_ms) == 0) {
+                verified = 1;
+                /* Check for GPT/MBR signature */
+                if (test_buf[510] == 0x55 && test_buf[511] == 0xAA)
+                    klog(LOG_INFO, "nvme", "sector 0 read OK (MBR signature found)");
+                else if (test_buf[0] == 0xEB || test_buf[0] == 0xE9)
+                    klog(LOG_INFO, "nvme", "sector 0 read OK (FAT boot jump)");
+                else
+                    klog(LOG_INFO, "nvme", "sector 0 read OK (sig=0x%x 0x%x)",
+                         (uint64_t)test_buf[510], (uint64_t)test_buf[511]);
+            } else {
+                klog(LOG_WARN, "nvme", "sector 0 read failed (error or timeout)");
+            }
+            /* A command that COMPLETED (success or error status) is finished
+             * with the page. A timed-out one is not: nothing cancels it, the
+             * queue is only poisoned, and a late completion would still DMA
+             * into the page. The device keeps it for good (one page per
+             * poisoned controller), never the allocator. */
+            if (nc->io_queue_active)
+                pmm_free_frame(test_phys);
+            else
+                klog(LOG_WARN, "nvme",
+                     "sector 0 read timed out -- verify buffer retained for DMA safety");
+        }
+        if (!verified) {
+            POST16(POST16_NVME_IO_OK);
+            return NVME_IOQ_UNVERIFIED;
+        }
+    }
+
+    POST16(POST16_NVME_IO_OK);
+    return 0;
+}
+
+/* ---- I/O command submission ---- */
+
+static int nvme_submit_io_cmd(struct nvme_controller *nc,
+                              struct nvme_sqe *cmd,
+                              uint32_t timeout_ms)
+{
+    volatile struct nvme_sqe *sqe;
+    volatile struct nvme_cqe *cqe;
+    uint32_t db_stride, elapsed;
+    uint16_t status;
+
+    db_stride = 4u << nc->dstrd;
+
+    /* Serialize the whole submit-to-completion against concurrent read/write/
+     * flush on the shared I/O queue (QID 1). SMP-safe single-in-flight gate via
+     * atomic CAS: a spinlock would hlt-hang (spin_lock disables IRQs, the poll
+     * sleeps), and the kernel mutex wait-queue is not SMP-safe. Nothing is held
+     * across the sleep. Bounded by timeout_ms so acquisition counts against the
+     * deadline (a contended flush stays CAP.TO-bounded). */
+    {
+        uint32_t acq = 0;
+        while (atomic_cmpxchg(&nc->io_busy, 0, 1) != 0) {
+            if (acq++ >= timeout_ms)
+                return -1;   /* could not acquire the queue within the deadline */
+            sleep_ms(1);
+        }
+    }
+    /* Now that we hold the gate, refuse to submit into a controller that is
+     * shutting down (nvme_shutdown sets shutting_down then takes this same gate,
+     * so holding it here means no CC.SHN can race this command) or whose queue
+     * was poisoned by a prior timeout. */
+    if (atomic_read(&nc->shutting_down) || !nc->io_queue_active) {
+        atomic_set(&nc->io_busy, 0);
+        return -1;
+    }
+
+    /* Write command into I/O SQ at tail */
+    sqe = &nc->io_sq[nc->io_sq_tail];
+    {
+        const uint32_t *src = (const uint32_t *)cmd;
+        volatile uint32_t *dst = (volatile uint32_t *)sqe;
+        uint32_t i;
+        for (i = 0; i < 16; i++)
+            dst[i] = src[i];
+    }
+
+    /* Advance tail and ring I/O SQ 1 tail doorbell */
+    nc->io_sq_tail = (nc->io_sq_tail + 1) % nc->io_queue_depth;
+    wmb();  /* SQ entry visible before doorbell (NVMe spec) */
+    /* SQ y tail doorbell: 0x1000 + (2y * db_stride), y=1 for I/O QID 1 */
+    nvme_write32(nc->mmio_base, NVME_REG_DOORBELL_BASE + (2 * db_stride), nc->io_sq_tail);
+
+    /* Poll I/O CQ for completion (volatile CQE access prevents compiler CSE) */
+    elapsed = 0;
+    while (elapsed < timeout_ms) {
+        cqe = &nc->io_cq[nc->io_cq_head];
+        status = cqe->status;
+
+        if ((status & 1) == nc->io_cq_phase)
+            goto done;
+
+        sleep_ms(1);
+        elapsed++;
+    }
+    /* Timeout: a completion may still arrive late for this command. With no
+     * per-command CID matching in this polled path (phase bit only), the next
+     * command would consume that stale CQE as its own. Poison the queue so all
+     * further I/O fails closed instead of corrupting; controller-reset recovery
+     * is future work tracked in the advanced NVMe backlog. */
+    nc->io_queue_active = 0;
+    klog(LOG_ERROR, "nvme", "I/O timeout -- queue poisoned, no further I/O");
+    atomic_set(&nc->io_busy, 0);
+    return -1;  /* timeout */
+
+done:
+    if ((status >> 1) != 0) {
+        klog(LOG_ERROR, "nvme", "I/O cmd failed: status=0x%x",
+             (uint64_t)(status >> 1));
+    }
+
+    /* Advance CQ head, flip phase on wrap */
+    nc->io_cq_head = (nc->io_cq_head + 1) % nc->io_queue_depth;
+    if (nc->io_cq_head == 0)
+        nc->io_cq_phase ^= 1;
+
+    /* Ring I/O CQ 1 head doorbell: 0x1000 + ((2*1+1) * db_stride) */
+    nvme_write32(nc->mmio_base, NVME_REG_DOORBELL_BASE + (3 * db_stride), nc->io_cq_head);
+
+    atomic_set(&nc->io_busy, 0);
+    return (status >> 1) != 0 ? -1 : 0;
+}
+
+/* ---- Controller init ---- */
+
+static int nvme_init_controller(uint8_t bus, uint8_t dev, uint8_t func)
+{
+    struct nvme_controller *nc;
+    uint32_t bar0, bar1, vs, cc, csts;
+    uint64_t cap, mmio_phys;
+    uint32_t timeout_ms, elapsed;
+
+    if (num_controllers >= NVME_MAX_CONTROLLERS) {
+        klog(LOG_WARN, "nvme", "Too many controllers (max %u)",
+             (uint64_t)NVME_MAX_CONTROLLERS);
+        return -1;
+    }
+
+    nc = &controllers[num_controllers];
+    atomic_set(&nc->io_busy, 0);
+    atomic_set(&nc->shutting_down, 0);
+
+    /* ---- Read 64-bit BAR0/BAR1 ---- */
+    bar0 = pci_read32(bus, dev, func, PCI_BAR0);
+    bar1 = pci_read32(bus, dev, func, PCI_BAR1);
+
+    if (bar0 & 0x01) {
+        klog(LOG_ERROR, "nvme", "BAR0 is I/O space (expected memory)");
+        return -1;
+    }
+    if (((bar0 >> 1) & 0x03) != 0x02) {
+        klog(LOG_WARN, "nvme", "BAR0 is not 64-bit (type=%u), trying 32-bit",
+             (uint64_t)((bar0 >> 1) & 0x03));
+        bar1 = 0;
+    }
+
+    mmio_phys = (uint64_t)(bar0 & 0xFFFFFFF0) | ((uint64_t)bar1 << 32);
+    if (mmio_phys == 0) {
+        klog(LOG_ERROR, "nvme", "BAR0 is zero -- no MMIO base");
+        return -1;
+    }
+
+    /* ---- Enable PCI command register ---- */
+    {
+        uint16_t cmd = pci_read16(bus, dev, func, PCI_COMMAND);
+        cmd |= PCI_CMD_BUS_MASTER;
+        cmd |= PCI_CMD_MEM_SPACE;
+        cmd |= PCI_CMD_INT_DISABLE;
+        pci_write16(bus, dev, func, PCI_COMMAND, cmd);
+    }
+
+    /* ---- Map MMIO region (16 KiB for NVMe controller registers) ---- */
+    nc->mmio_phys = mmio_phys;
+    nc->mmio_size = 0x4000;
+    {
+        void *va = vmm_map_mmio_uc(mmio_phys, nc->mmio_size);
+        if (!va) {
+            klog(LOG_ERROR, "nvme", "vmm_map_mmio_uc failed for 0x%llx",
+                 (uint64_t)mmio_phys);
+            return -1;
+        }
+        nc->mmio_base = (volatile uint8_t *)va;
+    }
+
+    /* ---- Read CAP register (64-bit) ---- */
+    cap = nvme_read64(nc->mmio_base, NVME_REG_CAP);
+    nc->mqes   = (uint16_t)(cap & NVME_CAP_MQES_MASK);
+    nc->to     = (uint8_t)((cap >> NVME_CAP_TO_SHIFT) & NVME_CAP_TO_MASK);
+    nc->dstrd  = (uint8_t)((cap >> NVME_CAP_DSTRD_SHIFT) & NVME_CAP_DSTRD_MASK);
+    nc->css    = (uint8_t)((cap >> NVME_CAP_CSS_SHIFT) & NVME_CAP_CSS_MASK);
+    nc->mpsmin = (uint8_t)((cap >> NVME_CAP_MPSMIN_SHIFT) & NVME_CAP_MPSMIN_MASK);
+    nc->mpsmax = (uint8_t)((cap >> NVME_CAP_MPSMAX_SHIFT) & NVME_CAP_MPSMAX_MASK);
+
+    /* ---- Read VS register ---- */
+    vs = nvme_read32(nc->mmio_base, NVME_REG_VS);
+    nc->ver_major = (uint16_t)(vs >> 16);
+    nc->ver_minor = (uint8_t)((vs >> 8) & 0xFF);
+    nc->ver_ter   = (uint8_t)(vs & 0xFF);
+
+    klog(LOG_INFO, "nvme", "Controller v%u.%u.%u at PCI %u:%u.%u, BAR0=0x%llx",
+         (uint64_t)nc->ver_major, (uint64_t)nc->ver_minor,
+         (uint64_t)nc->ver_ter,
+         (uint64_t)bus, (uint64_t)dev, (uint64_t)func,
+         (uint64_t)mmio_phys);
+
+    klog(LOG_DEBUG, "nvme", "CAP: MQES=%u DSTRD=%u TO=%u CSS=0x%x MPSMIN=%u MPSMAX=%u",
+         (uint64_t)nc->mqes, (uint64_t)nc->dstrd, (uint64_t)nc->to,
+         (uint64_t)nc->css, (uint64_t)nc->mpsmin, (uint64_t)nc->mpsmax);
+
+    /* The mapped BAR window must cover the highest doorbell this driver writes:
+     * the I/O CQ-1 head doorbell at 0x1000 + 3*(4<<DSTRD). A controller with a
+     * large DSTRD would push it past the mapping and fault on a UC MMIO write;
+     * reject rather than scribble out of bounds. */
+    {
+        uint64_t max_db = (uint64_t)NVME_REG_DOORBELL_BASE + 3ull * (4ull << nc->dstrd) + sizeof(uint32_t);
+        if (max_db > nc->mmio_size) {
+            klog(LOG_ERROR, "nvme",
+                 "DSTRD=%u doorbell window exceeds BAR map -- skipping",
+                 (uint64_t)nc->dstrd);
+            return -1;
+        }
+    }
+
+    /* This host programs CC.MPS=0 (4 KiB) and allocates 4 KiB queues/buffers,
+     * so the controller must accept MPS=0 -- i.e. CAP.MPSMIN must be 0. Reject
+     * a controller that requires a larger minimum host page size. */
+    if (nc->mpsmin != 0) {
+        klog(LOG_ERROR, "nvme",
+             "MPSMIN=%u > 0 -- 4 KiB host pages unsupported, skipping",
+             (uint64_t)nc->mpsmin);
+        return -1;
+    }
+
+    /* Validate NVM command set support */
+    if (!(nc->css & NVME_CAP_CSS_NVM)) {
+        klog(LOG_ERROR, "nvme", "NVM command set not supported (CSS=0x%x)",
+             (uint64_t)nc->css);
+        return -1;
+    }
+
+    /* Timeout: CAP.TO * 500ms, minimum 500ms */
+    timeout_ms = (uint32_t)nc->to * 500;
+    if (timeout_ms < 500)
+        timeout_ms = 500;
+
+    /* ---- Controller disable (if currently enabled) ---- */
+    cc = nvme_read32(nc->mmio_base, NVME_REG_CC);
+    if (cc & NVME_CC_EN) {
+        cc &= ~NVME_CC_EN;
+        nvme_write32(nc->mmio_base, NVME_REG_CC, cc);
+
+        /* Wait for CSTS.RDY == 0 */
+        elapsed = 0;
+        while (elapsed < timeout_ms) {
+            csts = nvme_read32(nc->mmio_base, NVME_REG_CSTS);
+            if (!(csts & NVME_CSTS_RDY))
+                break;
+            if (csts & NVME_CSTS_CFS) {
+                klog(LOG_ERROR, "nvme", "controller fatal status during disable");
+                return -1;
+            }
+            sleep_ms(1);
+            elapsed++;
+        }
+        if (elapsed >= timeout_ms) {
+            klog(LOG_ERROR, "nvme", "controller disable timeout (%u ms)",
+                 (uint64_t)timeout_ms);
+            return -1;
+        }
+    }
+
+    /* ---- Admin queue allocation (must happen while CC.EN=0) ---- */
+    nc->admin_sq_phys = pmm_alloc_contiguous(1);
+    nc->admin_cq_phys = pmm_alloc_contiguous(1);
+    if (!nc->admin_sq_phys || !nc->admin_cq_phys) {
+        klog(LOG_ERROR, "nvme", "failed to allocate admin queues");
+        return -1;
+    }
+    nc->admin_sq = (volatile struct nvme_sqe *)nc->admin_sq_phys;
+    nc->admin_cq = (volatile struct nvme_cqe *)nc->admin_cq_phys;
+    nvme_memset((void *)nc->admin_sq_phys, 0, 4096);
+    nvme_memset((void *)nc->admin_cq_phys, 0, 4096);
+    nc->admin_sq_tail  = 0;
+    nc->admin_cq_head  = 0;
+    nc->admin_cq_phase = 1;
+
+    /* Write AQA: ACQS[27:16] = depth-1, ASQS[11:0] = depth-1 */
+    nvme_write32(nc->mmio_base, NVME_REG_AQA,
+                 ((uint32_t)(NVME_ADMIN_QUEUE_DEPTH - 1) << 16) |
+                  (uint32_t)(NVME_ADMIN_QUEUE_DEPTH - 1));
+    /* Write ASQ and ACQ base addresses (64-bit) */
+    nvme_write64(nc->mmio_base, NVME_REG_ASQ, (uint64_t)nc->admin_sq_phys);
+    nvme_write64(nc->mmio_base, NVME_REG_ACQ, (uint64_t)nc->admin_cq_phys);
+
+    klog(LOG_DEBUG, "nvme", "Admin SQ=0x%llx CQ=0x%llx depth=%u",
+         (uint64_t)nc->admin_sq_phys, (uint64_t)nc->admin_cq_phys,
+         (uint64_t)NVME_ADMIN_QUEUE_DEPTH);
+
+    /* ---- Controller enable ---- */
+    cc = NVME_CC_EN
+       | NVME_CC_CSS_NVM
+       | (0 << NVME_CC_MPS_SHIFT)          /* 4 KiB pages */
+       | (0 << NVME_CC_AMS_SHIFT)          /* Round Robin */
+       | (6 << NVME_CC_IOSQES_SHIFT)       /* 64-byte SQ entries (2^6) */
+       | (4 << NVME_CC_IOCQES_SHIFT);      /* 16-byte CQ entries (2^4) */
+    nvme_write32(nc->mmio_base, NVME_REG_CC, cc);
+
+    /* Wait for CSTS.RDY == 1 */
+    elapsed = 0;
+    while (elapsed < timeout_ms) {
+        csts = nvme_read32(nc->mmio_base, NVME_REG_CSTS);
+        if (csts & NVME_CSTS_RDY)
+            break;
+        if (csts & NVME_CSTS_CFS) {
+            klog(LOG_ERROR, "nvme", "controller fatal status during enable");
+            return -1;
+        }
+        sleep_ms(1);
+        elapsed++;
+    }
+    if (elapsed >= timeout_ms) {
+        klog(LOG_ERROR, "nvme", "controller enable timeout (%u ms)",
+             (uint64_t)timeout_ms);
+        return -1;
+    }
+
+    /* Final CFS check */
+    csts = nvme_read32(nc->mmio_base, NVME_REG_CSTS);
+    if (csts & NVME_CSTS_CFS) {
+        klog(LOG_ERROR, "nvme", "controller fatal status after enable");
+        return -1;
+    }
+
+    nc->bus  = bus;
+    nc->dev  = dev;
+    nc->func = func;
+    nc->active = 1;
+    num_controllers++;
+
+    klog(LOG_INFO, "nvme", "Controller enabled (MQES=%u, doorbell stride=%u)",
+         (uint64_t)(nc->mqes + 1), (uint64_t)(4 << nc->dstrd));
+
+    /* ---- Identify Controller + Namespace ---- */
+    nvme_identify(nc, timeout_ms);
+
+    /* ---- I/O Queue creation (only for a usable namespace) ---- */
+    /* USABLE is a stronger claim than ENABLED, and the load-status record
+     * needs the stronger one: a controller that is out of reset but has no
+     * addressable namespace or no I/O queue carries no data, so counting it as
+     * initialized would report a clean boot over a disk nobody can read. */
+    if ((nc->ns_sector_size == 512 || nc->ns_sector_size == 4096) &&
+        nc->ns_lba_count != 0) {
+        /* Usable needs the sector-0 read to have SUCCEEDED (creation returns
+         * 0 only then) and the queue still live afterwards; a zero-capacity
+         * namespace is refused by blkdev registration, so it is not usable
+         * either. */
+        if (nvme_create_io_queues(nc, timeout_ms) == 0 && nc->io_queue_active)
+            s_probe_usable++;
+        else
+            klog(LOG_WARN, "nvme",
+                 "I/O queue unusable or unverified -- controller enabled, no verified I/O");
+    } else {
+        klog(LOG_WARN, "nvme",
+             "no usable namespace (sector size unsupported or zero capacity) -- I/O queue skipped");
+    }
+
+    return 0;
+}
+
+/* ---- Public API ---- */
+
+int nvme_init(void)
+{
+    uint8_t bus, dev, func, hdr;
+
+    num_controllers  = 0;
+    s_probe_attempted = 0u;
+    s_probe_usable    = 0u;
+
+    for (bus = 0; bus < 8; bus++) {
+        for (dev = 0; dev < 32; dev++) {
+            for (func = 0; func < 8; func++) {
+                uint16_t vid = pci_read16(bus, dev, func, PCI_VENDOR_ID);
+                if (vid == 0xFFFF)
+                    continue;
+
+                /* Multi-function check */
+                if (func == 0) {
+                    hdr = pci_read8(bus, dev, func, PCI_HEADER_TYPE);
+                    if (!(hdr & 0x80)) {
+                        /* Single-function -- check func 0 only, then break */
+                        uint8_t cls = pci_read8(bus, dev, 0, PCI_CLASS);
+                        uint8_t sub = pci_read8(bus, dev, 0, PCI_SUBCLASS);
+                        uint8_t pi  = pci_read8(bus, dev, 0, PCI_PROG_IF);
+                        if (cls == NVME_PCI_CLASS &&
+                            sub == NVME_PCI_SUBCLASS &&
+                            pi  == NVME_PCI_PROG_IF) {
+                            s_probe_attempted++;
+                            nvme_init_controller(bus, dev, 0);
+                        }
+                        break;
+                    }
+                }
+
+                {
+                    uint8_t cls = pci_read8(bus, dev, func, PCI_CLASS);
+                    uint8_t sub = pci_read8(bus, dev, func, PCI_SUBCLASS);
+                    uint8_t pi  = pci_read8(bus, dev, func, PCI_PROG_IF);
+                    if (cls == NVME_PCI_CLASS &&
+                        sub == NVME_PCI_SUBCLASS &&
+                        pi  == NVME_PCI_PROG_IF) {
+                        s_probe_attempted++;
+                        nvme_init_controller(bus, dev, func);
+                    }
+                }
+            }
+        }
+    }
+
+    if (s_probe_attempted == 0u)
+        klog(LOG_DEBUG, "nvme", "no controller found");
+    else if (s_probe_usable < s_probe_attempted)
+        klog(LOG_WARN, "nvme",
+             "%u of %u controller(s) usable (%u enabled)",
+             (uint64_t)s_probe_usable, (uint64_t)s_probe_attempted,
+             (uint64_t)num_controllers);
+
+    return num_controllers;
+}
+
+void nvme_probe_counts(uint32_t *attempted, uint32_t *usable)
+{
+    if (attempted)
+        *attempted = s_probe_attempted;
+    if (usable)
+        *usable = s_probe_usable;
+}
+
+int nvme_controller_count(void)
+{
+    return num_controllers;
+}
+
+struct nvme_controller *nvme_get_controller(int idx)
+{
+    if (idx < 0 || idx >= num_controllers)
+        return (struct nvme_controller *)0;
+    return &controllers[idx];
+}
+
+/* ---- Sector I/O ---- */
+
+int nvme_read_sectors(int ctrl_idx, uint64_t lba, uint32_t count, void *buf)
+{
+    struct nvme_controller *nc;
+    struct nvme_sqe cmd;
+    uint32_t timeout_ms, sectors_done, chunk;
+    uintptr_t dma_phys;
+    uint8_t *dma_buf;
+    uint8_t *dst = (uint8_t *)buf;
+
+    nc = nvme_get_controller(ctrl_idx);
+    if (!nc || !nc->io_queue_active ||
+        (nc->ns_sector_size != 512 && nc->ns_sector_size != 4096))
+        return -1;
+
+    /* Bounds-check the LBA range against namespace capacity (overflow-safe):
+     * a filesystem/partition bug or direct caller must not submit I/O past the
+     * namespace or wrap lba+count, which risks wrong-sector overwrite. */
+    if (count == 0)
+        return 0;
+    if (lba >= nc->ns_lba_count || count > nc->ns_lba_count - lba)
+        return -1;
+
+    timeout_ms = (uint32_t)nc->to * 500;
+    if (timeout_ms < 500)
+        timeout_ms = 500;
+
+    /* Allocate a single DMA page (4096 bytes) for transfers */
+    dma_phys = pmm_alloc_contiguous(1);
+    if (!dma_phys)
+        return -1;
+    dma_buf = (uint8_t *)dma_phys;
+
+    sectors_done = 0;
+    while (sectors_done < count) {
+        /* Max sectors per 4 KiB page */
+        chunk = 4096 / nc->ns_sector_size;
+        if (chunk > (count - sectors_done))
+            chunk = count - sectors_done;
+
+        nvme_memset(&cmd, 0, sizeof(cmd));
+        cmd.cdw0 = NVME_IO_READ;
+        cmd.nsid = 1;
+        cmd.prp1 = (uint64_t)dma_phys;
+        /* CDW10-11: Starting LBA (64-bit) */
+        cmd.cdw10 = (uint32_t)(lba + sectors_done);
+        cmd.cdw11 = (uint32_t)((lba + sectors_done) >> 32);
+        /* CDW12: Number of Logical Blocks (0-based) */
+        cmd.cdw12 = chunk - 1;
+
+        if (nvme_submit_io_cmd(nc, &cmd, timeout_ms) != 0) {
+            klog(LOG_ERROR, "nvme", "read failed: LBA=%llu count=%u",
+                 lba + sectors_done, (uint64_t)chunk);
+            pmm_free_frame(dma_phys);
+            return -1;
+        }
+
+        /* Copy from DMA buffer to caller's buffer */
+        memcpy(dst, dma_buf, (uint64_t)chunk * nc->ns_sector_size);
+
+        dst += chunk * nc->ns_sector_size;
+        sectors_done += chunk;
+    }
+
+    pmm_free_frame(dma_phys);
+    return 0;
+}
+
+int nvme_write_sectors(int ctrl_idx, uint64_t lba, uint32_t count,
+                       const void *buf)
+{
+    struct nvme_controller *nc;
+    struct nvme_sqe cmd;
+    uint32_t timeout_ms, sectors_done, chunk;
+    uintptr_t dma_phys;
+    uint8_t *dma_buf;
+    const uint8_t *src = (const uint8_t *)buf;
+
+    nc = nvme_get_controller(ctrl_idx);
+    if (!nc || !nc->io_queue_active ||
+        (nc->ns_sector_size != 512 && nc->ns_sector_size != 4096))
+        return -1;
+
+    /* Bounds-check the LBA range against namespace capacity (overflow-safe):
+     * a filesystem/partition bug or direct caller must not submit I/O past the
+     * namespace or wrap lba+count, which risks wrong-sector overwrite. */
+    if (count == 0)
+        return 0;
+    if (lba >= nc->ns_lba_count || count > nc->ns_lba_count - lba)
+        return -1;
+
+    timeout_ms = (uint32_t)nc->to * 500;
+    if (timeout_ms < 500)
+        timeout_ms = 500;
+
+    /* Allocate a single DMA page for transfers */
+    dma_phys = pmm_alloc_contiguous(1);
+    if (!dma_phys)
+        return -1;
+    dma_buf = (uint8_t *)dma_phys;
+
+    sectors_done = 0;
+    while (sectors_done < count) {
+        chunk = 4096 / nc->ns_sector_size;
+        if (chunk > (count - sectors_done))
+            chunk = count - sectors_done;
+
+        /* Copy from caller's buffer to DMA buffer */
+        memcpy(dma_buf, src, (uint64_t)chunk * nc->ns_sector_size);
+
+        nvme_memset(&cmd, 0, sizeof(cmd));
+        cmd.cdw0 = NVME_IO_WRITE;
+        cmd.nsid = 1;
+        cmd.prp1 = (uint64_t)dma_phys;
+        cmd.cdw10 = (uint32_t)(lba + sectors_done);
+        cmd.cdw11 = (uint32_t)((lba + sectors_done) >> 32);
+        cmd.cdw12 = chunk - 1;
+
+        if (nvme_submit_io_cmd(nc, &cmd, timeout_ms) != 0) {
+            klog(LOG_ERROR, "nvme", "write failed: LBA=%llu count=%u",
+                 lba + sectors_done, (uint64_t)chunk);
+            pmm_free_frame(dma_phys);
+            return -1;
+        }
+
+        src += chunk * nc->ns_sector_size;
+        sectors_done += chunk;
+    }
+
+    pmm_free_frame(dma_phys);
+    return 0;
+}
+
+/* ---- Cache flush + controller shutdown ---- */
+
+/* NVM Flush (opcode 0x00): commit the controller's volatile write cache to
+ * media. Registered as the blkdev `flush` callback so blkdev_sync() (the
+ * FAT32 / VFS / NtFlushBuffersFile durability boundary) is honest. */
+int nvme_flush(int ctrl_idx)
+{
+    struct nvme_controller *nc;
+    struct nvme_sqe cmd;
+    uint32_t timeout_ms;
+
+    nc = nvme_get_controller(ctrl_idx);
+    if (!nc || !nc->io_queue_active)
+        return -1;
+
+    timeout_ms = (uint32_t)nc->to * 500;
+    if (timeout_ms < 500)
+        timeout_ms = 500;
+
+    nvme_memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_IO_FLUSH;    /* opcode 0x00 */
+    cmd.nsid = 1;
+    /* nvme_submit_io_cmd serializes on nc->io_lock against read/write. */
+    return nvme_submit_io_cmd(nc, &cmd, timeout_ms);
+}
+
+/* Issue the NVMe normal-shutdown handshake: set CC.SHN=01b and poll CSTS.SHST
+ * for completion (10b), bounded by the CAP.TO timeout, with a CFS abort check.
+ * Controller-register only -- does not touch the I/O queue, so no io_lock.
+ * Must run with interrupts enabled (the poll sleeps via hlt). */
+int nvme_shutdown(int ctrl_idx)
+{
+    struct nvme_controller *nc;
+    uint32_t cc, csts, timeout_ms, elapsed;
+
+    nc = nvme_get_controller(ctrl_idx);
+    if (!nc || !nc->active)
+        return -1;
+
+    timeout_ms = (uint32_t)nc->to * 500;
+    if (timeout_ms < 500)
+        timeout_ms = 500;
+
+    /* Close admission so no new read/write/flush starts, then drain any
+     * in-flight command by taking the I/O gate (bounded) -- CC.SHN must not
+     * race a command that is still submitting or polling the shared queue. */
+    atomic_set(&nc->shutting_down, 1);
+    {
+        uint32_t acq = 0;
+        int held = 0;
+        for (;;) {
+            if (atomic_cmpxchg(&nc->io_busy, 0, 1) == 0) { held = 1; break; }
+            if (acq++ >= timeout_ms) break;
+            sleep_ms(1);
+        }
+        /* If the gate never drained, an in-flight command still owns it. Do NOT
+         * write CC.SHN (it would race the still-polling submitter) and do NOT
+         * clear io_busy (it belongs to that command). Fail closed -- the caller
+         * logs an unclean shutdown. */
+        if (!held) {
+            klog(LOG_WARN, "nvme", "shutdown: I/O did not drain -- skipping CC.SHN");
+            return -1;
+        }
+    }
+    nc->io_queue_active = 0;   /* queue is no longer usable; we hold io_busy */
+
+    /* CC.SHN normal shutdown: the controller flushes its volatile write cache
+     * to media before reporting SHST=complete. */
+    cc = nvme_read32(nc->mmio_base, NVME_REG_CC);
+    cc = (cc & ~NVME_CC_SHN_MASK) | NVME_CC_SHN_NORMAL;
+    nvme_write32(nc->mmio_base, NVME_REG_CC, cc);
+
+    elapsed = 0;
+    while (elapsed < timeout_ms) {
+        csts = nvme_read32(nc->mmio_base, NVME_REG_CSTS);
+        if (csts & NVME_CSTS_CFS) {
+            klog(LOG_ERROR, "nvme", "controller fatal status during shutdown");
+            atomic_set(&nc->io_busy, 0);
+            return -1;
+        }
+        if ((csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_COMPLETE) {
+            klog(LOG_INFO, "nvme", "shutdown complete");
+            atomic_set(&nc->io_busy, 0);
+            return 0;
+        }
+        sleep_ms(1);
+        elapsed++;
+    }
+    klog(LOG_WARN, "nvme", "shutdown notification timeout");
+    atomic_set(&nc->io_busy, 0);
+    return -1;
+}
+
+/* Shut down every active controller. Called from the block-layer shutdown
+ * path on poweroff/reboot, BEFORE interrupts are disabled. */
+void nvme_shutdown_all(void)
+{
+    int i;
+    for (i = 0; i < num_controllers; i++) {
+        if (controllers[i].active)
+            (void)nvme_shutdown(i);
+    }
+}

@@ -1,0 +1,1715 @@
+---
+schema_version: 1
+id: automation-hardening
+domain: 00-infrastructure
+status: active
+title: "TODO-08 -- Automation Hardening (Skill / Hook / MCP / Codex Integration)"
+---
+
+# TODO-08 -- Automation Hardening (Skill / Hook / MCP / Codex Integration)
+
+> **Validated:** 2026-06-21 | backfill -- todo-graph structural validate clean; all sections shipped + reviewed
+> **Gap-audited:** 2026-06-21 | backfill -- triage DONE (sections shipped + quality-reviewed / deferred); Stages 1-2 predate this marker
+
+> **Goal:** Take the existing Claude Code + Codex + LSP-MCP + todo-graph automation surface from "works most of the time" to "works on every single section, every single review, every single commit". Wire the two MCP servers into Codex (Claude Code already has them via `.mcp.json`); enforce the model-and-effort defaults policy across both sides; convert today's advisory hook reminders into hard gates where critical steps keep getting skipped (Codex review, `receiving-code-review`, `review-todo-section` step 8 quality dispatch); and remove the cross-tool drift between `.claude/`, `~/.codex/`, and the two installed plugins (superpowers 5.0.7, openai-codex 1.0.2).
+
+> [!IMPORTANT]
+> **Current state:**
+> - **Claude Code MCP wiring** at [`.mcp.json`](../../.mcp.json) loads two servers: `todo-graph` (read-only graph queries over [`scripts/todo-graph/mcp_server.py`](../../scripts/todo-graph/mcp_server.py), TODO-06 §8) and `lsp-bridge` (read-only LSP-over-MCP via [`scripts/lsp-mcp/bridge.py`](../../scripts/lsp-mcp/bridge.py), TODO-07).
+> - **Codex CLI MCP wiring** is empty: [`~/.codex/config.toml`](file:///home/derickpayne/.codex/config.toml) has only `model = "gpt-5.5"`, `model_reasoning_effort = "medium"`, the trust block, and the gpt-5.3-codex -> gpt-5.4 migration alias. No `[mcp_servers.*]` blocks. Codex CLI 0.125.0+ supports `codex mcp add` (per `codex --help`), so the wiring is available; just not used.
+> - **Plugins installed** (per [`installed_plugins.json`](file:///home/derickpayne/.claude/plugins/installed_plugins.json)): `superpowers@claude-plugins-official` 5.0.7 (user scope, 12 skills incl. `receiving-code-review`, `requesting-code-review`, `verification-before-completion`, `writing-plans`, `using-git-worktrees`); `codex@openai-codex` 1.0.2 (user scope, skills `codex-cli-runtime` / `codex-result-handling` / `gpt-5-4-prompting`, commands `/codex:review` `/codex:adversarial-review` `/codex:setup` `/codex:status` `/codex:result` `/codex:cancel` `/codex:rescue`, agent `codex-rescue`, hooks shipped). Both plugin caches under [`~/.claude/plugins/cache/`](file:///home/derickpayne/.claude/plugins/cache/).
+> - **Hook system** at [`.claude/settings.json`](../../.claude/settings.json) + [`.claude/hooks/`](../../.claude/hooks/) is mostly reminder-based (`systemMessage` print) with 3 hard blocks (Unicode dashes exit 2, bare section refs at commit, accepted-XREF block). The big-impact reminders (`section_review_required.py`, `design_review_required.py`, the section-commit gate, the receiving-code-review nudge after Codex finishes) all rely on the agent reading the hook output and acting; user feedback memory `feedback_skill_invocation_drift.md` and `feedback_never_skip_review.md` confirm this is the single biggest reliability gap.
+> - **codex-companion.mjs** dispatch from Claude into Codex CLI is the only way the Codex plugin runs reviews; the companion accepts `--model` and `--effort` flags but the user's policy is "leave both unset, Codex CLI uses the default in `~/.codex/config.toml`". The 9 in-repo `codex-*` skills under [`.claude/skills/`](../../.claude/skills/) all dispatch to `codex-companion.mjs` correctly, but several pre-1.0.2 docs/skills still hard-code the absolute marketplaces path; one such absolute-path invocation is currently in `codex-adversarial-review-section/SKILL.md` step 3.
+> - **Receiving-code-review** is wired into the 9 codex-* skills as prose ("apply receiving-code-review discipline") and as a PostToolUse `systemMessage` hook on `Bash(scripts/copilot-review.sh:*)` and `Bash(codex-companion.mjs adversarial-review:*)`. There is no hook that fires after a `Skill(codex-adversarial-review-section)` completes, no audit that the receiving-code-review skill was actually invoked between the Codex output and the next code edit, and no marker file or recent-conversation check.
+> - **Skipped-step incidents** in user feedback memory: 2026-04-24 (review-todo-section step 8 = adversarial conflated with quality dispatches; user fed back four-dispatch policy), 2026-04-07 (3 incidents of tests calling forbidden boot fns -> hook added), repeated drift on `kernel-code-quality` not being walked. The pattern: hooks remind, agent acknowledges, agent skips. Hard blocks on the *next tool call after a trigger* are the only reliable fix.
+> - **No Codex-side MCP** = Codex CLI cannot query the TODO graph or hover/definition-lookup symbols when running adversarial review or rescue tasks. Every Codex review reads files cold, missing the dependency context Claude has via the MCP servers.
+
+## Inputs
+
+- [`.claude/settings.json`](../../.claude/settings.json) -- canonical hook + permissions config; this TODO edits `hooks.PreToolUse` / `hooks.PostToolUse` blocks
+- [`.claude/hooks/`](../../.claude/hooks/) -- Python hook scripts: `section_review_required.py`, `design_review_required.py`, `accepted_xref_block.py`, `bare_section_refs.py`, `numeric_todo_shorthand.py`, `notes_bloat_check.py`, `scope_gap_marker.py`, `scope_gap_dedup_check.py`, `test_pending_reminder.py`, `test_message_uniqueness.py`, `test_side_effect_ban.py`, `todo_format_check.py`, `accepted_xref_warn.py` -- §3 + §4 + §5 + §10 + §11 + §12 add ~12 new ones (audit + manifest in §7)
+- [`.mcp.json`](../../.mcp.json) -- Claude Code MCP manifest; §1 mirrors this into Codex side
+- [`~/.codex/config.toml`](file:///home/derickpayne/.codex/config.toml) -- Codex CLI config; §1 adds `[mcp_servers.todo-graph]` + `[mcp_servers.lsp-bridge]` blocks; §2 documents the model/effort policy
+- [`scripts/todo-graph/mcp_server.py`](../../scripts/todo-graph/mcp_server.py) -- existing FastMCP server (TODO-06 §8); §1 confirms it works under Codex's MCP client
+- [`scripts/lsp-mcp/bridge.py`](../../scripts/lsp-mcp/bridge.py) -- existing FastMCP server (TODO-07); §1 confirms cross-client and §6 wires usage discipline
+- [`scripts/codex-companion.mjs`](../../scripts/codex-companion.mjs) -- absent in repo; canonical copy lives in plugin at `~/.claude/plugins/cache/openai-codex/codex/1.0.2/scripts/codex-companion.mjs`. §2 verifies the absolute-path versus `${CLAUDE_PLUGIN_ROOT}` invocation across all 9 codex-* skills
+- [`scripts/lint.sh`](../../scripts/lint.sh) -- existing pre-commit lint (Check 1-5); §12 adds Check 6 + Check 7 (tautological-test + stub-behind-stamp; the originally-planned Check 8 phantom-include was attempted and dropped, see §12 history)
+- [`build/todo-cache.json`](../../build/todo-cache.json) -- TODO-06 §2 derived cache; §12 stub-behind-stamp consumer reads the stamped-item -> file:symbol map from this artifact
+- [`.claude/skills/`](../../.claude/skills/) -- 28 skills (11 `codex-*`, plus implement / verify / review / quality / create / validate); §5 audits invocation discipline
+- [`~/.claude/plugins/cache/claude-plugins-official/superpowers/5.0.7/skills/`](file:///home/derickpayne/.claude/plugins/cache/claude-plugins-official/superpowers/5.0.7/skills/) -- 12 superpowers skills; §7 audits which are actually useful in Impossible OS context and which to suppress
+- [`~/.claude/plugins/cache/openai-codex/codex/1.0.2/`](file:///home/derickpayne/.claude/plugins/cache/openai-codex/codex/1.0.2/) -- Codex plugin: `commands/adversarial-review.md`, `agents/codex-rescue.md`, `skills/codex-cli-runtime`, `hooks/hooks.json`
+- [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) -- doctrine doc; §8 updates the External-Reviewer Contract + Hook Routing Matrix sections
+- [`AGENTS.md`](../../AGENTS.md) -- pointer file for non-Claude tools; §8 verifies the 3-bullet authority block stays exact-match
+- [`CLAUDE.md`](../../CLAUDE.md) -- master doctrine; §2 adds a one-paragraph "Codex invocation policy" section under Model Roles
+- -> XREF: [`00-infrastructure/TODO-02 §3 Hook Routing Matrix`](TODO-02-ai-development-system.md) -- §3 + §4 add new hook rows, this TODO is the implementation owner; TODO-02 is the documentation owner
+- -> XREF: [`00-infrastructure/TODO-02 §4 External-Reviewer Contract`](TODO-02-ai-development-system.md) -- §5 enforces the contract via tool-call gating; TODO-02 owns the doctrine paragraph
+- -> XREF: [`00-infrastructure/TODO-06 §8 todo-graph MCP server`](TODO-06-todo-metadata-layer.md#8-mcp-server-ai-agent-transport-over-the-cache) -- consumer; §1 + §6 specify when Claude AND Codex must call which MCP method
+- -> XREF: [`00-infrastructure/TODO-07 §1, §7, §8`](TODO-07-lsp-mcp-bridge.md) -- consumer; §1 wires the bridge into Codex; §6 wires usage discipline into both sides
+
+## Outcome
+
+- **Codex CLI loads the same two MCP servers as Claude Code.** `~/.codex/config.toml` has `[mcp_servers.todo-graph]` and `[mcp_servers.lsp-bridge]` blocks pointing at the in-repo Python entry points; a sentinel test (`scripts/test-tooling.sh` adds a sub-test) confirms `codex mcp list` shows both servers and a smoke task can reach them. Drift between Claude `.mcp.json` and Codex MCP config is detected by a new validator in `scripts/test-tooling.sh`.
+- **Codex invocation policy is documented and enforced.** A new "Codex Invocation Policy" paragraph in CLAUDE.md (under Model Roles) states: when invoking ANY Codex command from Claude (`/codex:adversarial-review`, `/codex:review`, `/codex:rescue`, direct `codex-companion.mjs task` calls), do NOT pass `--model` or `--effort`; let Codex CLI pick its configured defaults from `~/.codex/config.toml`. A new hook (`.claude/hooks/codex_model_flag_block.py`) BLOCKS Bash invocations that include `--model` or `--effort` against `codex-companion.mjs` or `codex` binary unless the user explicitly added an opt-out env var. The 9 `codex-*` skills under `.claude/skills/` and the Codex plugin docs are checked for any leftover hard-coded model/effort hints.
+- **`receiving-code-review` is enforced as a hard gate.** After ANY tool invocation that returns Codex/Copilot review output (Skill calls to `codex-adversarial-review-section`, `codex-review-todo`, `codex-fix-review`, `codex-design-review`, `codex-test-coverage`, `codex-impact-analysis`, `codex-consistency-audit`, `codex-perf-review`, `codex-quality-review-section`, OR Bash calls to `codex-companion.mjs adversarial-review` / `scripts/copilot-review.sh` / `/codex:adversarial-review`), the next Edit / Write / MultiEdit on a code file is BLOCKED until the conversation contains an explicit `Skill(superpowers:receiving-code-review, ...)` invocation OR an opt-out marker (the agent claimed the review found zero findings, with code-evidence quote required by the hook). Implemented via a state file at `.claude/state/last-codex-review.json` and a new `.claude/hooks/receiving_review_required.py`.
+- **Section-commit gate hardens to a BLOCK, not just a reminder.** The current `git commit` PreToolUse hook prints a long advisory listing steps 13-18; it does not block. New behavior: when the staged diff contains both source code (`.c`/`.h`/`.asm`/`.S`) AND a TODO file with an Implementation Order `[x]` flip in the same diff, the hook EXITS 2 (block) unless the recent conversation contains evidence of (a) a `Skill(codex-adversarial-review-section, ...)` invocation, (b) a `Skill(superpowers:receiving-code-review, ...)` invocation, AND (c) a passing build (`tail -1 build/build.log` shows `=== BUILD OK ===`). Same `SKIP_REVIEW_HOOK=1` opt-out as today, plus a new `SKIP_REVIEW_HOOK_REASON="<text>"` requirement to leave a paper trail.
+- **`review-todo-section` step 8 multi-dispatch policy is mechanically enforced.** A post-step-8 marker file (`.claude/state/last-review-stamps.json`) records each of the 3 required Codex dispatches (adversarial / consistency / perf); the section-commit hook checks all 3 are present-and-recent (within the last 30 minutes for the same TODO file path). The legacy fourth `dead-code` dispatch was retired 2026-04-25 (rationale in `review-todo-section/SKILL.md` retirement note). The user's feedback memory `feedback_codex_review_four_dispatches.md` keeps its filename for stable referencing while the body documents the current three-dispatch canonical set.
+- **Hook system audit + dedupe.** All 14 active hooks under `.claude/hooks/` + the inline Python in `settings.json` get a 1-line description and a coverage note; hooks doing the same job collapse to one. New `scripts/audit-hooks.sh` lists every hook, every matcher, and the trigger event; `bash scripts/test-tooling.sh` adds a sub-test that asserts the hook count and coverage matches an expected manifest at `.claude/hooks/MANIFEST.md`.
+- **Skill catalog audit + suppression policy.** The 12 superpowers skills are split into "actively used" (`receiving-code-review`, `verification-before-completion`, `writing-plans`, `dispatching-parallel-agents`, `subagent-driven-development`, `using-git-worktrees`, `executing-plans`, `systematic-debugging`, `test-driven-development`, `requesting-code-review`, `finishing-a-development-branch`, `using-superpowers`, `brainstorming`, `writing-skills`) versus "noise / suppress" (none currently identified, but the manifest sets the policy). Add a `superpowers-suppression.md` doc identifying any plugin-shipped behavior that conflicts with Impossible OS doctrine (e.g. AI-attribution trailers, autonomous-agent assumptions). One row in CLAUDE.md "Mandatory Skill Triggers" table per actively-used superpowers skill, with the same hard-gate enforcement.
+- **MCP usage discipline -- documented, not enforced.** A new `docs/infrastructure/mcp-usage.md` describes when to call which MCP tool: prefer `lsp-bridge` `definition` / `references` over `grep` for symbol queries; use `todo-graph` `ready` / `blocking` / `backlinks` before manually walking TODO XREFs; the `code` / `code-by` queries connect a source file to its owning TODO. CLAUDE.md "Using your tools" section gets a 3-bullet pointer at the doc. No hooks force this; the change is doctrine-level so future skill iterations adopt the pattern.
+- **Cross-tool drift detection.** New `scripts/audit-ai-system.sh` runs eight checks: (1) `.mcp.json` server set matches `~/.codex/config.toml` `[mcp_servers.*]` set; (2) every `Skill(codex-...)` invocation in `.claude/skills/` uses `${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs` not the absolute marketplaces path; (3) every `codex-*` skill carries the receiving-code-review reminder paragraph; (4) every `.claude/hooks/*.py` policy-block path uses `sys.exit(2)` (or declares `permissionDecision: "deny"` JSON output); (5) every plugin under `~/.claude/plugins/installed_plugins.json` has its `hooks/hooks.json` enumerated in `MANIFEST.md`; (6) state-file directory layout matches the documented shape; (7) Codex `~/.codex/config.toml` `model` + `model_reasoning_effort` match the policy file; (8) `tool-history.jsonl` is being written and is fresh. Sub-test added to `scripts/test-tooling.sh`.
+- **Skill step-state telemetry.** New `.claude/state/skill-progress.json` records each step of every multi-step skill (`implement-todo-section`, `review-todo-section`, `verify-todo-section`, `complete-todo-file`, `quality-review-section`) on the actual tool call that proves the step ran -- never on agent self-claim. New PreToolUse hook BLOCKs commit if step evidence is non-contiguous or terminal steps are missing. Closes the "claimed step 18, actually did step 13" failure mode named in `feedback_skill_invocation_drift` and `feedback_codex_review_four_dispatches`.
+- **Hook event surface expansion.** Five currently-unused Claude Code hook events get wired: `SessionStart` (state-file rebuild + uncommitted-TODO context injection), `UserPromptSubmit` (doctrine reminder on "skip review" / "just commit" prompts), `Stop` (acknowledged-but-skipped detector + verification-before-completion check), `SubagentStop` (subagent-budget audit), `PreCompact` (mid-pipeline state flush so compaction doesn't lose evidence). Plus a `tool-history.jsonl` writer feeding §10 step observation and §11 conversation scanning.
+- **AI-slop content lints.** Two live checks in `scripts/lint.sh`: (1) tautological-test detection (`TEST_ASSERT_EQ(X, X, ...)` and `TEST_ASSERT_EQ(SYM, LITERAL_VALUE_OF_SYM, ...)`); (2) stub-behind-stamp detection (cross-checks every `[x]` checklist item naming a function against the function's body LOC). The originally-planned phantom-include check via lsp-bridge was attempted and dropped (clangd false-positive rate too high on freestanding kernel; see §12 history). Each opt-out via env var with paper-trail logging.
+- **Documentation sync** -- CLAUDE.md gets the Codex Invocation Policy paragraph and a 3-bullet "MCP usage" pointer; `docs/infrastructure/ai-system.md` Hook Routing Matrix gets the new hooks; `docs/infrastructure/mcp-usage.md` is new; the Skills table in CLAUDE.md absorbs the four superpowers skills as "Mandatory Skill Triggers" rows.
+
+## Implementation Order
+
+| ⭐  | Order | Section | Deliverable                                                                                      | Depends On                 | Status |
+| --- | :---: | :-----: | ------------------------------------------------------------------------------------------------ | -------------------------- | :----: |
+| ⭐  |   1   |   §1    | Wire `todo-graph` + `lsp-bridge` MCP into Codex CLI; cross-config drift validator                | --                         |  [/]   |
+| ⭐  |   2   |   §2    | Codex invocation policy: no `--model` / `--effort` from Claude, hook block                       | §1                         |  [x]   |
+| ⭐  |   3   |   §3    | `receiving-code-review` hard gate: state file + post-Codex hook block                            | §2                         |  [/]   |
+| ⭐  |   4   |   §4    | Section-commit gate hardens to BLOCK with build + Codex + receiving evidence                     | §3                         |  [x]   |
+| ⭐  |   5   |   §5    | `review-todo-section` four-dispatch enforcement (state file + commit-gate check)                 | §4                         |  [/]   |
+| 💎  |   6   |   §6    | MCP usage discipline doc; CLAUDE.md pointer; skill audits update prose                           | §1                         |  [x]   |
+| ⭐  |   7   |   §10   | Skill step-state telemetry + non-contiguous-step block                                           | §3, §11                    |  [x]   |
+| ⭐  |   8   |   §11   | Hook event surface expansion                                                                     | §3, §4                     |  [x]   |
+| ⭐  |   9   |   §12   | AI-slop content lints (tautological / stub-behind-stamp; phantom-include attempted then dropped) | --                         |  [x]   |
+| 💎  |  10   |   §7    | Hook system audit + dedupe; `MANIFEST.md`; `scripts/audit-hooks.sh`; exit-code gate              | §3, §4, §5, §10, §11, §12  |  [x]   |
+| 💎  |  11   |   §8    | Superpowers skill catalog audit; suppression policy; CLAUDE.md trigger rows                      | §3                         |  [x]   |
+| ⭐  |  12   |   §9    | Cross-tool drift detection: `scripts/audit-ai-system.sh` (7 checks)                              | §1, §2, §7, §11            |  [x]   |
+| 💎  |  13   |   §13   | Documentation sync: CLAUDE.md / ai-system.md / mcp-usage.md; reciprocal XREF sweep               | §1-§12                     |  [x]   |
+| 💎  |  14   |   §14   | Remove Copilot CLI reviewer wholesale (Codex is sole external reviewer)                          | §3 (initial sweep started) |  [x]   |
+| 💎  |  15   |   §15   | Design-review hook scope fix: review-kind recognition + commit-clears-gate                       | §7                         |  [x]   |
+| ⭐  |  16   |   §16   | Compaction-resilient skill-step state                                                            | §10, §11                   |  [x]   |
+| ⭐  |  17   |   §17   | Review-pipeline pre-Codex enforcement: Phase-1 evidence-map + re-adversarial trigger gate        | §10, §11, §4               |  [x]   |
+| ⭐  |  18   |   §18   | Stamp-region + OS Comparison completeness lints (lint.sh Check 10 + Check 11)                    | §12                        |  [x]   |
+| 💎  |  19   |   §19   | Codex prompt-scope helper: re-review wrapper that embeds committed-file content                  | §2                         |  [x]   |
+| ⭐  |  20   |   §20   | Implement-pipeline section-commit gates (steps 5/8/13/16 -- quality / tests / adv / smoke)       | §3, §4, §10, §11           |  [x]   |
+| ⭐  |  21   |   §21   | Implement-todo-section partial-enforcement heuristics (steps 1/2/3/9/15/17/18 -- WARN-first)     | §10, §11, §20              |  [x]   |
+| ⭐  |  22   |   §22   | Review-pipeline right-sizing doctrine                                                            | §3, §10, §17               |  [x]   |
+| ⭐  |  23   |   §23   | Unify SKIP_REVIEW_HOOK opt-out scanner across PreToolUse gates                                   | §3, §4, §17, §20           |  [x]   |
+| ⭐  |  24   |   §24   | last-codex-review.json state-write reliability -- close §22 #4 properly                          | §3, §22                    |  [x]   |
+| ⭐  |  25   |   §25   | Observer step-13/13.5 regex coverage for all Codex dispatch shapes                               | §10, §17, §22              |  [x]   |
+| 💎  |  26   |   §26   | Formalize or retire `scripts/commit-with-skip.sh` opt-out bridge wrapper                         | §23                        |  [x]   |
+| ⭐  |  27   |   §27   | Phase 1 evidence-gate threshold tuning via miss-log telemetry                                    | §17, §21                   |  [x]   |
+| 💎  |  28   |   §28   | Codex prompt argument escaping doctrine (cosmetic shell-expansion errors)                        | §19                        |  [x]   |
+| ⭐  |  29   |   §29   | Standardize PreToolUse prefix-allowlist across gates (partner to §23 env-scanner)                | §3, §4, §17, §20, §23      |  [x]   |
+| ⭐  |  30   |   §30   | Shell-aware Codex dispatch segmentation in `_review_kind` (close §25 round-7 deferred)           | §25                        |  [x]   |
+| 💎  |  31   |   §31   | Post-commit hook concurrency: serialize build/smoke via flock (end stomp-stamp races)            | --                         |  [x]   |
+| ⭐  |  32   |   §32   | Grammar-accurate shell segmentation for the gate exemptions (retire the hand-rolled walk)        | §30                        |  [x]   |
+| 💎  |  33   |   §33   | Section-commit gate reads an untokenizable commit line as a commit                               | §4                         |  [x]   |
+| 💎  |  34   |   §34   | Section-commit gate test wiring that kernel sources can satisfy                                  | §4                         |  [x]   |
+| 💎  |  35   |   §35   | Cross-section review of a closed TODO file                                                       | §5                         |  [/]   |
+| 💎  |  36   |   §36   | Second-boot leg in the smoke matrix                                                              | --                         |  [x]   |
+| 💎  |  37   |   §37   | Syscall argument counts in the ABI fingerprint                                                   | --                         |  [x]   |
+| 💎  |  38   |   §38   | Release-flavor build at the section boundary                                                     | --                         |  [x]   |
+| 💎  |  39   |   §39   | Re-judge the closed parks under the never-park rule                                              | --                         |  [x]   |
+| 💎  |  40   |   §40   | Pytest-style control-plane tests run in the suite                                                | --                         |  [x]   |
+| 💎  |  41   |   §41   | CI jobs run in the pinned image                                                                  | --                         |  [x]   |
+| 💎  |  42   |   §42   | The graph jobs run in a small pinned image                                                       | §41                        |  [ ]   |
+| 💎  |  43   |   §43   | The control-plane commit gate tests the staged commit                                            | none                       |  [x]   |
+| ⭐  |  44   |   §44   | A second reviewer reads kernel, boot, security and ABI sections                                  | none                       |  [x]   |
+| ⭐  |  45   |   §45   | A reviewer outage leaves a review owed and the run continues                                     | §44                        |  [x]   |
+| ⭐  |  46   |   §46   | The second reviewer's switched-off machinery is removed                                          | §45                        |  [x]   |
+| ⭐  |  47   |   §47   | The Bash safety guards read commands with a shell grammar                                        | §32                        |  [ ]   |
+
+> 💎 = parity work -- standard developer-tooling hygiene (audit scripts, drift detection, doc sync). Linux kernel ships `MAINTAINERS` + `get_maintainer.pl`; Windows has the engineering-systems-internal equivalent. We need it because skill / hook / MCP wiring drifts silently.
+> ⭐ = competitive edge -- enforcing reviewer-contract discipline at the Bash / Edit tool boundary, hard-gating skill-pipeline steps, cross-wiring two AI assistants (Claude Code + Codex CLI) into the same MCP server set, and observed-not-claimed step-state telemetry are novel ground. Neither Win11 nor Linux ships AI-tooling automation at this layer; among AI dev tools (Cursor, Aider, Continue, Copilot Workspace) only `nesaminua/claude-code-lsp-enforcement-kit` ships a comparable state-binding pattern as of early 2026.
+> **Order vs section number:** §1 unblocks every other section (Codex needs MCP first; the model-flag policy + receiving-review gate + section-commit gate all assume Codex is reachable from Claude with shared context). §2 must precede §3 because the hook in §2 gates `codex-companion.mjs` invocations; the §3 hook fires on the OUTPUT of those invocations. §4 wraps §3 into a commit gate. §5 extends §4 with the four-dispatch counting. §11 (hook events) ships before §10 (step telemetry) because §10 reads the `tool-history.jsonl` writer that §11 installs. §12 (AI-slop lints) ships in parallel with §10/§11 since it has no hard dependency on either. §6 / §8 are independent audits that can interleave. §7 (hook audit) ships AFTER §10/§11/§12 so it can manifest the new hooks they add. §9 (cross-tool drift) ships after §7 (which produces the manifest §9 reads). §13 closes doctrine in lockstep with everything.
+
+---
+
+## 1. Codex MCP Wiring + Cross-Config Drift Validator
+
+Wire the two MCP servers Claude Code already uses (`todo-graph` + `lsp-bridge`) into Codex CLI's MCP client so Codex review / rescue / task runs have the same dependency-graph + LSP-grade code intelligence Claude has. Today every Codex review starts cold: it has the file paths in the prompt but no way to ask "what TODO owns this section?" or "where else is this symbol used?". Wiring the MCP servers into both sides closes that asymmetry. Codex CLI 0.125.0+ supports `codex mcp add` per `codex --help`; this section uses that surface.
+
+- [x] `[mcp_servers.todo-graph]` block lives in repo-owned fixture [`docs/infrastructure/codex-mcp.config.toml`](../../docs/infrastructure/codex-mcp.config.toml) and is installed into `~/.codex/config.toml` by [`scripts/codex-mcp-install.sh`](../../scripts/codex-mcp-install.sh): `command = "python3"`, `args = ["scripts/todo-graph/mcp_server.py"]`, `cwd = "/home/derickpayne/impossible-os"`. Design review High caught the original "edit config.toml directly" plan as non-reproducible (no source of truth for fresh dev envs / Codex reinstalls); fixture + idempotent installer + drift validator triplet is the adopted shape.
+- [x] `[mcp_servers.lsp-bridge]` block in the same fixture, `args = ["scripts/lsp-mcp/bridge.py", "--warm-start=c,py", "--warm-start-mode=background"]` so Codex spawns the bridge with the same MCP-launcher-safe warm-start pattern Claude uses (Background Warm-Start Mode contract). Verified via `codex mcp get lsp-bridge` -- args round-trip exactly.
+- [x] `startup_timeout_sec = 10` and `tool_timeout_sec = 60` in BOTH blocks. Confirmed Codex CLI 0.128 round-trips both keys via `codex mcp get` (re-verified 2026-05-01).
+- [x] `required = true` in both blocks. Codex CLI 0.128 silently accepts the key (parser does not reject); whether the runtime enforces it is forward-compat. Cost of including is zero; benefit if a future Codex release hardens the field is explicit fail-loud.
+- [x] `enabled_tools = ["definition", "references", "hover", "workspace_symbol", "document_symbol", "diagnostics"]` on the `lsp-bridge` block. The bridge ships 15 tools (6 core + 8 extended + 1 `_health` meta per [TODO-07 §11](./TODO-07-lsp-mcp-bridge.md#11-extended-lsp-tools-completion-signature-help-type-definition-implementation-declaration-call-hierarchy-code-action)); the allowlist clamps Codex to the same minimal read-only surface even if the bridge accidentally exposes a write-capable tool in a future revision.
+- [x] `codex mcp list` shows both servers `enabled` with the expected command/args; `codex mcp get <name>` round-trips every key. Captured during install verification.
+- [/] Codex MCP exec / app-server smoke -- BLOCKED on upstream bug [openai/codex#16685](https://github.com/openai/codex/issues/16685): every MCP tool call under any **non-interactive** Codex path returns `"user cancelled MCP tool call"` because Codex hits an MCP elicitation / `RequestUserInput` path that has no interactive surface to satisfy. Affects: `codex exec` (CLI), `codex app-server` (which `codex-companion.mjs` and our `/codex-*` review skills use), and presumably any IDE plugin that drives Codex non-interactively. Reproduced on 0.118.0 through 0.128.0 (latest stable as of 2026-05-01; live-tested with `todo-graph/stats` + `lsp-bridge/workspace_symbol`, both returned the same cancellation). Live-verified against `codex-companion.mjs adversarial-review` -- both `[codex] Tool todo-graph/ready failed.` and `[codex] Tool lsp-bridge/hover failed.` fired. The MCP subprocess is never spawned (verified via spawn-shim probe). Codex log line that confirms the diagnosis: `request_user_input is not supported in exec mode`. Last-known-good Codex version is **0.116.0** (gpt-5.4) -- spawn-shim probe on 0.116 showed both `mcp: todo-graph ready` + `mcp: lsp-bridge ready`; tool call returned real data. 0.116 hard-rejects `gpt-5.5` ("requires a newer version of Codex"), so pinning to 0.116 means downgrading the model. Upstream fix [PR #16632](https://github.com/openai/codex/pull/16632) is **OPEN, blocked on security team review** as of 2026-04-26. Stance: stay on latest stable (0.128.0) + gpt-5.5; reviews keep completing via shell-tool fallback (`rg` / `sed` / `cat` / `git diff`); MCP is registered-but-unused for our `/codex-*` skills until upstream ships. When PR #16632 merges + a new release ships: `npm install -g @openai/codex@<new>` is the single command; no code change anticipated on our side; the existing fixture + installer + drift-validator handle re-installs; flip this item to `[x]` after one successful `mcp_drift` check + one MCP probe.
+- [x] `mcp_drift` sub-test added to [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh): two-step semantic check -- (a) cross-side parity diffs server names between `.mcp.json` and the repo fixture, (b) Codex-side parity delegates to `scripts/codex-mcp-install.sh --check` which compares user's `~/.codex/config.toml` against the fixture key-for-key. Skip-with-PASS on fresh dev env (no `~/.codex/config.toml` yet); FAIL with actionable hint when drift is real. Design review High caught name-only-diff as insufficient -- semantic compare covers wrong-command / wrong-cwd / wrong-args / missing-required / wrong-enabled_tools failure modes too.
+- [x] Documented the wiring in `docs/infrastructure/ai-system.md` ["MCP server boundary" -> "Cross-tool MCP server set" subsection](../../docs/infrastructure/ai-system.md#mcp-server-boundary): names both clients, both servers, the fixture, the installer, the drift validator entry point, the upstream `codex exec` MCP bug ([openai/codex#16685](https://github.com/openai/codex/issues/16685) / [PR #16632](https://github.com/openai/codex/pull/16632)), and this TODO as the canonical source.
+- [x] Commit: `"codex/mcp: wire todo-graph + lsp-bridge into Codex CLI config; add cross-config drift validator"`
+
+**Test checkpoint:** `codex mcp list` shows `todo-graph` + `lsp-bridge`. `codex exec "..."` smoke prompts return real data from both servers. `bash scripts/test-tooling.sh` shows the new `mcp_drift` sub-test PASS. Manually deleting one of the four config blocks and re-running the validator triggers the sub-test FAIL with the expected actionable message. Test on: Linux WSL2 dev host (Codex CLI 0.125.0+).
+
+Verified locally: `codex mcp list` shows both servers `enabled`; `bash scripts/codex-mcp-install.sh --check` reports `OK: 2 servers in sync`; `bash scripts/test-tooling.sh` shows `mcp_drift Claude .mcp.json and Codex config in sync (both sides expose 2 servers: lsp-bridge, todo-graph)` (85/85 tooling tests PASS). FAIL-mode test confirmed: dropping the `[mcp_servers.lsp-bridge]` block from the user's Codex config and re-running test-tooling.sh produces `FAIL mcp_drift cross-config drift detected: codex-side: ... missing block [mcp_servers.lsp-bridge]` with the actionable installer hint. The `codex exec` smoke item carries the upstream MCP-cancel limitation (still reproducible on 0.128.0 as of 2026-05-01) noted in its `[/]` checklist entry.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test `mcp_drift`) | 85/85 tooling tests PASS
+
+> **Notes:**
+> - Repo-owned Codex MCP fixture at `docs/infrastructure/codex-mcp.config.toml`; idempotent installer `scripts/codex-mcp-install.sh` merges it into `~/.codex/config.toml` for the interactive `codex` TUI (the only production-blessed MCP path on Codex 0.128 today). `--check` mode is a dry-run.
+> - `mcp_drift` sub-test in `scripts/test-tooling.sh` does semantic two-step compare: cross-side `.mcp.json` vs fixture (command + args[0] for every shared name PLUS full args list for the `lsp-bridge` warm-start contract); codex-side `~/.codex/config.toml` vs fixture key-for-key via installer's `--check`. Skip-with-PASS on fresh dev env; FAIL with installer hint on real drift.
+> - Installer hardened post-ship: validates merged TOML BEFORE atomic replace (no destructive write on bad merge), boundary detector recognizes all 4 TOML-equivalent owned-block forms (bare/quoted prefix, bare/quoted name, whitespace around dot), structured FATAL envelope on malformed target.
+> - Earlier `scripts/codex.sh` wrapper was reverted: it did NOT fix the `codex exec` MCP rejection ([openai/codex#16685](https://github.com/openai/codex/issues/16685) is upstream; bug is in MCP elicitation routing, not in our wiring -- verified via probe), and was a band-aid against the no-bandaids principle. Will re-evaluate `codex exec` MCP when [PR #16632](https://github.com/openai/codex/pull/16632) merges.
+> - Canonical doc: `docs/infrastructure/ai-system.md` "MCP server boundary" -> "Cross-tool MCP server set" subsection.
+> - Scope boundary: §1 wires + validates the cross-tool MCP server set; §2 owns the no-`--model`/`--effort` invocation policy that goes on top of this wiring; §6 owns the broader MCP usage discipline doctrine.
+
+> **Verified:** 2026-04-26 | commit `90b4b838` (revert `fc517191` removed wrapper follow-up) | 9/10 items, 1 deferred ([/]: codex exec smoke blocked on upstream openai/codex#16685; PR #16632 in flight) | build OK | tests 85/85 PASS
+> **Quality reviewed:** 2026-04-26 | Codex 6x (design + adversarial + consistency + perf + re-adversarial) | 3H+5M+1L fixed | scope: N/A (host-side dev tooling)
+
+---
+
+## 2. Codex Invocation Policy: No `--model` / `--effort` From Claude
+
+Document the user's policy and add a hook that blocks accidental violations. The user's stated rule: when Claude invokes ANY Codex command (`/codex:adversarial-review`, `/codex:review`, `/codex:rescue`, raw `codex-companion.mjs task`, `codex exec`), Claude does NOT pass `--model` or `--effort`; Codex CLI uses the configured default from `~/.codex/config.toml` (today: `model = "gpt-5.5"`, `model_reasoning_effort = "medium"`). The intent is that the user controls model + reasoning effort centrally without Claude second-guessing per dispatch.
+
+> [!IMPORTANT]
+> **Models in scope:** Impossible OS uses Claude Opus 4.7 in Claude Code and GPT 5.5 in Codex (per the user's standing instruction; this is not negotiable in this TODO). Existing skill prose under `.claude/skills/codex-*/` that hints at "use --effort xhigh for deep review" or names a specific model is reviewed and stripped or qualified.
+
+- [x] Added "Codex Invocation Policy" subsection to [`CLAUDE.md`](../../CLAUDE.md) under Model Roles. States the rule explicitly (no `--model` / `--effort` from any Codex path), names the enforcement hook, the opt-out env var (`CODEX_FLAG_OVERRIDE=1`), the sub-test, and the absolute-path note (CLAUDE_PLUGIN_ROOT is not exported in the harness env so the absolute path stays canonical for skill-driven Codex invocation; verified via `env | grep CLAUDE`).
+- [x] Audited all 24 in-repo skills under [`.claude/skills/`](../../.claude/skills/) -- the 8 codex-* skills (`codex-adversarial-review-section`, `codex-consistency-audit`, `codex-design-review`, `codex-fix-review`, `codex-impact-analysis`, `codex-perf-review`, `codex-review-todo`, `codex-test-coverage`; `codex-quality-review-section` is NOT present) AND the 7 non-codex-prefixed skills that invoke Codex (`debug-session`, `diagnose-serial-log`, `implement-ssdt-range`, `implement-todo-section`, `implement-unit-tests`, `quality-review-section`, `review-todo-section`). Grep across all 24 for the four forbidden tokens: ZERO hits. Policy already followed in practice; the new hook adds defense-in-depth so a future skill author cannot accidentally regress it.
+- [x] `codex-adversarial-review-section/SKILL.md` step 3 absolute-path documented (NOT changed). Same `node "/home/derickpayne/.claude/plugins/marketplaces/openai-codex/plugins/codex/scripts/codex-companion.mjs"` form is used by 15 skills; `${CLAUDE_PLUGIN_ROOT}` substitution would not work because the harness env exports only `CLAUDECODE`, `CLAUDE_CODE_SSE_PORT`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH` (verified live). Documented in the new CLAUDE.md "Codex Invocation Policy" subsection's "Note on absolute paths" paragraph.
+- [x] Added [`.claude/hooks/codex_model_flag_block.py`](../../.claude/hooks/codex_model_flag_block.py) -- PreToolUse hook on `Bash`. Tokenizes the command via `shlex.split` (POSIX mode) so prompt-text containing the literal flag substring is NOT blocked (the substring lives inside its containing quoted-arg token after shlex; only standalone bare-flag tokens or `--flag=value` attached forms are flagged). Codex-target detection looks at argv[0]/argv[1] only (NOT all tokens) -- a `python3` heredoc whose body happens to contain the flag literal is correctly allowed; a real `codex exec` or `node /path/to/codex-companion.mjs` invocation is correctly blocked. Subcommand allowlist: `exec` / `review` / `task` / `mcp` / `app-server` / `rescue` / `exec-server` / `resume` / `fork` / `apply`. Bare `codex` with no subcommand (TUI / `--help` / `--version`) is allowed. Opt-out: `CODEX_FLAG_OVERRIDE=1` env var. Fail-open on malformed JSON / unparseable shell / missing `command` key (we never want a hook crash to mask unrelated failures).
+- [x] Wired the hook into [`.claude/settings.json`](../../.claude/settings.json) PreToolUse `Bash` matcher block, between `accepted_xref_block.py` and the inline section-commit gate. Timeout 5s.
+- [x] Added the `codex_flag_block` sub-test to [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) with **10 sub-cases** (broader than the original 2-case plan): block `--model` on companion (1), block `--effort` on `codex exec` (2), block `--model=value` attached form (3), allow clean Codex command (4), allow non-codex command with `--model` (5), allow `--model` literal inside a quoted prompt arg (6), allow with `CODEX_FLAG_OVERRIDE=1` opt-out (7), allow empty command (8), allow bare `codex --version` no-subcommand (9), allow `python3 -c` with `--model` literal in argv (10 -- regression for the false-positive caught during this very implementation when the original ALL-tokens scan blocked an unrelated python heredoc). All 10 PASS.
+- [x] Commit: `"codex/policy: document no --model/--effort policy; add hook to block accidental flag use"`
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` shows the `codex_flag_block` sub-test PASS. Manually triggering the hook with a synthetic `Bash(codex-companion.mjs adversarial-review --model gpt-5.5 ...)` invocation prints the block message and exits 2. Setting `CODEX_FLAG_OVERRIDE=1` allows the call through. Audit grep over `.claude/skills/codex-*/SKILL.md` shows no remaining `--model` or `--effort` example invocations. Test on: Linux WSL2 dev host.
+
+Verified locally: 29/29 `codex_flag_block` sub-test cases PASS (114/114 tooling tests total); audit grep across all 24 in-repo skills shows ZERO hits for the forbidden tokens; the post-impl Codex adversarial review caught two real bypasses (`codex --json exec --model X` -- global option before subcommand bypassed the original tokens[1]-only check; `-c model=...` / `-m` aliases bypassed the long-flag-only check) -- both fixed with new tests added (cases 11-16). False-positive caught during implementation: `python3` heredoc whose body contains the literal `--model` token is correctly allowed (the original ALL-tokens scan blocked an unrelated python script -- now argv[0]/argv[1] inspection only).
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test `codex_flag_block` -- 29 cases) | 114/114 tooling tests PASS
+
+> **Notes:**
+> - New PreToolUse hook `.claude/hooks/codex_model_flag_block.py` blocks `--model` / `--effort` / `-m` / `-e` (bare or `=value` attached) AND `-c model=...` / `--config model=...` / `-c model_reasoning_effort=...` config overrides on Codex invocations (codex-companion.mjs, `codex exec` / `review` / `task` / `mcp` / `app-server` / `rescue` / `e` / `a` etc.); walks past Codex global options to find the real subcommand so `codex --json exec --model X` is correctly blocked; checks argv[0]/argv[1] for Codex-target detection so unrelated heredocs / pipes that mention the flag literal are correctly allowed.
+> - Wired into `.claude/settings.json` PreToolUse Bash matcher block at position 2 (between `accepted_xref_block.py` and the inline section-commit gate). Timeout 5s. Opt-out: `CODEX_FLAG_OVERRIDE=1` env var per call.
+> - 29-case `codex_flag_block` sub-test in `scripts/test-tooling.sh` covers block paths (16 -- including bypass closures for `--json`-before-subcommand, `-c model=...` / `model_reasoning_effort` / `model_provider` config overrides, `codex e` exec alias, `-m` short form, env-prefix, env wrapper, timeout/sudo/nice wrappers, `&&` chain, redirect-after-Codex, heredoc-on-Codex), allow paths (11 -- including non-forbidden `-c sandbox_mode=...` config override, python3-heredoc false-positive regression, non-codex chain second segment, env-prefix to non-codex, file-redirect to non-codex, process substitution to non-codex), opt-out (1), edge case empty command (1).
+> - All 24 in-repo skills audited clean (0 forbidden-token hits); policy was already followed in practice, hook adds defense-in-depth against future regression.
+> - Canonical doc: `CLAUDE.md` "Model Roles" -> "Codex Invocation Policy" subsection (rule + enforcement + absolute-path note).
+> - Scope boundary: §2 documents + enforces the no-flag policy; §1 owns the MCP wiring; §6 owns the broader MCP usage discipline doctrine; §3 owns the receiving-code-review hard gate.
+
+> **Verified:** 2026-04-26 | commit `9e970610` + post-impl fixes (TBD: original review commit hash unrecorded; placeholder preserved for git-log audit) | 7/7 items | build OK | tests 114/114 PASS
+> **Quality reviewed:** 2026-04-26 | Codex 5x (design + adversarial + consistency + perf + re-adversarial) | 4H+5M fixed | scope: N/A (host-side hook + docs)
+
+---
+
+## 3. `receiving-code-review` Hard Gate: State File + Post-Codex Hook Block
+
+The user's `feedback_skill_invocation_drift.md` and `feedback_never_skip_review.md` both name the same failure mode: Claude runs Codex, gets a list of findings, and silently starts fixing without invoking `Skill(superpowers:receiving-code-review, ...)`. The reminder hook prints a `systemMessage` that the agent reads and acknowledges in prose, then proceeds anyway. Convert this from advisory to enforced.
+
+- [x] Created `.claude/state/` dir (preserved via `.keep`); added gitignore rule to track only `.keep` + `README.md` and exclude per-session JSON files. State file shape at [`.claude/state/last-codex-review.json`](../../.claude/state/last-codex-review.json) (gitignored): `{timestamp_ns, trigger, trigger_files, head_sha, tree_hash, received, received_timestamp_ns}`. Full schema + lifecycle + stale-pass policy + `tool_use_id` deferral rationale documented at [`.claude/state/README.md`](../../.claude/state/README.md).
+- [x] Added PostToolUse hook [`.claude/hooks/codex_review_completed.py`](../../.claude/hooks/codex_review_completed.py): fires on `Bash` (shlex tokenizes the command, walks past env-prefix + wrapper tokens (`sudo` / `timeout DURATION` / `nice` / `nohup` / `env` / `ionice` / etc.), then inspects argv[0]/argv[1] only -- accepts `codex-companion.mjs` direct exec or via `node`, OR bare `codex review` / `codex e` CLI) AND on `Skill` (when `tool_input.skill` or `.name` is one of the 8 codex-* skills: `codex-adversarial-review-section`, `codex-review-todo`, `codex-design-review`, `codex-impact-analysis`, `codex-test-coverage`, `codex-consistency-audit`, `codex-perf-review`, `codex-fix-review`). Writes the state file with `received: false`, captures `head_sha` + `tree_hash` for audit, atomic write via `.tmp` + `os.replace`. Fail-open on malformed JSON / git missing. Substring scan over the full command was rejected after Codex adversarial review M1 caught false positives from `rg codex-companion.mjs`, `git grep "codex review"`, and heredoc bodies containing the literal (live-reproduced when the §3 review-prompt heredoc itself wrote a `Bash(cat > /tmp/...)` trigger label). Same shlex pattern as §2 `codex_model_flag_block.py`.
+- [x] Same hook also handles RECEIVE events: when `tool_input.skill` or `.name` is `superpowers:receiving-code-review` OR the bare-name `receiving-code-review` (Codex design review caught the bare-name path -- the marketplaces plugin sometimes resolves one form to the other; matches existing `section_review_required.py` and `design_review_required.py` tolerant pattern). Loads state, flips `received: true`, sets `received_timestamp_ns`. No-ops if no prior trigger (skill is harmless to invoke standalone). On TRIGGER, if a prior trigger is being overwritten while still `received: false` AND within TTL, the hook emits a stderr WARN naming both labels -- the H1 mitigation Codex caught (full queue-based correlation needs `tool_use_id` from harness; deferred to item 8).
+- [x] Added PreToolUse hook [`.claude/hooks/receiving_review_required.py`](../../.claude/hooks/receiving_review_required.py): on `Edit` / `Write` / `MultiEdit`. Allows if no state file, `received: true`, or TTL expired (>3600s). Otherwise BLOCKs (rc=2) with envelope naming the trigger (e.g. `Bash(codex-companion.mjs adversarial-review ...)` truncated to 120 chars), the trigger ISO timestamp, age in seconds, target file, the receive skill name to invoke, and the opt-out: `RECEIVING_REVIEW_OVERRIDE=1` AND a code-evidence quote justifying skip. Doctrine pointer to CLAUDE.md "Mandatory Skill Triggers" + memory `feedback_skill_invocation_drift` / `feedback_never_skip_review`. Fail-open on malformed JSON / git missing / hook bug.
+- [x] Wired both hooks into [`.claude/settings.json`](../../.claude/settings.json): PostToolUse `Bash|Skill` matcher block runs `codex_review_completed.py` (timeout 5s); PreToolUse `Edit|Write|MultiEdit` matcher block runs `receiving_review_required.py` (timeout 5s, ordered AFTER `section_review_required.py` per the design-review ordering rule).
+- [x] Added `receiving_review_gate` sub-test block to [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) -- **28 cases total** (12 baseline + 5 impl-pipeline M1+H1 + 4 review-pipeline H2+H3 + 3 H4 segmentation + 4 re-adversarial H7+H8): Bash trigger writes state with `received: false`; Skill trigger writes state; PreToolUse blocks Edit (rc=2); PreToolUse blocks Write (rc=2); PreToolUse allows after `received: true` (rc=0); namespaced receive (`superpowers:receiving-code-review`) flips True via both `skill` key and `name` key; bare-name receive (`receiving-code-review`) flips True via both `skill` key and `name` key; allow when no state file (rc=0); opt-out via `RECEIVING_REVIEW_OVERRIDE=1` (rc=0); TTL stale-pass (state mutated to >1h old, allow rc=0); non-Edit tools (Bash/Read/Grep) pass through (rc=0). M1 regressions: `rg codex-companion.mjs` does NOT trigger; heredoc body literal does NOT trigger; `git grep "codex review"` does NOT trigger. M1 positive: `RECEIVING_REVIEW_OVERRIDE=1 timeout 600 node /abs/codex-companion.mjs ...` IS a trigger. H1 mitigation: rapid-fire trigger overwriting unreceived state emits stderr WARN naming both labels. H2: `env FOO=bar codex review`, `timeout -k 10 5 codex review`, `codex --json review` all IS triggers. H3: `_write_atomic` uses unique per-process tmp paths (no residue after parallel writes). H4: `true && codex review`, `taskset -c 0 codex review`, `chrt -f 10 codex review` all IS triggers (matches section-2 hook detection via segmentation + scan-anywhere pattern).
+- [x] Updated [`.claude/skills/codex-adversarial-review-section/SKILL.md`](../../.claude/skills/codex-adversarial-review-section/SKILL.md) step 4 to call out the new hard gate: hook BLOCKS subsequent Edit/Write/MultiEdit until receiving-review fires; state file lives at `.claude/state/last-codex-review.json` (schema in `.claude/state/README.md`); 1 hour TTL stale-pass; opt-out via `RECEIVING_REVIEW_OVERRIDE=1` env var + required code-evidence quote justifying skip.
+- [/] **Anti-stale-pass binding -- partial:** state schema captures `head_sha` (from `git rev-parse HEAD`) + `tree_hash` (sha256 of `git status --porcelain`) at trigger time for audit. Invalidation is TTL-only (1h); HEAD/tree mismatch is deliberately NOT used (Codex design review High caught "stale-tree allow" as a bypass: agent could edit a non-code file between trigger and receive, gate would see tree changed and let next code edit through without receive ever firing). The `trigger_tool_use_id` field is **NOT in the schema** because the Claude Code harness PostToolUse / PreToolUse hooks do not expose `tool_use_id` to hooks (verified live via probe -- only `tool_name` + `tool_input` arrive via stdin JSON). Documented in `.claude/state/README.md` "Why `tool_use_id` is not in the schema". Future-fix when harness exposes the field. -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §10 (item: future skill step-state telemetry consumer of `tool_use_id` if upstream lands).
+- [/] **Structured-finding parser -- deferred:** the upstream `superpowers:receiving-code-review` skill is process-prose ("READ then VERIFY then EVALUATE"), not structured JSON output (verified by reading `~/.claude/plugins/cache/claude-plugins-official/superpowers/<ver>/skills/receiving-code-review/SKILL.md`). Parsing structured findings from its prose would require either modifying the upstream skill (out of scope; we do not own that surface) OR establishing a marker-file convention (no current pattern). Documented in `.claude/state/README.md` "Why no structured-finding parser". -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §12 (item: AI-slop content lints could include a "performative-agreement" detector once the marker convention exists).
+- [x] Commit: `"hooks: receiving-code-review hard gate via state file + Pre/PostToolUse pair"`
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` shows the 17-case `receiving_review_gate` sub-test block PASS (132/132 tooling tests total). Manually triggering the PreToolUse hook against synthetic Edit JSON with `received: false` state file produces rc=2 with the BLOCK envelope; with `received: true` produces rc=0; with `RECEIVING_REVIEW_OVERRIDE=1` produces rc=0. Test on: Linux WSL2 dev host.
+
+Verified locally: 132/132 tooling tests PASS (17-case `receiving_review_gate` block); lint clean; AI-system regression 72/72; build OK; Codex adversarial review returned 1H+1M, both fixed (M1: shlex tokenization replaces substring scan; H1 mitigation: stderr WARN on overwrite-while-unreceived).
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test block `receiving_review_gate` -- 17 cases) | 132/132 tooling tests PASS
+
+> **Notes:**
+> - PostToolUse `codex_review_completed.py` (Bash + Skill matchers) writes `.claude/state/last-codex-review.json` with `received: false` on Codex trigger (Bash side: shlex argv[0]/argv[1] match for `codex-companion.mjs` / `node ...codex-companion.mjs` / `codex review` / `codex e`, walking past env-prefix + wrapper tokens like `timeout DURATION`; 8 codex-* skill names on Skill side); flips `received: true` on `superpowers:receiving-code-review` skill (or bare-name variant). On overwrite-while-unreceived emits stderr WARN naming both labels (H1 mitigation). Atomic write; fail-open on any error.
+> - PreToolUse `receiving_review_required.py` (Edit / Write / MultiEdit) BLOCKs (rc=2) when `received: false` AND TTL valid (<1h). BLOCK envelope names trigger, ISO timestamp, age, target file, the receive skill to invoke, and the `RECEIVING_REVIEW_OVERRIDE=1` opt-out + required code-evidence quote.
+> - Stale-pass policy is TIME-only (1h TTL) per Codex design review High: HEAD / tree-hash mismatch deliberately does NOT invalidate (would create a bypass where agent edits a non-code file between trigger and receive, then gate sees tree changed and lets next code edit through). New review trigger overwrites state with fresh `received: false`.
+> - Reduced scope: `tool_use_id` binding (anti-rapid-fire) deferred because Claude Code harness does not expose `tool_use_id` to hooks (verified live). Structured-finding parser deferred because upstream `superpowers:receiving-code-review` is process-prose, not structured JSON. Both deferrals documented in `.claude/state/README.md`.
+> - Canonical doc: `.claude/state/README.md` (schema, lifecycle, stale-pass policy, deferral rationale).
+> - Scope boundary: §3 wires the receive-or-block gate; §4 builds on it for the section-commit hard block (Codex evidence + receiving evidence + build evidence); §5 extends §4 with the four-dispatch counting; §10 may consume `tool_use_id` for step-state telemetry if upstream exposes it.
+
+> **Verified:** 2026-04-26 | commit `ec043c81` + review fixes `011d1a93` | 7/9 items, 2 deferred ([/]: item 8 anti-stale-pass binding partial -- HEAD/tree captured for audit, TTL invalidation works, `tool_use_id` portion deferred because Claude Code harness does not expose it; item 9 structured-finding parser deferred because upstream `superpowers:receiving-code-review` is process-prose, not structured JSON) | build OK | tests 143/143 PASS
+> **Accepted:** [H] Hook Python startup ~25ms baseline per invocation (review-pipeline perf finding H6) -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §7 (item: "Hot-path Python startup mitigation (perf)" at line 252 -- adds `.claude/hooks/wrap.sh` shell pre-filter applied to all Python hooks)
+> **Quality reviewed:** 2026-04-26 | Codex 4x (adversarial, consistency, perf, re-adversarial) | 7H+1L fixed, 1H accepted-XREF | scope: N/A (host-side dev tooling, no kernel/boot/desktop/shell domain)
+
+---
+
+## 4. Section-Commit Gate Hardens to BLOCK With Build + Codex + Receiving Evidence
+
+Today's section-commit hook (the inline Python block in [`.claude/settings.json`](../../.claude/settings.json) under the `Bash` matcher PreToolUse for `git commit`) prints a long `systemMessage` listing implement-todo-section steps 13-18 and exits 0. The user's `feedback_never_skip_review.md` says this reminder mode does not work. Convert to a hard block when the staged diff carries the section-commit signature, with a deterministic check for build + Codex review + receiving-review evidence in the recent state.
+
+- [x] Section-commit signature defined in [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py) `_detect_signature()`: staged diff must contain BOTH (a) `_staged_source_files()` (paths matching `.c/.h/.asm/.S` under `src/`/`include/` OR `.py/.mjs/.sh` under `scripts/` -- inherited from §3 `crc._staged_source_files`) AND (b) at least one `todo/**/*.md` where `_impl_order_flips_with_status()` finds an Implementation Order row flipping to `[x]`. Regex `_IO_OLD_OPEN_RE` / `_IO_NEW_DONE_RE` anchors on the trailing status cell to avoid `[x]` in description cells (Codex H1).
+- [x] Evidence requirements implemented:
+   1. **Build evidence** (`_build_evidence`): `tail -1 build/build.log` is `=== BUILD OK ===`; mtime within `EVIDENCE_TTL_SECONDS=1800`; mtime newer than every staged source file (1s slop for FS rounding); index/worktree blob NOT desynced via `git diff --name-only -z` (round-2: catches reverted-worktree-then-rebuild bypass where build compiled non-staged content).
+   2. **Codex+receiving evidence** (`_review_evidence`): `.claude/state/last-codex-review.json` shows `received: true` within TTL; `trigger_files` non-empty AND covers every staged source path; `trigger_blobs` SHA matches current staged blob (round-1 C1: content binding via blob SHA, not just path).
+   3. **Receiving-review evidence:** baked into 2 -- §3 PostToolUse hook flips `received: true` ONLY on `superpowers:receiving-code-review` skill firing.
+- [x] Replaced inline reminder hook with script call to [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py) (826 lines after fix-loop, all of [`.claude/settings.json:73-75`](../../.claude/settings.json) PreToolUse Bash matcher). Script imports `codex_review_completed.py` for shared shlex-tokenize/segment-by-control-operators/wrapper-walk pattern (§3 parity). Two execution modes: harness PreToolUse (stdin JSON payload) and `--git-hook-mode` for `.githooks/pre-commit` (TOCTOU defense for `git add foo && git commit -m bar` chains the harness layer cannot see). Pre-signature errors fail-OPEN; post-signature errors fail-CLOSED (Codex H2). Opt-out: `SKIP_REVIEW_HOOK=1` AND `SKIP_REVIEW_HOOK_REASON="<text >= 12 chars>"` (both required); on opt-out appends JSONL audit record to `.claude/state/skip-log.jsonl` AND resets `last-codex-review.json` `received` -> false so the skip cannot be reused (Codex M1).
+- [x] Updated PostToolUse smoke-test + boot-smoke hooks in [`.claude/settings.json:115-123`](../../.claude/settings.json) to read `skip-log.jsonl`, match by parent SHA (`HEAD~1`, since SKIP records the pre-commit HEAD), and prepend `[SKIP_REVIEW_HOOK reason: ...]` to their `systemMessage` so the user sees in the next conversation turn what was bypassed and why.
+- [x] Added 55 sub-test cases under `[section_commit_gate]` block in [`scripts/test-tooling.sh:1319-1780`](../../scripts/test-tooling.sh) covering: missing build/missing review state/expired TTL/empty trigger_files/blob mismatch (round-1 C1, C2); ADD-only `[x]` row signature (H1); SKIP without reason / with reason / state reset / small-section WARN (M1); bypass closures across env-prefix / wrapper / chain / `git -c x=y` (C1); `--no-verify` and `-n` blocked unconditionally (H1); shell descents `bash -c` / `bash -lc` / `sh -ec` / `bash --rcfile myrc -c` / `eval` (H1c, H2 r2/r3/r4); per-wrapper value-flag table for env / sudo / timeout / nice / ionice / stdbuf / command / taskset / chrt / flock / setpriv / cgexec / xargs / exec (H2 r3-r5); commit aliases `ci` / `cm` (H2 r2); index/worktree desync (H2 r2); flock special-case for lockfile-positional + `-c/--command` shell descent (H2 r4); `taskset MASK` positional (H2 r5); `exec -a NAME` value flag (H2 r5); `setpriv --ruid` / `--securebits` (H2 r5); `cgexec --sticky` no-value (H2 r5); inline `git -c alias.<X>=<commit ...>` plain-form resolution (round-6); inline `git -c alias.<X>='!git commit ...'` shell-alias resolution + `!f() {...}; f` function-alias defense-in-depth (round-7); alias body with leading git pre-subcommand options like `-c user.name=x commit --no-verify` and `-C /tmp commit --no-verify` (round-8).
+- [x] Updated [`.claude/skills/implement-todo-section/SKILL.md`](../../.claude/skills/implement-todo-section/SKILL.md) step 19 to call out the gate as a hard block (steps 13-17 produce the evidence; skipping = blocked commit, not reminder); references both harness PreToolUse and `.githooks/pre-commit` execution modes; documents the dual-env-var opt-out + skip-log audit + state-reset semantics.
+- [x] Updated [`.claude/skills/verify-todo-section/SKILL.md`](../../.claude/skills/verify-todo-section/SKILL.md) to note the gate fires on the same staged-diff signature for verify-mode, but downgrade-only audit commits (`[x]` -> `[/]` or `[ ]`) do NOT match the signature regex; promote-mode audit commits (rare) DO match and require evidence.
+- [x] **No-small-section-exemption** implemented via `_is_small_section()`: counts `git diff --cached --numstat` source-LOC delta; if < 50, appends `{"kind": "WARN", "tag": "small-section-skip-risk"}` to `skip-log.jsonl` regardless of pass/fail outcome. The gate does NOT relax evidence requirements for small diffs; the WARN is a sweep-able audit log entry for the recurring "section was small so I skipped review" pattern.
+- [x] Commit: `"hooks: section-commit gate is now a hard block, not a reminder"` -- shipped `7bbbe87b`
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` shows 209/209 tooling tests PASS including the 55-case `section_commit_gate` block. End-to-end verified by the test harness: stage section-commit diff WITHOUT review state -> rc=2 with missing-evidence message; with all 3 evidence pieces -> rc=0; `SKIP_REVIEW_HOOK=1` without reason -> rc=2 (usage envelope); both env vars with valid reason -> rc=0 with skip-log entry AND state reset. Test on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test block `section_commit_gate` -- 55 cases) | 209/209 tooling tests PASS
+
+> **Notes:**
+> - `.claude/hooks/section_commit_gate.py` is the load-bearing hard-block: ~970 lines, dual-mode (harness PreToolUse + `.githooks/pre-commit --git-hook-mode`), 55 regression test cases. Replaces the prior reminder-mode inline hook that printed a `systemMessage` and exited 0.
+> - Wired at [`.claude/settings.json:73-75`](../../.claude/settings.json) for harness layer; at [`.githooks/pre-commit:42-56`](../../.githooks/pre-commit) for git layer (catches `git add && git commit` chains the harness sees only as pre-stage). Fail-OPEN before signature, fail-CLOSED after. Opt-out requires both `SKIP_REVIEW_HOOK=1` AND `SKIP_REVIEW_HOOK_REASON="<>= 12 chars>"`; logs to `.claude/state/skip-log.jsonl` AND resets `last-codex-review.json` so a single Codex review cannot be reused for multiple commits.
+> - 9x Codex review pipeline: 5 implementation-time rounds in commit `7bbbe87b` (initial adversarial + 4 fix-loop) plus 4 post-commit review-todo-section rounds (adversarial + consistency + perf + re-adversarial closure). Round-1 build mtime + content binding gaps; round-2 bash -lc combined-flag + ci/cm aliases + index/worktree desync; round-3 env -u VAR + bash --rcfile FILE wrapper-value gaps; round-4 wrapper arity bugs (sudo -n / command -p / ionice -t no-value) + eval/xargs not handled; round-5 taskset MASK positional + exec -a + setpriv current names + cgexec --sticky no-value; round-6 plain-alias resolution + cross-hook wrapper-table parity (between section_commit_gate and codex_review_completed); round-7 perf hot-path (lazy-import + literal screen, ~7ms savings/call) + git shell-alias `!`-prefix bypass; round-8 alias body with leading git pre-subcommand options. Each round closed 1-3 bypass shapes; the gate now blocks ~60 distinct invocation forms.
+> - Canonical doc: [`.claude/state/README.md`](../../.claude/state/README.md) for state-file schema; [`.claude/skills/implement-todo-section/SKILL.md`](../../.claude/skills/implement-todo-section/SKILL.md) step 19 for skill integration.
+> - Scope boundary: §4 owns the section-commit hard-block + signature detection + evidence checks; §3 owns the Codex receive-or-block gate this section consumes; §5 owns the four-dispatch counting on top of §4; §7 owns the inline-hook extraction (post-commit smoke-test + boot-smoke + reminder hooks) -- a Medium finding from initial adversarial about post-commit hooks not following the gate's wrapped-form detection is accepted-XREF there because §7 already plans the cleanup; the gate itself catches the security concern.
+
+> **Verified:** 2026-04-27 | commit `7bbbe87b` + review-pipeline fixes `44e600f6` | 9/9 items | build OK | tests 209/209 PASS
+> **Accepted:** [M] PostToolUse smoke-test + boot-smoke + reminder inline hooks use `cmd.startswith('git commit')` AND `Bash(git commit:*)` matcher -- wrapped forms (`env git commit`, `bash -c 'git commit'`) skip post-commit smoke + skip-reason propagation. Observability gap, not enforcement gap (gate itself catches the security concern). -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §7 (item: "Same extraction for the inline `git commit` smoke-test hook and boot-smoke hook into dedicated files `post_commit_smoketest.py` and `post_commit_smoketest_boot.py`")
+> **Accepted:** [H] Stale receive event marking newer trigger received -- under racy multi-dispatch ordering (review A trigger -> review B trigger overwrites unreceived state -> agent receives intending A), state.received flips True against B's trigger_files, so the gate trusts an untriaged latest review. The §3 design captured `head_sha` + `tree_hash` for audit but explicitly defers `tool_use_id` correlation because the Claude Code harness does not expose `tool_use_id` to hooks (verified via probe). -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §3 (item: "Anti-stale-pass binding -- partial: state schema captures head_sha + tree_hash at trigger time for audit. ... The trigger_tool_use_id field is NOT in the schema because the Claude Code harness PostToolUse / PreToolUse hooks do not expose tool_use_id to hooks (verified live via probe)" at line 241)
+> **Quality reviewed:** 2026-04-27 | Codex 9x (adversarial + 4 fix-loop + post-commit adversarial + consistency + perf + re-adversarial) | 12H + 2M fixed, 1M+1H accepted-XREF | scope: N/A (host-side automation tooling, no kernel/boot/desktop/shell domain)
+
+---
+
+## 5. `review-todo-section` Four-Dispatch Enforcement
+
+User feedback memory `feedback_codex_review_four_dispatches.md`: review-todo-section step 8 is multiple separate Codex dispatches, not one combined pass. The skill prose names them; agents conflate them. Make the policy state machine-checkable. Note: the original framing used four (adversarial / consistency / dead-code / perf); review-todo-section/SKILL.md retired the dead-code dispatch on 2026-04-25 (rationale: dead-code findings against functions reserved for future TODO sections introduced regressions that surfaced weeks later via SSDT/IDT/driver-vtable paths). The current canonical step-8 set is **three** dispatches: adversarial + consistency + perf. The state file and gate track that set.
+
+- [x] Define a state file [`.claude/state/last-review-stamps.json`](../../.claude/state/last-review-stamps.json) (gitignored): keyed by TODO file path, `{<todo_path>: {"section": "<§N>", "adversarial": <ts_ns|null>, "adversarial_head": "<sha>", "consistency": <ts_ns|null>, "consistency_head": "<sha>", "perf": <ts_ns|null>, "perf_head": "<sha>"}}`. Per-kind `<kind>_head` field added in the post-impl review pipeline (Codex M2) for cross-branch reuse defense. Schema + lifecycle + concurrency note in [`.claude/state/README.md`](../../.claude/state/README.md).
+- [x] Updated the §3 PostToolUse hook ([`codex_review_completed.py`](../../.claude/hooks/codex_review_completed.py) lines ~442-720) to write `last-review-stamps.json` when the trigger is one of the three step-8 dispatches: `codex-adversarial-review-section` -> `adversarial`, `codex-consistency-audit` -> `consistency`, `codex-perf-review` -> `perf`. Bash dispatches must carry a `[review-kind: <kind>]` marker at the start of the prompt; Skill dispatches use the skill name. The TODO path is extracted via regex `(?<![\w/-])todo/[\w./-]+TODO-\d[\w./-]*\.md`. Multiple matches surface a stderr WARN; first match wins. Read-merge-write serialized via `fcntl.flock()` on a sibling lockfile (Codex M3) to prevent parallel-dispatch entry loss.
+- [x] Updated [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py) with three new evaluate paths and a HEAD-ancestry check: (a) `_STAMP_ADDED_RE` regex tolerates 0-3 leading spaces of valid Markdown blockquote indent (Codex M4); (b) `_detect_signature` adds a `stamp_only` state for separate `stamp:` commits (no source change) AND for source+stamp+no-row-flip mixed shapes (Codex M1+M5); (c) `_evaluate` scans ALL staged TODOs (not just `flipped`) for stamp adds via `_stamped_todos(root, _staged_todo_files(root))` (Codex M5 cross-TODO piggyback fix); (d) `_four_dispatch_evidence` validates per-kind `<kind>_head` is an ancestor of current HEAD via `git merge-base --is-ancestor` (Codex M2). Legacy entries without head fields pass on TTL alone with one-shot WARN. SKIP_REVIEW_HOOK opt-out works on the stamp_only path; audit record carries `kind: "stamp_only"`.
+- [x] Added 11 sub-tests under the `four_dispatch_gate` block in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) covering: implementation-only commit bypasses the check; stamp commit + state missing blocks; 2-of-3 dispatches blocks naming missing kind; stale dispatch (>30 min) blocks; all 3 recent allows; PostToolUse Skill records consistency; PostToolUse Bash records perf via marker; missing marker / missing TODO path skips state write; self-summary preamble emits stderr WARN; round-trip (3 dispatches via PostToolUse + stamp commit) allows. Plus M1-M5 post-impl test cases: M1 stamp-only block / allow / SKIP path; M4 indented stamp detected; M2 head field write / non-ancestor block / equal-HEAD pass / legacy compat; M3 parallel-dispatch lock preservation; M5 source+stamp+no-flip block / allow.
+- [x] Updated [`.claude/skills/review-todo-section/SKILL.md`](../../.claude/skills/review-todo-section/SKILL.md) step 5 (adversarial) and 8a/8b (consistency/perf): each now requires `[review-kind: <kind>]` marker + TODO path in the prompt; references the state-file mechanism and the §4 commit gate refusal; points at [`codex-prompt-template.md`](../../.claude/skills/review-todo-section/codex-prompt-template.md). The "two dispatches instead of one combined" rationale paragraph updated to "separate dispatches" since the canonical set is three.
+- [x] **No-self-summary Codex template + context-isolation enforcement:** created [`codex-prompt-template.md`](../../.claude/skills/review-todo-section/codex-prompt-template.md) with three fixed templates (adversarial / consistency / perf) that name files + adversarial angles only, no implementor narrative. Per [CONSENSAGENT ACL-2025](https://aclanthology.org/2025.findings-acl.1141/), pasting the implementor's narrative into the reviewer's prompt biases the reviewer toward agreement. The §3 PostToolUse hook scans the first ~10 non-blank prompt lines for first-person preambles (`^\s*I (built|wrote|implemented|made|added|created|fixed)`, `^\s*Summary of changes`, `^\s*What I built`, `^\s*My (implementation|approach|fix|change)`, `^\s*Here (is|'s) what I `) and emits a stderr WARN naming the matched line. WARN-only by design (false positives on legitimate context lines made hard-block infeasible).
+- [/] **Per-section state keying** (Codex M6 + Consistency H1 dup) -- BLOCKED, **operator-gated**: no cross-TODO owner exists and this section is stamped, so only a decision to re-open §5 clears it
+      - The defect: the state file is keyed by TODO path, so cross-section reuse inside the 30-min TTL is possible -- dispatch reviews for §5, then stamp §6 in the same file within 30 min, and the gate sees `state[TODO-08]` holding all three kinds and passes.
+      - The fix needs markdown-aware diff parsing: walk back from each stamp ADD hunk to its `## N. <title>` heading and key state by `(todo_path, section)`. Extend `_record_stamp` to take the section (`f"{todo_path}#{section}"`) and `_stamped_todos` to return `[(path, section_label)]` from `git show :{path}` plus `git diff --cached` hunk line numbers.
+      - Shape corrected 2026-08-13 by the sequencer's ADVANCE drain: it was a bare `- [ ]` inside a Deferred-stamped section, which the triage oracle never revisits and the orphan check exempts, so nothing could see it.
+- [/] **Full-diff batching for `_detect_signature` + `_stamped_todos`** (Codex Perf M1a) -- BLOCKED, **operator-gated**: same blocker as the item above; it touches `_detect_signature`'s ownership boundary, so it belongs to §5 or to nobody
+      - Today the gate runs `git diff --cached --name-only` plus a per-TODO `git diff --cached -U0 -- <path>` (for `_impl_order_flips_with_status` AND `_stamped_todos`), so a stamp commit over N TODO files pays roughly `2N` subprocess shells.
+      - Refactor: read `git diff --cached -U0 -- <all-todo-files-batch>` ONCE in `_detect_signature`, parse it into `{path: hunks}`, and derive both the Implementation Order flips and the added stamps from that one parse; pass the dict to `_evaluate` so `_stamped_todos` never re-shells. Estimated ~150ms -> ~30ms of gate latency.
+      - Shape corrected 2026-08-13 by the same drain, for the same reason.
+- [x] Commit: `"hooks: enforce review-todo-section step-8 four-dispatch policy via state file"`
+
+**Test checkpoint:** End-to-end on a `verify-todo-section` re-stamp: run only adversarial + consistency, attempt to commit a `**Quality reviewed:**` stamp, hook exits 2 naming `perf` missing; run the remaining one, retry, exit 0. `bash scripts/test-tooling.sh` shows 11 new four_dispatch_gate sub-tests PASS (236/236 total). Test on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test block `four_dispatch_gate` -- 28 cases) | 242/242 tooling tests PASS
+
+> **Notes:**
+> - `last-review-stamps.json` records per-kind `(ts_ns, dispatch_head_sha)`; gate enforces TTL (30 min) AND `git merge-base --is-ancestor` of dispatch_head against current HEAD; legacy entries without head fields TTL-only with WARN. Three dispatches required (adversarial + consistency + perf); dead-code retired 2026-04-25.
+> - Three signature paths in `_detect_signature`: `section` (source + row flip; build + review + four-dispatch evidence); `stamp_only` (added stamp lines + optional source without row flip; ONLY four-dispatch); `not_section` (allow). Lockfile `last-review-stamps.lock` serializes parallel dispatches.
+> - Downstream effects: `verify-todo-section` retro-stamps and `review-todo-section` post-impl stamps both gate through this; the user's separate `stamp:` commit pattern (per git log `f2655a0a stamp: TODO-08 §4 ...`) now triggers the four-dispatch check rather than bypassing entirely. Codex review pipeline: 1 implementation-time adversarial + 1 post-impl re-adversarial; M1+M2+M3+M4 fixed in the impl pass; M5 + M6 found in re-adv (M5 fixed, M6 accepted-XREF as the per-section keying follow-up item above).
+> - Canonical doc: [`.claude/state/README.md#last-review-stampsjson`](../../.claude/state/README.md) (schema + concurrency + stamp-only path + ancestry binding); skill integration in [`review-todo-section/SKILL.md`](../../.claude/skills/review-todo-section/SKILL.md) steps 5 and 8.
+> - Scope boundary: §5 owns the four-dispatch state-file + gate enforcement + prompt template; §3 owns the receive-or-block gate this section consumes; §4 owns the section-commit hard block this section extends; per-section keying (Codex M6) and full-diff batching (Perf M1a) are filed as `[ ]` follow-ups here; §7 owns the inline-hook extraction concern (post-commit smoke / boot-smoke detection of wrapped `git commit` forms; observability gap, not enforcement gap).
+
+> **Verified:** 2026-04-27 | commit `72fd7744` + review pipeline `c65568fc` | 7/9 items | build OK | tests 242/242 PASS
+> **Deferred:** [M] Per-section state keying -- cross-section dispatch reuse within 30-min TTL is theoretically possible (state keyed by TODO path, not `(path, section)`); the fix requires markdown-aware diff parsing to walk back from each stamp ADD hunk to its `## N.` heading. Codex M6 + Consistency H1 (dup) -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §5 (item: "Per-section state keying" at line ~245)
+> **Deferred:** [M] Full-diff batching for `_detect_signature` + `_stamped_todos` -- per-TODO `git diff` subprocess fanout (~2N per stamp commit) -- one batched `git diff --cached -U0 -- <all>` parse would cut gate latency from ~150ms to ~30ms. Codex Perf M1a -> XREF: 00-infrastructure/TODO-08-automation-hardening.md §5 (item: "Full-diff batching" at line ~248)
+> **Quality reviewed:** 2026-04-27 | Codex 6x (impl-adversarial + impl-re-adversarial + post-impl-adversarial + consistency + perf + re-adversarial) | 5H+8M+1L fixed, 2M deferred-XREF, 1H rejected-dup | scope: N/A (host-side automation tooling, no kernel/boot/desktop/shell domain)
+
+---
+
+## 6. MCP Usage Discipline -- Doc + CLAUDE.md Pointer
+
+Today neither Claude nor Codex consistently uses the two MCP servers. Symptom: Claude greps for symbols when a `lsp-bridge.definition` would be one call; Claude walks TODO XREFs by hand instead of calling `todo-graph.backlinks`. Document the doctrine; let the agent's planning skill (and future skill iterations) pick it up.
+
+- [x] Created [`docs/infrastructure/mcp-usage.md`](../../docs/infrastructure/mcp-usage.md) (NEW; ~110 lines). Sections: Inventory (two servers + canonical-owner links); When to call `todo-graph` (12 read-only queries with use-case-each table); When to call `lsp-bridge` (15 LSP-backed tools, 6 high-value highlighted, discipline rules around `definition` over `grep '^.*foo.*('` and `references` over `grep -rn 'foo('`); When NOT to call MCP (Read for bytes, Edit/Write for changes, grep for free-text); Cross-tool parity (post-Codex-MCP-wiring). Tool counts reflect actual server contents (not the 11/6 framing in this section's original draft, which predated `code-by` landing in todo-graph and over-counted the lsp-bridge "specialized" tier).
+- [x] Added "MCP Usage" 3-bullet block to [`CLAUDE.md`](../../CLAUDE.md) above the existing `## Skills` section. Bullets cover: (1) prefer `mcp__lsp-bridge__definition` / `references` over `grep`; (2) prefer `mcp__todo-graph__ready` / `backlinks` / `code` over manual TODO walks; (3) full doctrine pointer.
+- [x] Audited the 11 task-execution skills. Findings: `implement-todo-section`, `validate-todo-file`, `gap-audit-todo` already use `python3 scripts/todo-graph/query.py` as the fast path (predates this MCP wrapper but same data source). `review-todo-section` line 162 uses `grep -r "Accepted:\s*\[H\]" todo/` for severity triage -- markdown free-text, kept. `complete-todo-file` line 79 inbound stamp sweep updated to prefer `mcp__todo-graph__deferred-by`. `verify-todo-section`, `quality-review-section`, `debug-session`, `diagnose-serial-log`, `implement-unit-tests` have no symbol/reference grep patterns to convert.
+- [x] Updated [`.claude/skills/create-todo/SKILL.md`](../../.claude/skills/create-todo/SKILL.md) step 3: `mcp__todo-graph__backlinks <id>` is now the fast path; Grep stays as the fallback for free-text / no-known-id cases.
+- [x] Updated [`.claude/skills/codex-impact-analysis/SKILL.md`](../../.claude/skills/codex-impact-analysis/SKILL.md) (new step 1.5: `mcp__lsp-bridge__references` MANDATORY pre-fetch for typed symbols) and [`.claude/skills/codex-consistency-audit/SKILL.md`](../../.claude/skills/codex-consistency-audit/SKILL.md) (new step 1.5: `mcp__lsp-bridge__references` per typed symbol + grep for assembly-side mirrors). Both skills now paste the verified reference set into the Codex prompt instead of letting Codex heuristically scan files.
+- [x] Added 5 doc-presence assertions to [`scripts/test-ai-system.sh`](../../scripts/test-ai-system.sh) (`mcp-usage.md` exists with key strings; CLAUDE.md has 'MCP Usage' section + pointer to the doc). Doctrine-presence regression coverage matches the existing pattern for `code-style-policies.md` / `test-policy.md`.
+- [x] Commit: `"docs/mcp: usage discipline doc; CLAUDE.md pointer; skill prose update"`
+
+**Test checkpoint:** `docs/infrastructure/mcp-usage.md` exists, names the two servers + key tool counts, validates as well-formed markdown via `bash scripts/lint.sh`. `bash scripts/test-ai-system.sh --quiet` shows the 5 new doc-presence assertions PASS. Skill grep for `grep -rn` in the 11 audited skills shows only fallback uses (or pre-existing structured-data-grep patterns like the `Accepted:\s*\[H\]` severity triage). Test on: Linux WSL2 dev host.
+
+> **Test runner:** N/A (host-side doctrine doc; no kernel/usermode/desktop test surface) | validation: `bash scripts/lint.sh` (markdown well-formed) + `bash scripts/test-ai-system.sh --quiet` (5 new doc-presence assertions PASS, total 79/79)
+
+> **Notes:**
+> - What shipped: `docs/infrastructure/mcp-usage.md` (~110 lines, 5 sections, full inventory of 12 todo-graph + 15 lsp-bridge tools); CLAUDE.md "MCP Usage" 3-bullet block above `## Skills`; targeted prose updates in 4 skills (`create-todo` step 3, `codex-impact-analysis` step 1.5, `codex-consistency-audit` step 1.5, `complete-todo-file` inbound stamp sweep).
+> - How it integrates: doctrine-only (no hooks, no enforcement gate). Auto-load via `description` is unreliable per CLAUDE.md, so the value comes from the CLAUDE.md `## MCP Usage` block + the skills that reference the doc. Future skill iterations naturally pick up the pattern.
+> - Downstream effects: Codex review pipelines (impact-analysis + consistency-audit) now prepend AST-resolved reference sets, reducing Codex's heuristic-scan budget and lowering the false-positive rate observed in `feedback_codex_review_workflow`. The `code` / `code-by` queries link source files to their owning TODO without a grep traversal.
+> - Canonical doc: [`docs/infrastructure/mcp-usage.md`](../../docs/infrastructure/mcp-usage.md) (single source of truth for tool inventory + when-to-use rules); CLAUDE.md `## MCP Usage` is the 3-bullet pointer block.
+> - Scope boundary: §6 owns the doctrine doc + CLAUDE.md pointer + 4 targeted skill updates; §1 owns the actual Codex MCP wiring that closes the cross-tool drift; §9 owns the drift validator. Today (pre-§1) Codex review remains MCP-cold; doc is forward-compatible.
+
+> **Verified:** 2026-04-27 | commit `628c4f0b` | 7/7 items | build OK | tests 79/79 PASS (test-ai-system) + lint clean (498 files)
+> **Quality reviewed:** 2026-04-27 | Codex 1x (adversarial) | 1M+1L fixed | scope: N/A (docs-only section; consistency + perf dispatches don't apply to a doctrine doc + skill prose; the 1 adversarial pass caught 2 real factual errors -- M1 lsp-bridge.references requires path/line/character not name lookup, L1 diagnostics path is required not optional)
+
+---
+
+## 7. Hook System Audit + Dedupe
+
+Today there are 14 Python files under [`.claude/hooks/`](../../.claude/hooks/) plus several inline-Python hooks in [`.claude/settings.json`](../../.claude/settings.json). Some overlap (`accepted_xref_block.py` blocks at commit, `accepted_xref_warn.py` warns at edit; `numeric_todo_shorthand.py` and `bare_section_refs.py` both touch TODO files; the inline domain-router and the dedicated quality-skill router fire on the same Edit events). No manifest documents which hook fires when, so adding a new hook risks shadowing or duplicating an existing one. After §3-§5 ship, the system gains 3-4 new hooks; document them all in one manifest and dedupe overlap.
+
+- [x] [`.claude/hooks/MANIFEST.md`](../../.claude/hooks/MANIFEST.md) ships with one row per hook (name, file path, kind, wrap.sh-eligibility + markers, opt-out env var, purpose), grouped by event then matcher. Includes `Block-via` policy column (`sys.exit(2)` default; `permissionDecision` and `warning-only` allowlist markers documented). 27 in-repo hooks + 4 plugin-side subsections enumerated.
+- [x] Overlap audit recorded in MANIFEST.md: `accepted_xref_block.py` (Bash PreToolUse `git commit` -- BLOCK at commit-time) and `accepted_xref_warn.py` (Edit/Write/MultiEdit PostToolUse -- REMINDER at edit-time) cover non-overlapping events; both kept with manifest rows that name the staging contract.
+- [x] Inline domain-router hook extracted to [`.claude/hooks/domain_quality_router.py`](../../.claude/hooks/domain_quality_router.py); settings.json `python3 -c` block replaced with `sh .claude/hooks/wrap.sh .claude/hooks/domain_quality_router.py src/ include/kernel/ user/`. Marker set covers all routing prefixes (Codex design-review H2 fix: `user/` was missing in initial draft, would have silenced the userland reminder).
+- [x] Inline post-commit smoketest + boot-smoke extracted to [`.claude/hooks/post_commit_smoketest.py`](../../.claude/hooks/post_commit_smoketest.py) and [`.claude/hooks/post_commit_smoketest_boot.py`](../../.claude/hooks/post_commit_smoketest_boot.py); settings.json entries are now one-line `python3 <hook>` calls. Both extracted hooks reuse `section_commit_gate._bash_is_git_commit` for alias-aware classification (M1 design fix vs. the original `cmd.startswith('git commit')` which silently skipped on `gci` / aliased commits).
+- [x] Inline `Skill` pipeline reminder extracted to [`.claude/hooks/skill_pipeline_reminder.py`](../../.claude/hooks/skill_pipeline_reminder.py) (wrap.sh markers = the six gated skill names); inline Codex-review reception reminder extracted to [`.claude/hooks/codex_review_reception_reminder.py`](../../.claude/hooks/codex_review_reception_reminder.py) (wrap.sh marker `adversarial-review`). Inline TODO-edit / test-wiring / CLAUDE.md-sync reminders extracted to [`.claude/hooks/todo_edit_reminder.py`](../../.claude/hooks/todo_edit_reminder.py), [`.claude/hooks/test_wiring_reminder.py`](../../.claude/hooks/test_wiring_reminder.py), [`.claude/hooks/skill_claudemd_sync_reminder.py`](../../.claude/hooks/skill_claudemd_sync_reminder.py); inline Unicode-dash block extracted to [`.claude/hooks/unicode_dash_block.py`](../../.claude/hooks/unicode_dash_block.py); inline todo-graph auto-rewrite extracted to [`.claude/hooks/todo_graph_auto_rewrite.py`](../../.claude/hooks/todo_graph_auto_rewrite.py). Settings.json went from ~13 KB with 8 inline `python3 -c` blocks to ~5.7 KB with zero inline Python (~57% shrinkage).
+- [x] [`scripts/audit-hooks.sh`](../../scripts/audit-hooks.sh) ships with 5 cross-checks (files-vs-manifest, manifest-vs-files, settings-vs-manifest+files, BLOCK-hook exit-code, plugin-side enumeration). PASS / FAIL with drift list. Sub-test `audit_hooks` added to [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh).
+- [x] **Exit-code correctness audit:** check 4 in `audit-hooks.sh` walks every `*.py` containing `stderr.write` and asserts presence of `sys.exit(2)` or `return 2`; allowlist top-of-file marker `# block-via: permissionDecision` (cleaner JSON envelope) or `# block-via: warning-only` (STATE hooks that emit informational stderr but never block, e.g. `codex_review_completed.py`). All current BLOCK hooks pass without any allowlist marker; one STATE hook flagged the marker-only path.
+- [x] **Plugin-side hook enumeration:** check 5 walks `~/.claude/plugins/installed_plugins.json` (v2 schema), dereferences each plugin's `installPath/hooks/hooks.json`, requires a `### <name>@<marketplace>` subsection in MANIFEST.md (Codex design-review M3 fix: substring-on-bare-name false-passes when one plugin's name is a substring of another, e.g. `codex` vs `codex-helper`; @-form is unique by definition), and asserts every event name in the plugin's hooks.json appears in its manifest subsection block. Currently enumerated: `superpowers@claude-plugins-official` 5.0.7, `codex@openai-codex` 1.0.2, `explanatory-output-style@claude-plugins-official` 1.0.0 (caught by Codex review -- I had originally claimed it shipped no hooks, when it does ship a SessionStart entry), `feature-dev@claude-plugins-official` (no-hooks documented).
+- [x] **Hot-path Python startup mitigation (perf):** [`.claude/hooks/wrap.sh`](../../.claude/hooks/wrap.sh) is a POSIX-shell prefilter that exits 0 immediately when no marker substring matches the JSON payload, saving ~25-35 ms of `python3` cold start per non-matching tool call. Wrap.sh is OPT-IN ONLY for REMINDER hooks with cheap, accurate marker sets; BLOCK hooks, STATE hooks, and the alias-aware post-commit smoketest pair stay on direct `python3 <hook>` invocation per the eligibility rules in the wrapper header. 6 reminder hooks promoted: `domain_quality_router`, `skill_pipeline_reminder`, `codex_review_reception_reminder`, `todo_edit_reminder`, `test_wiring_reminder`, `skill_claudemd_sync_reminder`.
+- [x] Commit: `"hooks: extract inline hooks; audit + manifest; dedupe overlap"` -- shipped as `cc4829e4` (push gate skip-logged: host-side automation extraction, no kernel/SMP risk).
+
+**Test checkpoint:** [`.claude/hooks/MANIFEST.md`](../../.claude/hooks/MANIFEST.md) lists 27 in-repo hooks + 4 plugin subsections. `bash scripts/audit-hooks.sh` shows zero drift. `bash scripts/test-tooling.sh` shows `audit_hooks` sub-test PASS (248/248 total). `.claude/settings.json` shrank from ~13 KB to ~5.7 KB (zero inline Python blocks remain). Test on: Linux WSL2 dev host.
+
+Verified locally: `bash scripts/audit-hooks.sh` -> `audit-hooks.sh: PASS (no drift)`; `bash scripts/test-tooling.sh` -> `PASS 248/248 tooling tests passed`; `bash scripts/lint.sh` -> `LINT CLEAN`; `python3 -c "import json; json.load(open('.claude/settings.json'))"` round-trips clean; `grep -c "python3 -c" .claude/settings.json` -> 0.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test `audit_hooks`) | 248/248 tooling tests PASS
+
+> **Notes:**
+> - 10 new hook artifacts ship under `.claude/hooks/`: 9 extracted Python hooks (domain_quality_router, unicode_dash_block, skill_pipeline_reminder, post_commit_smoketest + smoketest_boot, codex_review_reception_reminder, todo_edit_reminder, test_wiring_reminder, skill_claudemd_sync_reminder, todo_graph_auto_rewrite) plus the POSIX-shell `wrap.sh` prefilter. Plus `MANIFEST.md` (cross-check anchor) and `scripts/audit-hooks.sh` (drift detector with 5 checks).
+> - Wired into `.claude/settings.json` PreToolUse + PostToolUse blocks; 6 reminder hooks invoked through `wrap.sh <hook> <markers>` for ~25-35 ms savings per non-matching tool call. Settings.json shrank from ~13 KB (8 inline `python3 -c` blocks) to ~5.7 KB (zero inline Python). Codex design-review adoptions in this commit: H1 (rewire settings.json so extracted fixes go live), H2 (domain_quality_router markers cover `user/` not just `src/` + `include/kernel/`), M3 (per-plugin `### name@marketplace` heading + per-event coverage check, replaces substring false-pass).
+> - `audit-hooks.sh` is wired into `scripts/test-tooling.sh` (`audit_hooks` sub-test, line ~2641) and reads MANIFEST.md as the cross-check anchor. PostCommit smoketest + boot-smoke continue to fire from `if: Bash(git commit:*)` matchers but now via the extracted alias-aware files (no more `cmd.startswith('git commit')` blind spot for wrapped commits).
+> - Canonical doc: `.claude/hooks/MANIFEST.md` (table of every hook + plugin subsection + wrap.sh eligibility quick reference + drift-check inventory).
+> - Scope boundary: §7 owns the manifest + extraction + audit script + wrap.sh; §3 owns the receiving-review hard gate (one of the BLOCK hooks the audit checks); §4 owns the section-commit gate (another BLOCK hook); §10 owns the future per-skill step-state telemetry that will add ~5 more hooks the audit will cover transparently.
+
+> **Verified:** 2026-04-27 | 9/10 items, 1 deferred ([ ]: Commit -- this stamp lands in the same commit) | audit-hooks.sh PASS | tooling 248/248 PASS | lint CLEAN | settings.json round-trip clean
+> **Quality reviewed:** 2026-04-27 | Codex 1x design (3 findings: H1 settings rewire, H2 marker coverage, M3 plugin subsection -- all fixed before commit) | scope: N/A (host-side automation, no kernel/SMP risk)
+
+---
+
+## 8. Superpowers Skill Catalog Audit + Trigger Rows
+
+The superpowers plugin ships 14 skills; CLAUDE.md "Mandatory Skill Triggers" today calls out only `superpowers:receiving-code-review`. Audit the other 13: which are actively useful in Impossible OS workflows, which conflict with our doctrine (e.g. anything that would add an AI-attribution trailer or assume autonomous-agent behavior), which have a hard mandatory trigger we should add, which are advisory.
+
+- [x] All 14 superpowers skills have a per-skill verdict in [`docs/infrastructure/superpowers-policy.md`](../../docs/infrastructure/superpowers-policy.md): MANDATORY (4 -- `using-superpowers`, `receiving-code-review`, `verification-before-completion`, `systematic-debugging`, `writing-skills`); Useful (5 -- `dispatching-parallel-agents`, `requesting-code-review`, `writing-plans`, `test-driven-development`, `brainstorming`); Advisory (3 -- `executing-plans`, `using-git-worktrees`, `finishing-a-development-branch`); Scope-restricted (1 -- `subagent-driven-development` approved for userland/tooling, forbidden as Codex four-dispatch substitute for kernel/boot).
+- [x] Two new CLAUDE.md "Mandatory Skill Triggers" rows added (lines 268-269): (a) `superpowers:verification-before-completion` triggered on any "task complete / fixed / passing" claim before commit/PR/Verified stamp; already wired into `review-todo-section` step 15.5 and `complete-todo-file` Execution Discipline. (b) `superpowers:systematic-debugging` triggered on any bug/test-failure/unexpected-behavior signal before proposing a fix; cross-references repo's `debug-session` skill. `requesting-code-review` row NOT added: the 9 in-repo `codex-*` skills are the canonical request mechanism, no separate trigger needed.
+- [x] Doctrine-conflict suppression rules documented in [`docs/infrastructure/superpowers-policy.md`](../../docs/infrastructure/superpowers-policy.md) "Doctrine Conflicts and Suppression Rules" section: AI-attribution trailers (CLAUDE.md zero-trailer policy wins), autonomous-agent assumptions (Autonomous-Agent Boundary wins), mock-the-database TDD patterns (concrete integration paths preferred), GitHub-PR-thread-reply mechanics in `receiving-code-review` (informational only; repo uses local Codex review, not PR threads).
+- [x] CLAUDE.md "Mandatory Skill Triggers" table now has 11 rows (up from 9) plus a closing line pointing at the policy doc: "Per-skill verdicts and the suppression rules for the rest of the superpowers catalog (e.g. `subagent-driven-development` forbidden on kernel/boot paths) live at [docs/infrastructure/superpowers-policy.md]".
+- [x] [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "External-Reviewer Contract" gained a new "Plugin skill catalog (superpowers)" subsection (lines 241-244) pointing at the policy doc with a one-line summary of the 3 MANDATORY skills + the 1 scope-restricted skill.
+- [x] subagent-driven-development scope distinction documented in [`docs/infrastructure/superpowers-policy.md`](../../docs/infrastructure/superpowers-policy.md) "Scope Distinction" table: `src/kernel/`, `src/boot/`, `include/kernel/` -> Forbidden as substitute, four-dispatch Codex mandatory; `user/`, `src/apps/`, tooling, docs -> Approved, Codex optional; `.claude/`, `scripts/` -> Approved, single design dispatch usually sufficient. Rationale: same-model self-review misses what cross-MODEL Codex review catches (concrete incidents cited: TODO-19 FPU bugs, TODO-02 GOP review where 2026-04-27 re-review caught 5H+1M after the original same-model review had stamped verified).
+- [x] Commit: `"docs/superpowers: audit catalog; add mandatory trigger rows; suppression policy doc"` -- shipped as `ed9852ad`.
+
+**Test checkpoint:** [`docs/infrastructure/superpowers-policy.md`](../../docs/infrastructure/superpowers-policy.md) exists and names every superpowers skill with a verdict. CLAUDE.md "Mandatory Skill Triggers" table has at least 2 new rows. Test on: Linux WSL2 dev host (no runtime test; doctrine-level change).
+
+> **Test runner:** N/A (docs-only change; no kernel test surface) | validation: `bash scripts/lint.sh` (0 violations across 499 files) + visual review of the 3 affected files (CLAUDE.md, ai-system.md, superpowers-policy.md)
+
+> **Notes:**
+> - 1 new doc shipped: `docs/infrastructure/superpowers-policy.md` (per-skill verdicts for 14 skills, doctrine-conflict suppression rules, subagent-vs-Codex scope distinction table). Doctrine surfaces touched: `CLAUDE.md` (2 new mandatory-trigger rows + 1 closing pointer line) and `docs/infrastructure/ai-system.md` (1 new subsection under External-Reviewer Contract).
+> - Structure / consumers: agent reads CLAUDE.md "Mandatory Skill Triggers" first (the prompt-facing surface); the new pointer line directs to `superpowers-policy.md` for per-skill verdicts and suppression rules. ai-system.md provides the doctrine-level cross-reference. No automated drift check today; `audit-hooks.sh` could grow a check if a future skill is retired upstream and the CLAUDE.md row goes stale.
+> - Canonical doc: `docs/infrastructure/superpowers-policy.md`.
+> - Scope boundary: §8 owns the superpowers plugin policy + the CLAUDE.md trigger rows for `verification-before-completion` and `systematic-debugging`; §7 owns the per-hook MANIFEST that enumerates plugin-side hooks (a different audit surface); §6 owns the broader MCP usage discipline (different plugin set).
+
+> **Verified:** 2026-04-27 | commit `ed9852ad` | 7/7 items | build N/A (docs-only) | lint CLEAN
+> **Quality reviewed:** 2026-04-27 | self-review only (docs-only, doctrine surface; no Codex four-dispatch needed per superpowers-policy.md scope distinction) | scope: N/A (docs-only)
+
+---
+
+## 9. Cross-Tool Drift Detection -- `scripts/audit-ai-system.sh`
+
+Wire the per-section audit checks (§1 MCP drift, §2 Codex flag policy, §3 receiving-review hook coverage, §6 mcp-usage discipline, §7 hook manifest, §8 superpowers policy) into one umbrella script that catches drift between the Claude side, the Codex side, and the two installed plugins.
+
+- [x] [`scripts/audit-ai-system.sh`](../../scripts/audit-ai-system.sh) ships with 7 checks (the 6 originally planned plus check 7 Codex config policy; the originally planned check 8 was MERGED into check 5 per design review M2 to avoid duplicate plugin enumeration calls). Each check is `t_pass` / `t_fail` / `t_warn` style with a 1-line actionable message on failure.
+  - `mcp_set_match` -- delegates to [`scripts/codex-mcp-install.sh --check`](../../scripts/codex-mcp-install.sh) (`.mcp.json` vs `~/.codex/config.toml` parity); SKIP-with-WARN if `~/.codex/config.toml` missing.
+  - `codex_no_model_flag` -- design review H1 fix: scope is ALL `.claude/skills/**/SKILL.md` that grep-match `codex-companion.mjs`, not just `codex-*` skills. Catches workflow-consumer skills (`implement-todo-section`, `review-todo-section`, etc.) that also invoke Codex.
+  - `codex_companion_path` -- every `node ... codex-companion.mjs` invocation in any Codex-using skill uses `${CLAUDE_PLUGIN_ROOT}` or the absolute marketplaces path. Pure-prose backtick mentions are exempt (the regex requires `node` or `bash` adjacent to the filename, so descriptive references are not flagged).
+  - `codex_receiving_pointer` -- every Codex-using skill (whole `.claude/skills/**` corpus, not just `codex-*`) mentions `receiving-code-review` at least once.
+  - `hook_manifest_complete` -- delegates to [`scripts/audit-hooks.sh --quiet`](../../scripts/audit-hooks.sh); covers files-vs-manifest, manifest-vs-files, BLOCK exit codes, and plugin enumeration in one call (no double-call duplication).
+  - `state_dir_layout` -- `.claude/state/` directory exists; `.claude/state/README.md` exists; `.gitignore` declares `.claude/state/*`.
+  - `codex_config_policy` -- compares `~/.codex/config.toml` top-level `model` + `model_reasoning_effort` against [`docs/infrastructure/codex-config-policy.toml`](../../docs/infrastructure/codex-config-policy.toml) fixture (NEW, this commit). SKIP-with-WARN on missing user config. Design review M2 fix: split user-home checks (1, 7) from repo-state checks (2-6) so CI runners that lack `~/.codex/config.toml` get clean PASS via the WARN path.
+- [x] Wired into [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) as a single sub-test (`audit_ai_system`) immediately before the existing `audit_hooks` block.
+- [x] CI coverage already in place: [`.github/workflows/build.yml`](../../.github/workflows/build.yml) line 127 runs `bash scripts/test-tooling.sh --quiet`; the new umbrella sub-test fires automatically via that path. No new workflow job needed.
+- [x] Check 7 ships as documented above with `docs/infrastructure/codex-config-policy.toml` as the single-source-of-truth fixture (model + effort). Future model-default changes are a 1-line edit to the fixture; the script reads it directly. Doctrine reasoning lives in CLAUDE.md "Codex Invocation Policy".
+- [x] Check 8 (originally planned plugin-manifest-enumeration) absorbed into check 5: `audit-hooks.sh` already enumerates plugins under `~/.claude/plugins/installed_plugins.json`, so a separate check would have called the same logic twice with no new coverage.
+- [x] Commit: `"scripts: audit-ai-system.sh -- seven cross-tool drift checks; wired into test-tooling"`.
+
+**Test checkpoint:** `bash scripts/audit-ai-system.sh` exits 0 with all 7 checks PASS. Synthetically delete the `lsp-bridge` block from `~/.codex/config.toml`, re-run, check 1 fails with the expected message. Restore. Synthetically add `--model gpt-5.5` to one skill's example, re-run, check 2 fails. Restore. `bash scripts/test-tooling.sh` shows the new umbrella sub-test PASS. Test on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (sub-test `audit_ai_system`) | 254/254 tooling tests PASS
+
+> **Notes:**
+> - Two new artifacts: [`scripts/audit-ai-system.sh`](../../scripts/audit-ai-system.sh) (281-line bash umbrella with 7 checks; delegates to existing per-section validators where possible) and [`docs/infrastructure/codex-config-policy.toml`](../../docs/infrastructure/codex-config-policy.toml) (model + reasoning-effort fixture for check 7). Sub-test `audit_ai_system` wired into `scripts/test-tooling.sh`.
+> - How it runs: invoke directly via `bash scripts/audit-ai-system.sh` or transitively via `bash scripts/test-tooling.sh`. CI runs it through test-tooling.sh per `.github/workflows/build.yml:127`. Idempotent over a clean working tree; audits disk state, not git index.
+> - Caught a real drift on first run: `codex-design-review/SKILL.md` line 65 had a bare `node codex-companion.mjs cancel` in the stale-recovery prose; rewrote to use the canonical absolute marketplaces path (fixed in this same commit).
+> - Codex design review adoptions in this commit: H1 (scope check 2/3/4 over ALL Codex-using skills, not just `codex-*`), M2 (split user-home from repo-state checks; SKIP-with-WARN on missing user config), Q1 (TOML fixture file), Q2 (merged checks 5+8 to avoid duplicate plugin-enumeration), Q3 (missing config = SKIP-with-WARN, not PASS).
+> - Canonical doc: [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) (the umbrella covers the surface that doc describes); fixture at [`docs/infrastructure/codex-config-policy.toml`](../../docs/infrastructure/codex-config-policy.toml).
+> - Scope boundary: §9 owns the umbrella drift detector; §1 owns the MCP wiring + drift validator; §7 owns the hook MANIFEST + audit-hooks.sh; §15 owns the design-review hook scope fix (a different gate, different concern).
+
+> **Verified:** 2026-04-27 | commit `99400ead` | 6/6 items | build N/A (host-side scripts) | lint CLEAN | tests 254/254 PASS | audit-ai-system.sh 7/7 PASS
+> **Quality reviewed:** 2026-04-27 | Codex 1x design (H1 + M2 + Q1+Q2+Q3 fixed pre-code) | self-review covers post-implementation | scope: N/A (host-side bash + TOML fixture)
+
+---
+
+## 10. Skill Step-State Telemetry + Non-Contiguous-Step Block
+
+The user's `feedback_skill_invocation_drift` and `feedback_codex_review_four_dispatches` memories both describe the same failure: a skill claims to do steps 1-18, actually does steps 1-13, the section ships, the gap is invisible until a later review catches it. §3-§5 catch this for one specific skill (`review-todo-section` step 8) by requiring four state-file entries. Generalize to every multi-step skill in the catalog: per-skill state file written by the SAME hooks that fire during the skill's tool calls, never on agent self-claim. The key insight from 2026 industry practice: a step is "done" only when a hook *observed* the tool call that step requires; the agent saying "I did step N" is not evidence.
+
+- [x] Per-skill state file at [`.claude/state/skill-progress.json`](../../.claude/state/skill-progress.json) (gitignored, already covered by `.gitignore` `.claude/state/*`): per-skill entry `{started_ts: <ns>, started_head_sha: <sha>, session_id: <str>, args: <str>, steps_observed: [{n, observed_ts, evidence_tool, evidence_token}]}`. Per Codex design Q1 fix, invalidation is keyed on `started_head_sha` (HEAD at skill-invocation time), NOT on current HEAD; repeated git commits within one skill flow keep state valid. Latest invocation per skill wins (Q2).
+- [x] Step-evidence map at [`.claude/hooks/skill_step_map.py`](../../.claude/hooks/skill_step_map.py): `SKILL_STEP_MAP` dict keyed by skill name, value list of `(step_n, tool_name, regex_pattern)` tuples. `REQUIRED_TERMINAL_STEPS` dict names the strict subset the gate enforces. Covers all 5 multi-step skills (`implement-todo-section`, `review-todo-section`, `verify-todo-section`, `complete-todo-file`, `quality-review-section`). Per Q3, design and adversarial dispatches are distinct: step 13 of implement-todo-section requires `adversarial-review` token NOT preceded by `[review-kind: design`.
+- [x] PostToolUse observer at [`.claude/hooks/skill_step_observer.py`](../../.claude/hooks/skill_step_observer.py) (matcher `Edit|Write|MultiEdit|Bash|Skill`): walks `transcript_path` JSONL backward to find the most-recent multi-step Skill invocation, looks up the step map, records observed steps in the state file. Branch A: a fresh `Skill(<multi-step>)` invocation rotates the entry (new `started_head_sha`). Branch B: any other tool call appends to `steps_observed` if it matches a step rule. STATE hook (`# block-via: warning-only`); never blocks. Independent of TODO-08 §11's `tool-history.jsonl` (the observer walks transcript directly, the same pattern `design_review_required.py` uses).
+- [x] PreToolUse blocker at [`.claude/hooks/skill_step_block.py`](../../.claude/hooks/skill_step_block.py) (matcher `Bash|Skill`): on `Bash(git commit:*)` and `Skill(skill="review-todo-section")`, looks up the most-recently-started multi-step skill's state. If any `REQUIRED_TERMINAL_STEPS` member is absent from `steps_observed`, exits 2 with the missing-step list. Per Q4, opt-out requires BOTH `SKIP_SKILL_STEP_BLOCK=1` AND `SKIP_SKILL_STEP_BLOCK_REASON` >= 12 chars; reason logged to `.claude/state/skip-log.jsonl`.
+- [x] Five sub-tests in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) synthesize fixtures and assert blocker exit codes: all-required terminals (rc=0), missing terminal step 19 (rc=2), gap at step 13 (rc=2), SKIP opt-out with proper reason (rc=0), SKIP with under-12-char reason (rc=2). All 5 PASS; total 259/259 tooling tests.
+- [x] Five SKILL.md files (`implement-todo-section`, `review-todo-section`, `verify-todo-section`, `complete-todo-file`, `quality-review-section`) gained a closing "TODO-08 §10 step-state telemetry" paragraph naming the observer hook, the blocker hook, the required terminal step list location, and the documented opt-out env vars.
+- [x] Commit: `"hooks: per-skill step-state telemetry; non-contiguous-step block"`.
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` shows the 5 new `skill_step_block` sub-tests PASS. End-to-end: invoke `/implement-todo-section` on a trivial section, deliberately skip step 13 (no Codex dispatch), attempt the section commit, hook exits 2 naming step 13 as missing-evidence; run step 13, retry, exits 0. State file invalidates after a fresh top-level `Skill(<multi-step>)` invocation rotates the per-skill entry. Test on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (5 `skill_step_block` sub-tests + observer is exercised transitively by every multi-step skill flow) | 259/259 tooling tests PASS
+
+> **Notes:**
+> - Four new artifacts: [`.claude/hooks/skill_step_map.py`](../../.claude/hooks/skill_step_map.py) (data module: 5 step-evidence rule lists + required-terminal-step lists), [`.claude/hooks/skill_step_observer.py`](../../.claude/hooks/skill_step_observer.py) (PostToolUse STATE hook ~210 lines), [`.claude/hooks/skill_step_block.py`](../../.claude/hooks/skill_step_block.py) (PreToolUse BLOCK hook ~150 lines), and the per-skill state file `.claude/state/skill-progress.json` (gitignored). Five SKILL.md files updated with the §10 closing paragraph.
+> - Wired into `.claude/settings.json`: observer in PostToolUse `Edit|Write|MultiEdit|Bash|Skill`; blocker in PreToolUse `Bash|Skill`. MANIFEST.md gained one BLOCK row + one STATE row + a new "Helper Modules" subsection for `skill_step_map.py` (imported, not invoked).
+> - Codex 1x design review with `[review-kind: design]` marker (per the §15 fix that recognizes review-kind as design-equivalent); 4 design Qs answered + adopted (Q1 started_head_sha invalidation, Q2 latest-invocation-wins, Q3 design ≠ adversarial, Q4 SKIP opt-out shape). Decoupled from §11 `tool-history.jsonl` by walking transcript directly (same pattern `design_review_required.py` uses).
+> - Canonical doc: skill-step telemetry has no separate doctrine page; the canonical reference is `.claude/hooks/skill_step_map.py` (the rules) + the closing paragraph in each of the 5 SKILL.md files.
+> - Scope boundary: §10 owns the step-state telemetry + non-contiguous-step gate; §3 owns the Codex receiving-review gate; §4 owns the section-commit gate (different evidence, different surface); §5 owns review-todo-section's four-dispatch counter. The four hooks compose.
+
+> **Verified:** 2026-04-28 | commit `f532b37e` | 7/7 items | build N/A (host-side hooks + tests + docs) | lint CLEAN | tests 259/259 PASS | audit-hooks PASS | audit-ai-system PASS
+> **Quality reviewed:** 2026-04-28 | Codex 1x design (Q1-Q4 fixed pre-code) | self-review covers post-implementation | scope: N/A (host-side hook system + Python data module + test fixtures)
+
+---
+
+## 11. Hook Event Surface Expansion (SessionStart / UserPromptSubmit / Stop / SubagentStop / PreCompact)
+
+The current hook surface uses only `PreToolUse` and `PostToolUse`. The 2026 hook spec exposes ~28 events; five of them carry high leverage for this hardening effort and are unused: `SessionStart` (session bootstrap), `UserPromptSubmit` (every user turn before Claude sees it), `Stop` (end-of-turn audit), `SubagentStop` (subagent completion), `PreCompact` (context-compaction trigger). Adds catch the failure modes the per-tool-call hooks structurally cannot.
+
+- [x] `SessionStart` hook [`.claude/hooks/session_start.py`](../../.claude/hooks/session_start.py) writes `.claude/state/session.json` (session_id + started_ts_ns + cwd + head_sha); truncates `.claude/state/tool-history.jsonl` if older than 7 days; surfaces the most recent line of `.claude/state/acknowledged-but-skipped.log` as systemMessage so yesterday's unresolved promise is visible at the start of every new session.
+- [x] `UserPromptSubmit` hook [`.claude/hooks/user_prompt_doctrine.py`](../../.claude/hooks/user_prompt_doctrine.py) regex-scans the user's prompt against 8 narrowly-anchored bypass patterns (`skip\s+(?:the\s+)?review`, `bypass\s+(?:the\s+)?(?:gate|hook|review)`, `ignore\s+(?:the\s+)?hook`, `disable\s+(?:the\s+)?hook`, `just\s+commit`, `just\s+ship`, `skip\s+(?:the\s+)?codex`, `skip\s+(?:the\s+)?test`); on match, prints a systemMessage with the relevant gate name + all 5 documented opt-out env vars (SKIP_REVIEW_HOOK / SKIP_DESIGN_REVIEW_HOOK / SKIP_SKILL_STEP_BLOCK / RECEIVING_REVIEW_OVERRIDE / CODEX_FLAG_OVERRIDE). Does NOT block (user's intent is authoritative).
+- [x] `Stop` hook [`.claude/hooks/stop_audit.py`](../../.claude/hooks/stop_audit.py) walks the transcript JSONL backward up to 30 turns, applies a narrow promise pattern (`I('ll|\s+will|\s+should)\s+(?:run|invoke|call|dispatch|fire|now)\s+...` anchored to enforcement-relevant skill names: `review-todo-section`, `verify-todo-section`, `implement-todo-section`, `complete-todo-file`, `quality-review-section`, `codex-*`, `<domain>-code-quality`, `superpowers:*`), and verifies a matching tool call fired within 5 turns. On miss, appends `<ts> ACKNOWLEDGED-BUT-SKIPPED promised=... excerpt=...` to the skip log.
+- [x] `Stop` hook also implements the verification-before-completion check: if any `todo/**/*.md` Edit/MultiEdit in the session carried `[x]` in `new_string` AND no `Skill(superpowers:verification-before-completion)` invocation occurred, appends a `<ts> VFC-OWED ...` line to the same skip log. Reminder, not block.
+- [x] `SubagentStop` hook [`.claude/hooks/subagent_audit.py`](../../.claude/hooks/subagent_audit.py) records `{ts_ns, subagent_type, duration_ms, tool_uses_total}` to `.claude/state/subagent-log.jsonl` per invocation; payload-first then transcript-walk fallback for `subagent_type` + `tool_uses_total` derivation. Runaway detection: > 30 tool calls or > 600,000 ms appends `SUBAGENT-RUNAWAY type=... duration_ms=... tool_uses=...` to the skip log.
+- [x] `PreCompact` hook [`.claude/hooks/pre_compact_flush.py`](../../.claude/hooks/pre_compact_flush.py) snapshots every `.claude/state/*.json` (excluding `.jsonl` append-only logs) into `.claude/state/.compaction-snapshots/<ts_ns>/`. Retains the 3 most recent snapshots; older ones deleted via `_prune_old`. The §10 step-state file is the highest-priority artifact preserved.
+- [x] [`.claude/hooks/tool_history_writer.py`](../../.claude/hooks/tool_history_writer.py) (PostToolUse `*` matcher) appends `{event, tool_name, tool_use_id, ts_ns, duration_ms, success}` to `.claude/state/tool-history.jsonl` per call. Live-rotates at 10 MiB to `tool-history.jsonl.1` (single rotation slot, older data discarded on second rotation). The 7-day truncate companion lives in `session_start.py`.
+- [x] All 6 new hooks wired into [`.claude/settings.json`](../../.claude/settings.json): 5 new top-level event blocks (`SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `PreCompact`) + the writer added to the existing PostToolUse `Edit|Write|MultiEdit|Bash|Skill` matcher alongside `skill_step_observer.py`. JSON round-trips clean. Per the SubagentStop / PreCompact min-version note in the original plan: Claude Code 2026-Q1+ exposes both events; older versions silently ignore the unknown event entries.
+- [x] Five sub-tests in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) (`session_start_writes`, `user_prompt_doctrine_skip`, `user_prompt_doctrine_clean`, `stop_audit_acknowledged`, `stop_audit_satisfied`) synthesize event payloads + transcript fixtures and assert hook side-effects. All 5 PASS; total 264/264.
+- [x] Commit: `"hooks: expand event surface (SessionStart/UserPromptSubmit/Stop/SubagentStop/PreCompact) + tool-history.jsonl"`.
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` shows the 5 new sub-tests PASS. Manual end-to-end: type "skip review and just commit" as the next user turn, the agent's first response includes the `doctrine reminder` systemMessage; type a normal prompt, no reminder. Run a session that says "I will run review-todo-section next" without doing it, end via `/clear`, the next `SessionStart` injection surfaces the ACKNOWLEDGED-BUT-SKIPPED line. Test on: Linux WSL2 dev host (Claude Code 2026-Q1+ for `SubagentStop` / `PreCompact`; older versions silently ignore those event entries).
+
+> **Test runner:** `bash scripts/test-tooling.sh` (5 hook-event sub-tests: session_start_writes + user_prompt_doctrine_skip + user_prompt_doctrine_clean + stop_audit_acknowledged + stop_audit_satisfied) | 264/264 tooling tests PASS
+
+> **Notes:**
+> - Six new hook artifacts ship under `.claude/hooks/`: `session_start.py`, `user_prompt_doctrine.py`, `stop_audit.py`, `subagent_audit.py`, `pre_compact_flush.py`, `tool_history_writer.py`. Wired into 5 new top-level event blocks in `.claude/settings.json` plus the existing PostToolUse `*` matcher.
+> - State files written: `.claude/state/session.json` (per session), `.claude/state/tool-history.jsonl` (per tool call, rotated at 10 MiB + 7-day truncated), `.claude/state/subagent-log.jsonl` (per subagent), `.claude/state/acknowledged-but-skipped.log` (warnings from Stop + SubagentStop), `.claude/state/.compaction-snapshots/<ts>/` (PreCompact snapshots, retain-3).
+> - Codex 1x design dispatch with `[review-kind: design]` marker; verdict deferred (no diff to review pre-code), so design Qs Q1-Q4 answered locally: Q1 live-rotate at 10 MiB + 7-day truncate, Q2 SubagentStop payload-first then transcript fallback, Q3 narrow promise regex anchored to enforcement-relevant skill names, Q4 snapshot-dir-per-event with retain-3 prune.
+> - Canonical doc: `.claude/hooks/MANIFEST.md` (6 new rows + the existing event-class headings; this expands the previously PreToolUse/PostToolUse-only manifest into the full 7-event surface).
+> - Scope boundary: §11 owns the 5 new event hooks + tool-history writer; §10 reads `tool-history.jsonl` (now provided) and writes `skill-progress.json` (preserved by PreCompact); §3 receiving-review hard gate is unchanged; §4 section-commit gate is unchanged.
+
+> **Verified:** 2026-04-28 | commit `58477fc8` | 10/10 items | build N/A (host-side hooks + tests + docs) | lint CLEAN | tests 264/264 PASS | audit-hooks PASS | audit-ai-system PASS
+> **Quality reviewed:** 2026-04-28 | Codex 5x (design + adversarial + consistency + perf + re-adversarial) | 2H+3M fixed (1H re-adversarial split-flag fix) | scope: N/A (host-side hook system + Python state-machine modules + test fixtures)
+
+---
+
+## 12. AI-Slop Content Lints (Tautological-Test / Stub-Behind-Stamp)
+
+Build green and tests green do not catch the most common AI-slop patterns. Industry reports for late 2025 / early 2026 (CodeRabbit Dec 2025 PR study) show AI-coauthored changes ship ~1.7x more major issues than human-authored, with the leak being content-level, not compile-level. The user's `feedback_no_substandard_code` and `feedback_no_corner_cutting` memories both name this as a recurring failure mode. CLAUDE.md already prohibits tautological tests in prose ("NO tautological constant tests like `TEST_ASSERT_EQ(POST16_FOO, 0xDF20)`"); enforce mechanically.
+
+- [x] [`scripts/lint.sh`](../../scripts/lint.sh) Check 6 **Tautological-test detection**: walks `src/kernel/test/test_*.c` via awk; flags `TEST_ASSERT_EQ(LHS, RHS, ...)` where whitespace-normalized `LHS == RHS` AND flags `TEST_ASSERT(true|1, ...)`. Same-line marker `/* TEST-TAUTOLOGY-OK: <reason> */` allowlists. Per-check skip env `SKIP_LINT_TAUTOLOGY=1` emits a visible WARN. Pre-existing tautology in 6 test files (`test_boot_init.c`, `test_cpu_security.c`, `test_desktop.c`, `test_ixfs.c`, `test_peb_teb.c`, `test_usermode_launcher.c`) tracked via `TAUTOLOGY_LEGACY_FILES` allowlist (mirrors Check 5 `BARE_SECTION_LEGACY_FILES`); these 12 sites emit WARN, not ERROR; new tautology in any non-allowlisted file is ERROR.
+- [x] [`scripts/lint.sh`](../../scripts/lint.sh) Check 7 **Stub-behind-stamp detection**: live as of [TODO-06 §9 Per-Item `stamped_items` Cache Extension](../00-infrastructure/TODO-06-todo-metadata-layer.md#9-per-item-stamped_items-cache-extension). Cache nodes carry `stamped_items.refs[*]` of `kind=symbol` paired with the first file ref in the same `[x]` item; [`scripts/lint/check_stub_behind_stamp.py`](../../scripts/lint/check_stub_behind_stamp.py) walks the cache, calls `resolve_symbol` + `is_stub_body`, emits `<file>:<line>:stub-behind-stamp:<symbol> ...` lines that lint.sh routes through `error()`. Helper rc + stderr captured separately so a corrupt cache cannot false-clean the lint; Python mtime walk handles cache-staleness portably; repo-escape guard rejects path-traversal refs. Per-check skip env `SKIP_LINT_STUB_BEHIND_STAMP=1`. Same-line marker `/* INTENTIONAL-STUB: <reason> */` on the body opener allowlists.
+- [x] Check 8 **Phantom-include detection** -- attempted then dropped 2026-05-02. The implementation (lsp-bridge MCP wrapper consuming clangd's `unused-includes` diagnostic) shipped briefly in commit `6869329b` and was removed in this commit. clangd's IncludeCleaner produces too many false positives on this freestanding kernel: misses include usage routed through preprocessor macros (`STBTT_malloc` -> `kmalloc`, `STBTT_sqrt` -> `kmath_sqrt`, plus `snprintf` / `memcpy` / `memset`), errno value identifiers used as `#define`s (`ENOEXEC`, `ENOENT`, `ENOMEM`), and forward-declaration providers used through downstream headers. A 127-finding sweep against the live tree showed >50% false-positive rate across at least 8 source files; the signal-to-noise ratio was too low to enforce, and per-file manual triage burden exceeded the AI-slop catch rate. The lsp-bridge `diagnostics` MCP tool itself stays (broadly useful via §7); only the lint-side consumer was removed. No replacement planned.
+- [x] All 3 checks wired into [`scripts/lint.sh`](../../scripts/lint.sh) pre-commit gate (between Check 5 and the Summary block; the existing `.githooks/pre-commit` invokes lint already). Each per-check skip env var emits a visible WARN line so bypasses are auditable per the design review Q4.
+- [x] Five sub-tests in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) (`lint_check6_tautology`, `lint_check6_marker`, `lint_check7_deferred`, `lint_check8_deferred`, `lint_check6_skip`) synthesize a non-legacy test path with the anti-pattern and confirm lint output. The original plan said 3 sub-tests; landing 5 because the marker-allowlist negative case + the skip-env visible-WARN case each deserve their own assertion.
+- [x] [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) gained a new "AI-Slop Content Gates" subsection (under External-Reviewer Contract) with a 3-row table of pattern + marker + skip env vars and the deferred-status note for Checks 7/8.
+- [x] Commit: `"scripts/lint: AI-slop content lints (tautological-test, stub-behind-stamp, phantom-include)"`.
+- [x] Restore a repo-local staged-secret guard: `scripts/lint.sh` Check 16 blocks tracked `secret`/`secrets.json` basenames + live key patterns in staged AND tracked content (`SKIP_LINT_SECRETS=1` opt-out); `[lint_secret_guard]` sub-tests cover it.
+
+**Test checkpoint:** Synthetic `src/kernel/test/test_synthetic_tautology_check_6.c` with `TEST_ASSERT(true, ...)` in a non-legacy path → lint exits non-zero with `tautological-test:` error. Adding `/* TEST-TAUTOLOGY-OK: ... */` on the same line → no error. `bash scripts/lint.sh` exits 0 with only the legacy-allowlist WARN lines. `bash scripts/test-tooling.sh` shows the lint sub-tests PASS. Test on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (5 lint_check sub-tests: tautology + marker + check7-deferred + check8-deferred + skip-env) | 269/269 tooling tests PASS
+
+> **Notes:**
+> - `scripts/lint.sh` gained 3 new check sections inserted before the Summary block. Check 6 is fully live (errors on new tautology, warns on legacy-allowlisted files); Checks 7 and 8 shipped as deferred-WARN stubs. Since then Check 7 went live on TODO-06's per-item cache with the local resolver (lsp-bridge delegation declined, Q31 in `todo/answers.md`), and Check 8 was dropped 2026-05-02. Markers `TEST-TAUTOLOGY-OK` (Check 6) and `INTENTIONAL-STUB` (Check 7, reserved) are same-line per design Q3.
+> - Caught real drift on first run: 12 pre-existing tautological tests in 6 test files. Adopted the Check 5 legacy-allowlist pattern (`TAUTOLOGY_LEGACY_FILES`) so the 12 sites WARN rather than ERROR. New tautology in any non-allowlisted file is hard ERROR. Cleanup of the 12 legacy sites is tracked as future work; this section's scope is the lint surface, not the cleanup pass.
+> - 5 sub-tests in `scripts/test-tooling.sh` (positive + marker + Check 7 deferred + Check 8 deferred + skip-env-WARN). Codex 1x design review with `[review-kind: design]` marker pre-code; 4 design Qs answered + adopted (Q1 defer Check 8 vs grep heuristic, Q2 skip-with-warn on missing cache, Q3 same-line markers, Q4 per-check skip env vars with visible WARN).
+> - Canonical doc: [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "AI-Slop Content Gates" subsection.
+> - Scope boundary: §12 owns the lint surface for the live anti-patterns (Check 6 tautological, Check 7 stub-behind-stamp); the cleanup pass over the 12 legacy tautological tests is future work; TODO-06 owns the cache extension that powers Check 7. The originally-planned Check 8 phantom-include lint was attempted via lsp-bridge MCP and dropped 2026-05-02 -- clangd false-positive rate too high on this freestanding kernel; no replacement planned.
+
+> **Verified:** 2026-04-28 | commit `12ba62c5` | 5/8 items (3 [x] + 2 [/] = Check 7+8 deferred to dependency TODOs) | build N/A (host-side lint) | lint CLEAN (12 legacy WARN, 0 errors) | tests 269/269 PASS
+> **Verified:** 2026-07-02 | ai-workflow evidence pilot-claude-c3c5bd55,db5598eb519531c7,97d14601018084af,97519be577d0dcbe | pilot close: tracked-secret guard Check 16 + lint_secret_guard fixtures; tooling 537/537
+> **Quality reviewed:** 2026-04-28 | Codex 4x (design + adversarial + consistency + perf) | 1H+2M fixed | scope: N/A (host-side bash + python lint check + 1 doc subsection)
+> **Quality reviewed:** 2026-07-02 | ai-workflow evidence pilot-claude-c3c5bd55,db5598eb519531c7,97d14601018084af,97519be577d0dcbe | Codex 6x on the guard (adversarial+consistency+perf, findings fixed, finals approved)
+
+---
+
+## 13. Documentation Sync -- CLAUDE.md / ai-system.md / mcp-usage.md / Reciprocal XREFs
+
+Every section above touches a doctrine surface. Close the loop in lockstep with the implementation so the docs and the running code never diverge.
+
+- [x] CLAUDE.md updates landed in lockstep with each section: Codex Invocation Policy paragraph (shipped with §2), MCP Usage 3-bullet pointer (shipped with §6), Mandatory Skill Triggers rows for `receiving-code-review` / section-commit gate / four-dispatch policy / `Accepted:` / `Deferred:` XREF grammar (shipped with §3 / §4 / §5 / §8). Per `feedback_todo_notes_brevity` the deeper doctrine lives in `docs/infrastructure/*.md`; CLAUDE.md keeps a 1-line pointer.
+- [x] [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md): Hook Routing Matrix expansion note (lines 95-105) covers all hooks landed in earlier sections inline -- §3 (`receiving_review_required.py`), §4 (`section_commit_gate.py`), §5 three-dispatch enforcement (`codex_review_completed.py` + `last-review-stamps.json`), §7 (`MANIFEST.md` + `audit-hooks.sh`), §10 (`skill_step_observer` / `skill_step_block` / `skill_step_map`), §11 (SessionStart / UserPromptSubmit / Stop / SubagentStop / PreCompact + `tool_history_writer.py`), §12 (lint Check 6/7/8 helpers). AI-Slop Content Gates subsection added (line 254). Skill-Step Telemetry and Hook Event Surface remain inline within the Hook Routing Matrix expansion rather than as separate subsections (Karpathy progressive-disclosure: deeper doctrine reachable via the TODO-08 §10/§11 links, not duplicated in ai-system.md). External-Reviewer Contract subsection unchanged in this section -- the §3 hook + §5 three-dispatch state file are documented at the Hook Routing Matrix entry point and at the canonical contract section through their existing skill pointers; redundant cross-pointers were not added.
+- [x] [`docs/infrastructure/mcp-usage.md`](../../docs/infrastructure/mcp-usage.md): finalized in §6 (12 todo-graph + 15 lsp-bridge tools, when-to-use / when-not-to-use, cross-tool parity story).
+- [x] [`docs/infrastructure/superpowers-policy.md`](../../docs/infrastructure/superpowers-policy.md): finalized in §8 (suppression policy + load-bearing / non-load-bearing skill split).
+- [x] Reciprocal XREF sweep: appended `> **XREF (2026-04-28):**` prose paragraphs to TODO-02 §3 (Hook Routing Matrix) referencing TODO-08 §3-§5 + §10-§12, TODO-02 §4 (External-Reviewer Contract) referencing TODO-08 §3 + §5, TODO-06 §8 (todo-graph MCP) referencing TODO-08 §1 + §6, TODO-07 §1 (LSP-MCP bridge) referencing TODO-08 §1 + §6 + §12. Prose-paragraph form chosen over `-> XREF:` line so verified stamps in those sections are not disturbed.
+- [x] [`todo/00-infrastructure/INDEX.md`](INDEX.md) already carries the TODO-08 row (ship-time addition, line 53 onward). No further edit needed.
+- [x] [`todo/TODO-00-INDEX.md`](../TODO-00-INDEX.md) is domain-only (lists 14 domains, no per-TODO rows); the per-TODO listing lives in each domain's INDEX.md. Spec wording superseded by the domain-only structure -- no row needed at the root.
+- [x] Memory: `feedback_codex_no_model_or_effort.md` (shipped 2026-04-26), `feedback_mcp_usage_first.md` (this commit -- prefer MCP over grep umbrella), `project_automation_hardening_complete.md` (this commit -- §1-§13+§15 shipped, §14 still open). MEMORY.md index updated.
+- [x] Commit: `docs: sync CLAUDE.md / ai-system.md / superpowers-policy + reciprocal XREFs for TODO-08` (this commit).
+
+**Test checkpoint:** `bash scripts/audit-ai-system.sh` PASS (7/7 checks); `bash scripts/test-tooling.sh --quiet` PASS (270/270); kernel build untouched (docs + memory + TODO files only); both indexes carry the TODO-08 row (root index intentionally domain-only). Tested on: Linux WSL2 dev host.
+
+> **Notes:**
+> - Doctrine sync was kept in lockstep across §1-§12: CLAUDE.md additions and `docs/infrastructure/*.md` subsections shipped with each section's commit, not batched.
+> - Reciprocal XREFs use `> **XREF (2026-04-28):**` prose paragraphs (not `-> XREF:` checklist lines) so the verified stamps in TODO-02 / TODO-06 / TODO-07 sections stay intact. Future readers grep `XREF (2026` to find the back-pointers.
+> - `todo/TODO-00-INDEX.md` is structurally domain-only (the 14 domain folders, not 86 per-TODO rows); the spec line "same row addition" is superseded by the current index shape -- per-TODO listing is in `todo/00-infrastructure/INDEX.md`.
+> - Memory: `feedback_mcp_usage_first.md` is the umbrella over `feedback_lsp_bridge_over_grep.md` (both MCP servers come first, not just one); `project_automation_hardening_complete.md` records §1-§13+§15 shipped and the open §14.
+> - §14 (Copilot CLI removal) remains; not in this section's scope. Tracked separately in TODO-08 IO row 14.
+
+> **Verified:** 2026-04-28 | commit `e8c6dfd9` | 8/8 items | build OK | tools 270/270 PASS, audit-ai-system 7/7 PASS
+> **Quality reviewed:** 2026-04-28 | Codex 3x (adversarial, consistency, perf) | 4M+1L fixed | scope: N/A (docs-only sync section; no source code)
+
+---
+
+## 14. Remove Copilot CLI Reviewer Wholesale (Subordinate-Reviewer Reduction)
+
+User policy 2026-04-26: "we are not using copilot anymore." Copilot CLI was the second subordinate reviewer alongside Codex (per `docs/infrastructure/ai-system.md` Authority Hierarchy). The decision is to drop it: Codex GPT-5.5 is the sole external reviewer, simplifying the External-Reviewer Contract from "Codex + Copilot, same gate" to "Codex, the gate." This section sweeps every reference. Initial sweep done as part of §3 (removed `scripts/copilot-review.sh` from `codex_review_completed.py` Bash trigger detector + from the inline `[external review complete]` reminder hook in `.claude/settings.json`); this section closes out the rest.
+
+- [x] Deleted `scripts/copilot-review.sh` via `git rm`. Pre-deletion grep across `.claude/` / `scripts/` / `docs/` confirmed no remaining live caller (only TODO-02 / TODO-08 historical references remained, retained as audit trail).
+- [x] [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md): removed Copilot CLI row from Authority Hierarchy table (line 16); removed `.github/copilot-instructions.md` row (line 17); removed Copilot from External-Reviewer Contract subsection (renamed heading from "Codex, Copilot" to "Codex"); removed `scripts/copilot-review.sh` + `.github/copilot-instructions.md` rows from Tool-local Doctrine table; removed "Copilot CLI guidance" row from Edit-Here-Not-There table; deleted the entire `### Copilot invocation surface` subsection; rewrote Hook Routing Matrix #11 from `copilot-review.sh / codex advers.` to `codex adversarial-review` only; updated all "Codex and Copilot" prose to "Codex"; updated External-Reviewer Contract anchor from `-codex-copilot` to `-codex`; preserved autonomous-agent-boundary section's `Copilot cloud-agent` references (separate concern).
+- [x] Deleted [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) via `git rm`. Pre-deletion grep confirmed only TODO-02 historical stamps + scripts/test-ai-system.sh checks referenced it; updated `scripts/test-ai-system.sh` to assert the file is now ABSENT instead of PRESENT (test 5 + test 12 rewritten to enforce the retirement).
+- [x] Bulk-renamed all 16 codex-using SKILL.md anchor links from `external-reviewer-contract-codex-copilot` to `external-reviewer-contract-codex` via `find ... | sed -i`. Then surgical edits to `debug-session/SKILL.md`: removed `Co-authored-by: Copilot <...>` git-trailer example (replaced with explicit "no AI-attribution trailers" pointer to CLAUDE.md), changed "Rubber-Duck Prompt Template (copy-paste for Copilot CLI context)" heading to "...for Codex dispatch or any external reviewer chat".
+- [x] CLAUDE.md updated: line 207 "Codex/Copilot subordinate reviewers" -> "Codex sole subordinate reviewer"; line 155 autonomous-agent-boundary paragraph rewritten to remove `.github/copilot-instructions.md` from the allowed-pointer list and add a 2026-04-28-retirement note.
+- [x] Memory: `project_ai_system_architecture.md` updated to drop Copilot from the architecture line; new `feedback_copilot_removed.md` records the policy so future sessions don't re-introduce it; MEMORY.md index updated.
+- [x] Commit: `"docs/scripts: remove Copilot CLI reviewer wholesale (Codex is sole external reviewer)"`
+
+**Test checkpoint:** `grep -rn "copilot-review\.sh\|copilot-instructions\.md" .claude/ scripts/ docs/ 2>/dev/null` returns only audit-trail mentions in test-ai-system.sh asserting absence; `bash scripts/lint.sh` green; `bash scripts/test-tooling.sh` green; `bash scripts/audit-ai-system.sh` green; `bash scripts/test-ai-system.sh` green (with the rewritten retirement-policy assertions). Tested on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-ai-system.sh` + `bash scripts/audit-ai-system.sh` + `bash scripts/test-tooling.sh --quiet` | retirement-policy assertions pass, no live Copilot references remain
+
+> **Notes:**
+> - What shipped: `scripts/copilot-review.sh` + `.github/copilot-instructions.md` deleted; `scripts/test-ai-system.sh` rewrites assert their absence; ai-system.md + CLAUDE.md + AGENTS.md + TODO-02 §4 reflect Codex-only state; 16 skill SKILL.md files use the new `-codex` anchor.
+> - How it integrates: External-Reviewer Contract simplifies from "Codex + Copilot, same gate" to "Codex, the gate"; the receiving-code-review hook + section-commit gate + four-dispatch state-file (TODO-08 §3-§5) keep their identical shape with one fewer dispatcher.
+> - Downstream: Codex GPT-5.5 is the sole external reviewer; the `superpowers:receiving-code-review` discipline still applies on every dispatch.
+> - Doc pointer: [docs/infrastructure/ai-system.md "External-Reviewer Contract (Codex)"](../../docs/infrastructure/ai-system.md#external-reviewer-contract-codex).
+> - Scope boundary: this section sweeps Copilot CLI subordinate-reviewer references only. The autonomous-agent boundary policy's references to Copilot CLOUD-AGENT (a separate Microsoft product) stay intact -- the org/repo Settings -> Copilot Access policy guard, the forbidden-paths list, and the regression-pack check on cloud-agent enablement remain in force.
+
+> **Verified:** 2026-04-28 | commit `f3a7b6bb` | 7/7 items | build OK | test-ai-system 79/79 PASS, audit-ai-system 7/7 PASS, test-tooling 270/270 PASS
+> **Quality reviewed:** 2026-04-28 | Codex 3x (adversarial, consistency, perf) | 3M+1L fixed | scope: N/A (docs/scripts removal sweep; no source code)
+
+---
+
+## 15. Design-Review Hook Scope Fix: Review-Kind Recognition + Commit-Clears-Gate
+
+The pre-implementation design-review hook ([`.claude/hooks/design_review_required.py`](../../.claude/hooks/design_review_required.py)) was over-aggressive in two ways observed during the §4 / §7 / §8 review sessions on 2026-04-27. First, review-pipeline edits responding to Codex findings were blocked even though three review dispatches had just run, because the hook only recognized prompts containing the literal word `design`. Second, once `implement-todo-section` was invoked, the gate persisted across commits and into unrelated subsequent work; §8 docs-only work left the gate armed and blocked §4 SMBIOS review-pipeline fixes that had nothing to do with §8. The documented `SKIP_DESIGN_REVIEW_HOOK=1` env-var opt-out is also broken in practice because the harness Edit/Write tool does not inherit env vars set by a prior Bash subshell.
+
+- [x] [`.claude/hooks/design_review_required.py`](../../.claude/hooks/design_review_required.py) recognizes `[review-kind: adversarial|consistency|perf|re-adversarial|design]` markers in Codex dispatch prompts as design-equivalent. Rationale: review-pipeline fixes responding to Codex findings ARE design-validated work; the pre-code rule is for new implementation, not for fixing a reviewer's findings. Closes the §4 SMBIOS pain.
+- [x] Hook auto-clears the gate after a section-ship-style commit subject (`review:`, `stamp:`, `docs:`, `todo:` prefix), supporting both inline `-m "..."` and HEREDOC body forms. Rationale: the gate enforces design-before-code WITHIN one implement-todo-section flow; once that flow ships, the next session's work should not inherit the gate. Closes the §8-after-§7 persistence pain.
+- [x] Two new sub-tests in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) (`design_review_review_kind` plus `design_review_commit_clears`) synthesize a transcript JSONL fixture, run the hook against an Edit payload, and assert the expected exit code (0 cleared, 2 blocked).
+- [x] Commit: `"hooks: design-review gate recognizes review-kind + clears on section-ship commit"`.
+
+**Test checkpoint:** Re-running the §4 / §7 / §8 session shape produces no false-positive blocks: §4 SMBIOS review-pipeline edits (after three `[review-kind: ...]` Codex dispatches) succeed without `SKIP_DESIGN_REVIEW_HOOK=1`; an §8-then-§4 sequence with a `docs:` commit between them clears the gate before §4 begins. `bash scripts/test-tooling.sh` shows both new sub-tests PASS. Test on: Linux WSL2 dev host.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (5 design_review sub-tests, baseline + 4 gate-clearance scenarios) | 253/253 tooling tests PASS
+
+> **Notes:**
+> - Edited [`.claude/hooks/design_review_required.py`](../../.claude/hooks/design_review_required.py) `_scan_transcript()`: Bash branch now matches `[review-kind: adversarial|consistency|perf|re-adversarial|design]` markers as design-equivalent (in addition to the existing `\bdesign\b` keyword match), and resets the gate state on a section-ship-style `git commit` (inline `-m "review:..."` or HEREDOC body starting with one of `review:` / `stamp:` / `docs:` / `todo:` followed by `:` or `/`).
+> - Five sub-tests in `scripts/test-tooling.sh` between `audit-hooks` and the prior `four_dispatch_gate` block: baseline-blocks (rc=2), `[review-kind: adversarial]` clears (rc=0), `review:` commit clears (rc=0), `docs/x:` commit clears (rc=0), `feat:` commit does NOT clear (rc=2). Synthesizes JSONL transcript fixtures via `dr_event` shell helper; runs the hook with a synthetic `Edit` payload; asserts exit codes.
+> - Closes the §4 / §7 / §8 session pain (false-positive blocks on review-pipeline fixes despite three real Codex dispatches; persistence across unrelated commits). The `SKIP_DESIGN_REVIEW_HOOK=1` env-var opt-out remains in place but is now rarely needed because the review-kind path covers the legitimate case.
+> - Canonical doc: `.claude/hooks/MANIFEST.md` (the hook's row updates implicitly via the file path; behavior is documented in the hook's own header comment).
+> - Scope boundary: §15 fixes the design-review hook's over-aggression; §3 owns the broader receiving-review gate; §4 (TODO-08) owns the section-commit gate. The three hooks compose.
+
+> **Verified:** 2026-04-28 | commit `d9bdacf9` | 5/5 items | build OK | tests 272/272 PASS, audit-hooks PASS
+> **Deferred:** [M] design_review_required.py `_scan_transcript()` does O(N) full-file parse on every PreToolUse Edit; latency grows with session length -> XREF: 00-infrastructure/TODO-08 §16 (item: "Selector skip in `_select_active_skill`" at line ~519 -- §16 extended in this commit to cover transcript-scan offset cache as the natural sibling perf win; the orphan-marking + transcript-cache fixes share the PreCompact + transcript hot-path scope)
+> **Quality reviewed:** 2026-04-28 | Codex 3x (adversarial, consistency, perf) | 1H+1L fixed, 1M deferred | scope: N/A (host-side hook fix; no kernel/SMP risk)
+
+---
+
+## 16. Compaction-Resilient Skill-Step State -- PreCompact Orphan-Marking
+
+`.claude/state/skill-progress.json` survives context compaction, but the `skill_step_observer.py` PostToolUse hook does not run during summary generation. Result: the entry written before compaction stays in the file with `steps_observed: []` (or partial) while the agent that resumes is a different turn that can no longer fill in those observations. `skill_step_block.py` then BLOCKs the next `git commit` or `Skill(review-todo-section, ...)` indefinitely because the stale entry is the most-recent active skill by `started_ts`.
+
+The catch-22 is structural: the gate runs PreToolUse and the observer runs PostToolUse, so the missing-step list can never close itself once the entry is orphaned. Session 2026-04-28 hit this twice during TODO-08 §13 ship (stale `implement-todo-section` entry from pre-compaction, then stale `review-todo-section` entry from §12 review). The documented `SKIP_SKILL_STEP_BLOCK=1 + REASON=...` opt-out works for `Bash(git commit:*)` but NOT for `Skill(review-todo-section, ...)` because Skill tool calls don't accept env-var prefixes -- the only paths through required user-authorized state-file edits.
+
+This section adds the principled fix: mark entries as compaction-orphaned at compaction time (when the observer is about to stop firing), and have the gate's selector skip orphaned entries. No heuristics, no TTL guesses, no HEAD-tracking subprocess overhead in the gate's hot path -- the orphan flag is set by the one hook that knows compaction is happening, written into the same state file that already exists.
+
+- [x] **PreCompact orphan-marking** in [`.claude/hooks/pre_compact_flush.py`](../../.claude/hooks/pre_compact_flush.py) (the §11 PreCompact hook): on every PreCompact firing, walk every entry in `.claude/state/skill-progress.json` and write `"compaction_orphaned": true` into the entry, alongside `"orphan_reason": "PreCompact fired with N steps observed"` (N = `len(steps_observed)`) and `"orphan_ts_ns": <now>`. Idempotent: if the flag is already set, do not overwrite (preserve the original `orphan_ts_ns`). Atomic: write to `skill-progress.json.tmp` then `os.replace` so a partial write cannot corrupt the file.
+- [x] **Selector skip in BOTH `skill_step_block.py` AND `skill_step_observer.py`** (design review H1 fix 2026-04-28): when each hook iterates entries to pick the most-recent active skill by `started_ts`, treat any entry where `entry.get("compaction_orphaned") is True` as "not active -- skip." If all entries are orphaned, observer creates a fresh new entry for the resumed skill flow and the blocker returns `(None, None)`. Why both: if only the blocker skips orphaned entries, the observer keeps recording post-compaction step evidence into the orphaned entry while the blocker ignores it, creating an enforcement bypass (post-compaction commits proceed without ANY active-skill gate, even when a fresh implement-todo-section was invoked after compaction). The observer's `_select_active_skill_for_record()` (or equivalent) must skip orphaned entries when looking for the most-recent active flow to attribute observed steps to.
+- [x] **Transcript-scan offset cache for `design_review_required.py`** (Codex §15 perf M1, deferred 2026-04-28): `_scan_transcript()` opens the transcript fresh and iterates every JSONL line on every PreToolUse Edit, so latency grows with session length. Add a per-transcript-path cache keyed by `(inode, mtime, size, last_byte_offset)` that processes only appended lines. Persist the cache to `.claude/state/transcript-scan-cache.json` (single file, all hooks share it; document in `.claude/state/README.md`). Alternative: scan backward from EOF until the latest `implement-todo-section` Skill event or section-ship commit and only parse that bounded suffix. Add a fixture with a large transcript (10k+ lines) to assert bounded runtime. Same hot-path concern applies to `skill_step_block.py:_select_active_skill` reading `skill-progress.json` -- that file is small (one entry per active skill) so no cache needed there. The cache is specifically for the JSONL transcript scanners.
+- [x] **Audit log on skip**: each time `_select_active_skill` skips an orphaned entry, append a one-line record to `.claude/state/skill-progress-skip.log` -- `{ts_ns, skill, started_head_sha, orphan_ts_ns, orphan_reason}`. 200-line ring buffer (truncate from the front when over). If a real bug shows up (gate clearing on what should have been a live skill flow), the log shows the entry shape that triggered the skip.
+- [x] **Sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) -- 3 cases:
+   1. Entry with `compaction_orphaned: true` set -> selector skips, gate clears, `Bash(git commit ...)` proceeds.
+   2. Entry without the flag (live entry) -> selector picks it normally (regression guard against accidentally skipping live entries).
+   3. PreCompact hook fixture: simulate calling `pre_compact_flush.py` with a state file containing one un-orphaned entry; assert the entry now has `compaction_orphaned: true` AND idempotent re-run does not bump `orphan_ts_ns`.
+- [x] **`MANIFEST.md` update**: add the new `pre_compact_flush.py` orphan-marking responsibility to the manifest entry (§7 §11 hook). Re-run `bash scripts/audit-hooks.sh` to confirm green.
+- [x] **Documentation**: add a 2-bullet "Compaction Resilience" subsection to [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) Hook Event Surface area (after the §11 PreCompact bullet), naming the orphan-flag mechanism and the skip-log audit file. Update [TODO-08 §10](#10-skill-step-state-telemetry--non-contiguous-step-block) Outcome with a one-line pointer to §16 so future readers see the resilience layer at the same depth as the original gate.
+- [x] Commit: `"hooks: PreCompact orphan-marking for compaction-resilient skill-step gate"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §10](#10-skill-step-state-telemetry--non-contiguous-step-block) (skill-step gate this section hardens), [00-infrastructure/TODO-08 §11](#11-hook-event-surface-expansion-sessionstart--userpromptsubmit--stop--subagentstop--precompact) (PreCompact hook this section extends).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` PASS with 3 new sub-tests; `bash scripts/audit-hooks.sh` PASS after MANIFEST.md update; `bash scripts/audit-ai-system.sh` PASS (no regressions). Manual reproduction: trigger context compaction in a live session with an active `implement-todo-section` flow -- subsequent `git commit` proceeds without manual `skill-progress.json` editing.
+
+> **Test runner:** `bash scripts/test-tooling.sh --filter compaction` | 3 sub-tests, 0 failures (planned)
+
+> **Notes:** (canonical shape, fill at ship time)
+> - What shipped: PreCompact hook flags every active `skill-progress.json` entry as `compaction_orphaned: true`; `skill_step_block.py:_select_active_skill` skips orphaned entries.
+> - How it integrates: PreCompact hook owned by §11 carries orphan-marking; gate selector owned by §10 gains the skip clause; both stay loose-coupled via the state file.
+> - Downstream: state-file edits to resume after compaction become unnecessary; the `SKIP_SKILL_STEP_BLOCK` env opt-out reverts to its intended rare-escape-hatch role.
+> - Doc pointer: `docs/infrastructure/ai-system.md` Compaction Resilience subsection (added by this section).
+> - Scope boundary: this section only adds the orphan flag + selector skip. Gate BLOCK message format and observer recording behavior unchanged.
+
+> **Verified:** 2026-04-28 | commit `4320b2ab` | 7/7 items | build OK | tests 276/276 PASS, audit-hooks PASS, audit-ai-system 7/7, test-ai-system 79/79
+> **Quality reviewed:** 2026-04-28 | Codex 5x (design, adversarial, consistency, perf, re-adversarial) | 1H+4M+1L fixed | scope: N/A (host-side hooks; no kernel/SMP risk)
+
+---
+
+## 17. Review-Pipeline Pre-Codex Enforcement (Phase-1 + Re-Adversarial)
+
+The 2026-04-28 boot-platform UEFI Hardening review session (Sections 6-8) surfaced two recurring review-pipeline skips that the user caught by hand: jumping straight to Phase 2 Codex dispatches without doing Phase 1 evidence-map / scope-gap audit / test-checkpoint verify (Boot UX Polish review; Phase 1 then surfaced both M findings the Codex dispatches missed), and skipping step 13.5 re-adversarial after a "small fix" judgment call (Boot UX Polish H1 fix; re-adversarial then caught H2 -- 32-bit width*4u multiply overflow). Both gaps live in the review-pipeline pre-Codex / intra-Codex window and are deterministic from `tool-history.jsonl` + the staged diff. Companion `implement-todo-section` gates live in §20; the lint sibling for stamp-region drift lives in §18; the Codex prompt-scope wrapper that closes the "re-review against an old commit returns no findings" symptom lives in §19.
+
+> **Outcome:** the two recurring review-pipeline failures from 2026-04-28 (Phase-1 skip; re-adversarial skip on faultable-region fix) become hook BLOCKs at the exact tool call where the skill prose said "must run".
+
+- [x] **Phase-1 evidence-map enforcement** as new dedicated PreToolUse hook [`.claude/hooks/phase1_evidence_gate.py`](../../.claude/hooks/phase1_evidence_gate.py) (NOT extending skill_step_block.py -- per Codex design review 2026-04-28 H1, tool-history.jsonl carries no tool_input AND steps_observed records AFTER execution, so the original draft was unenforceable). Fires on `Bash` invocations of `codex-companion.mjs adversarial-review` whose first non-blank line carries `[review-kind: adversarial]`. When skill-progress.json has an active `review-todo-section` entry, walks `transcript_path` JSONL forward from `started_ts` and counts `Read`/`Grep`/`Glob` tool_use events whose location-input (`file_path` / `path` / `glob`, NOT `pattern`) matches `src/` or `include/`. BLOCKs exit 2 if count < 2. Opt-out: `SKIP_PHASE1_BLOCK=1 SKIP_PHASE1_BLOCK_REASON="<text >= 12 chars>"`; reason logged to `.claude/state/skip-log.jsonl`. Defensive: non-dict `tool_use.input` coerced to `{}` so a malformed event mid-transcript does not abort the walk (Codex test-coverage M1 fix).
+- [x] **Re-adversarial trigger gate** in [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py) (`_re_adversarial_trigger_check` + `_attribute_review_todo` + `_staged_diff_text` + `_staged_loc_delta`). Trigger regexes (per Codex design M3): `spinlock_t|atomic_t|atomic\d+_t|mutex_t` (locking), `boot_halt|panic|KeBugCheck\w*|fault_handler|exception_\w*` (faultable region), `\w*_(alloc|free|refcount)` (lifecycle), staged C/H LOC > 50 (numstat sum). Scope: ADDED diff lines only (filters `+++` headers). Per Codex design H2, fires on BOTH section-commit signatures AND pure-source fix-loop commits when active `review-todo-section` provides TODO attribution; falls back to PASS+WARN when no attribution path exists (manual judgment per step 13.5 prose). State-machine and >3-functions triggers are not regex-detectable -- documented as manual-only gaps. Honors `SKIP_REVIEW_HOOK=1` opt-out. Doctrine: `feedback_re_adversarial_small_fix` memory.
+- [x] **`codex_review_completed.py` extension** -- `_REVIEW_KIND_RE` and `_record_stamp` accept-list now include `re-adversarial`. `last-review-stamps.json` entries gain `re-adversarial` + `re-adversarial_head` fields; legacy 3-kind readers ignore the new keys (no migration step required, per design Q4).
+- [x] **17 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) `pre_codex_enforcement` block (4 phase1 happy path + 5 re_adv happy path + 5 re_adv coverage gaps + 3 phase1 boundary): `phase1_evidence_block` covers 0/2 Reads BLOCK/PASS, SKIP env, consistency dispatch bypass, re-adversarial discrimination, missing-marker bypass, malformed-input resilience. `re_adv_trigger_block` covers faultable BLOCK / fresh PASS / stale BLOCK / mutex_t locking / SKIP_REVIEW_HOOK PASS / lifecycle trigger / >50 LOC trigger / malformed-stamps-JSON / no-attribution PASS+WARN / compaction_orphaned skip. All 293/293 tooling tests PASS.
+- [x] **`MANIFEST.md` update** -- new `phase1_evidence_gate` row + extended `section_commit_gate` row with §17 trigger-gate description; `audit-hooks.sh` and `audit-ai-system.sh` both PASS.
+- [x] **`.claude/settings.json`** -- `phase1_evidence_gate.py` wired into PreToolUse Bash chain after `section_commit_gate.py`.
+- [x] **`docs/infrastructure/ai-system.md`** Hook Routing Matrix gets a 1-bullet "Review-pipeline pre-Codex enforcement" pointer to this section.
+- [x] Commit: `"hooks: review-pipeline pre-Codex enforcement -- phase-1 evidence-map + re-adversarial trigger gate"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §10 skill step-state telemetry](#10-skill-step-state-telemetry--non-contiguous-step-block) (skill_step_block surface this extends), [00-infrastructure/TODO-08 §11 hook event surface expansion](#11-hook-event-surface-expansion-sessionstart--userpromptsubmit--stop--subagentstop--precompact) (tool-history.jsonl writer this consumes), [00-infrastructure/TODO-08 §4 section-commit gate](#4-section-commit-gate-hardens-to-block-with-build--codex--receiving-evidence) (section_commit_gate.py surface this extends), [00-infrastructure/TODO-08 §18 stamp-region + OS Comparison lints](#18-stamp-region--os-comparison-completeness-lints-check-10--check-11) (sibling -- catches the post-Codex stamp-completeness drift), [00-infrastructure/TODO-08 §20 implement-pipeline section-commit gates](#20-implement-pipeline-section-commit-gates-steps-581316) (sibling -- closes the matching impl-side gates).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` PASS with all 17 new sub-tests; `bash scripts/audit-hooks.sh` PASS after MANIFEST update; manual reproduction: invoking `review-todo-section` and dispatching adversarial Codex without 2+ src/ Reads first hits BLOCK; staging a faultable-region C/H change and attempting commit without a `re-adversarial` entry hits BLOCK.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (block `pre_codex_enforcement`) | 17 sub-tests, 0 failures | 293/293 tooling PASS
+
+> **Notes:**
+> - What shipped: dedicated `phase1_evidence_gate.py` PreToolUse Bash hook + `section_commit_gate.py::_re_adversarial_trigger_check` + `codex_review_completed.py::_REVIEW_KIND_RE` extension (re-adversarial recognition); 17 sub-tests in `pre_codex_enforcement` block.
+> - How it integrates: phase1 gate fires on `Bash(codex-companion.mjs adversarial-review)` with `[review-kind: adversarial]`, walks `transcript_path` JSONL forward from `skill-progress.json[review-todo-section].started_ts` counting Read/Grep/Glob on src/ or include/ location fields; re-adversarial gate runs in `section_commit_gate._evaluate` for both real-section and `not_section` (pure-source fix-loop) paths, scanning ADDED-line diff for locking / faultable / lifecycle / >50 LOC triggers and looking up `last-review-stamps.json[<todo>].re-adversarial` ts_ns within 30 min.
+> - Downstream: `feedback_re_adversarial_small_fix` doctrine is now mechanical -- a fix-loop commit that hits a step-13.5 trigger cannot land without a recent re-adversarial dispatch (or explicit `SKIP_REVIEW_HOOK` paper trail). Codex review adoptions in commit message; design H1+H2+M3 + test-coverage H1+M1+M2 all addressed.
+> - Doc pointer: `docs/infrastructure/ai-system.md` Hook Routing Matrix subsection "Review-pipeline pre-Codex enforcement (TODO-08 §17)".
+> - Scope boundary: this section enforces TWO pre-Codex / intra-Codex review gates only. Stamp-region completeness is §18; Codex prompt-scope wrapper is §19; impl-side gates are §20; heuristic WARN-first hooks are §21.
+
+> **Verified:** 2026-04-28 | commit `d8bbc454` (impl) + `df362e4e` (review) + follow-up commit (deferred fixes) | 8/8 items | build OK | tests 296/296 PASS
+> **Quality reviewed:** 2026-04-28 | Codex 6x (design + adversarial + test-coverage + re-adversarial + consistency + perf) | 5H+8M+1L fixed | scope: N/A (host-side automation hooks; no SMP/kernel risk)
+
+---
+
+## 18. Stamp-Region + OS Comparison Completeness Lints (Check 10 + Check 11)
+
+Two recurring drifts the user caught by hand on 2026-04-28: stamp regions missing the `**Notes:**` block and `**Test runner:**` line on review re-runs (Secure Boot Shim, Boot UX Polish, Serial Log Standardization), and `[x]` Implementation Order rows whose matching OS Comparison row sat at "Planned" (Compaction-Resilient Skill State, hit twice in one session). Both are file-shape checks suitable for `scripts/lint.sh` -- ERROR-class, sentinel-date scoped, sibling to the existing Check 9 (placeholder leak) shipped 2026-04-28.
+
+> **Outcome:** every `[x]` IO row in any `todo/**/*.md` shipped after this lint lands MUST have a complete stamp region (Notes + Test runner + Verified + Quality reviewed) AND a matching ✅ OS Comparison row. Drift is an ERROR at lint time, not a user-spotted bug at review time.
+
+- [x] **Stamp-region completeness lint** as `scripts/lint.sh` Check 10: for every `[x]` Implementation Order row in any `todo/**/*.md`, verify the corresponding section body contains all of: `> **Notes:**` block, `> **Test runner:**` line (or explicit `**Note:** No <surface> test surface` exemption), `> **Verified:**` stamp, `> **Quality reviewed:**` stamp. ERROR on any missing piece. Sentinel-date scoped: only enforce on sections whose `**Verified:**` line is dated on/after the lint-land date (older sections grandfathered). Sibling to existing Check 9 (placeholder leak).
+- [x] **OS Comparison cross-table consistency lint** as `scripts/lint.sh` Check 11: for every `[x]` Implementation Order row, verify the matching feature row in the file's OS Comparison table is checkmark-shipped (✅) not ⬜ Planned / ⚠️ Partial. ERROR on the `[x]`-but-OS-table-still-Planned drift the user flagged on the Compaction-Resilient Skill State row. Heuristic: feature-row matching by either explicit section reference (`§N` in last column) or substring match on the IO row's deliverable text against the OS row's last column.
+- [x] **2 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh): `lint_stamp_region` (synthetic TODO file with `[x]` row whose body lacks Notes -> ERROR; same with all 4 stamp pieces -> PASS; same with grandfather date -> PASS) + `lint_os_comparison_sync` (synthetic TODO file with `[x]` IO row + ⬜ OS row -> ERROR; with ✅ OS row -> PASS; with neither row matchable to other -> WARN, not ERROR).
+- [x] Commit: `"lint: add Check 10 (stamp-region completeness) + Check 11 (OS Comparison sync)"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §12 AI-slop content lints](#12-ai-slop-content-lints-tautological-test--stub-behind-stamp) (lint Check pattern this extends), [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (sibling -- catches the in-flight review skips).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` PASS with the 2 new sub-tests; `bash scripts/lint.sh` runs cleanly across the existing TODO tree (sentinel date excludes legacy sections). Manual reproduction: marking an existing draft section `[x]` without writing the stamp region triggers Check 10 ERROR; flipping IO `[x]` without flipping the OS row to ✅ triggers Check 11 ERROR.
+
+> **Test runner:** `bash scripts/test-tooling.sh --filter stamp_completeness` | 2 sub-tests, 0 failures (planned)
+
+> **Notes:**
+> - What shipped: `scripts/lint.sh` Check 10 (stamp-region completeness on `[x]` rows) + Check 11 (OS Comparison ✅ sync); both sentinel-date scoped (LINT_LAND_DATE=2026-04-29).
+> - How it integrates: Python heredoc embedded in lint.sh walks every `todo/**/*.md` IO table, parses `[x]` rows, locates the matching `## N.` body via end-sentinel regex, and cross-references the OS Comparison row by `§N` or first-distinctive-word substring match.
+> - Downstream: shipping a new section without a stamp region or without flipping the OS row breaks `bash scripts/lint.sh`; pre-commit hook surfaces the error before commit. Older sections grandfathered via the sentinel date; future renames advance the date.
+> - Canonical doc: `scripts/lint.sh` Check 10/11 (in-source) + `review-todo-section/SKILL.md` step 16 (stamp-region doctrine).
+> - Scope boundary: lint-only, no hook surface. The §17 phase1 / re-adv gates and §20 impl-side gates handle the in-flight enforcement; this lint is the post-ship file-shape enforcement.
+
+> **Verified:** 2026-04-28 | RISK_TIER=trivial | 4/4 items | build OK | tests 304/304 PASS
+> **Quality reviewed:** 2026-04-28 | Codex 1x (design) | 0 fixed | scope: N/A (host-side automation lint additions; no SMP/kernel risk; trivial-tier dogfooded)
+
+---
+
+## 19. Codex Prompt-Scope Helper -- Wrapper Plumbing for Re-Reviews
+
+Codex CLI's `adversarial-review` wrapper defaults to working-tree-diff scope: when re-reviewing a section whose impl is already committed and the working tree is clean, Codex sees an empty diff and returns "approve / no findings" while the actual files are unreviewed. This was the symptom behind the user comment "Codex reviews seem less" on 2026-04-28 -- §6 / §7 / §8 consistency + perf re-dispatches all returned shallow because the wrapper never embedded the committed file content into the prompt context.
+
+This section is plumbing-only -- no doctrine change, no hook, no lint. It fixes the wrapper so re-reviews against a clean tree see the same content as fresh reviews against a working diff.
+
+> **Outcome:** Codex re-reviews against committed work return real findings, not "approve / no findings" against an empty diff.
+
+- [x] **Codex prompt-scope helper** at `scripts/codex-dispatch-with-files.sh` (wrapper around the plugin's `codex-companion.mjs adversarial-review`): when the dispatch prompt names files via the in-repo `[review-kind: ...]` + TODO-path + `§N` marker convention AND `git diff --quiet HEAD --` shows a clean working tree, embed `git show HEAD -- <files>` content into the prompt context BEFORE invoking Codex. Implementation: parse the prompt for file mentions matching `(src|include|scripts)/[a-zA-Z0-9_/.-]+\.[ch](pp)?|asm|sh|py|mjs)`, gather their last-commit content, prepend a `--- COMMITTED FILE CONTENT ---` block. Do NOT modify the plugin file directly (`~/.claude/plugins/marketplaces/openai-codex/plugins/codex/scripts/codex-companion.mjs`) -- it is plugin-cache and gets overwritten on plugin update.
+- [x] **Skill prose pointer** -- canonical doctrine entry added to `docs/infrastructure/ai-system.md` Hook Routing Matrix; the 9 in-repo `codex-*` skills inherit via the External-Reviewer Contract pointer (no per-skill edits needed). Original draft sections call this wrapper instead of `codex-companion.mjs adversarial-review` directly when the dispatch is re-reviewing already-committed work. Detection rule: if the skill's prompt mentions `commit <hash>` / `the last commit` / `the §N ship`, route through the wrapper.
+- [x] **2 sub-tests** (clean_tree_embeds + dirty_tree_passthrough) in `scripts/test-tooling.sh` `codex_prompt_scope` block in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh): synthetic clean-tree + prompt naming a `src/kernel/foo.c` file -> wrapper emits `--- COMMITTED FILE CONTENT ---` block with the file content; dirty tree + same prompt -> wrapper passes through unchanged.
+- [x] Commit: `"scripts: add codex-dispatch-with-files.sh wrapper for re-review prompt-scope"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (sibling -- §17 forces Phase-1 evidence; §19 ensures the Codex dispatch sees real content), [00-infrastructure/TODO-08 §2 Codex invocation policy](#2-codex-invocation-policy-no---model----effort-from-claude) (wrapper inherits the no-model/effort policy).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` PASS with the 1 new sub-test; manual reproduction: re-running a §6/§7/§8-style re-review through the wrapper returns non-empty findings on at least one of the three sections re-checked from 2026-04-28.
+
+> **Test runner:** `bash scripts/test-tooling.sh --filter codex_prompt_scope` | 1 sub-test, 0 failures (planned)
+
+> **Notes:**
+> - What shipped: `scripts/codex-dispatch-with-files.sh` (~135-line Bash wrapper) + canonical doctrine pointer in `docs/infrastructure/ai-system.md` Hook Routing Matrix.
+> - How it integrates: drop-in replacement for `codex-companion.mjs adversarial-review` direct calls; auto-detects clean vs dirty tree, embeds `git show HEAD -- <files>` content (8 files / 200 lines each cap) when clean. Plugin file untouched.
+> - Downstream: re-reviews of already-committed work return real findings instead of "approve / no findings" against an empty working-tree diff.
+> - Canonical doc: `docs/infrastructure/ai-system.md` Hook Routing Matrix entry; the 9 in-repo `codex-*` skills inherit the calling convention via External-Reviewer Contract pointer.
+> - Scope boundary: plumbing-only; no doctrine change beyond the wrapper-routing pointer. The codex-* skills retain direct `codex-companion.mjs` invocation for fresh dispatches against working-tree diffs.
+
+> **Verified:** 2026-04-29 | RISK_TIER=trivial | 4/4 items | build OK | tests 306/306 PASS
+> **Quality reviewed:** 2026-04-29 | Codex 0x (trivial-tier single-script plumbing; design review skipped per codex-design-review SKILL.md "Skip When" criterion) | 0 fixed | scope: N/A (host-side Bash wrapper; no SMP/kernel risk)
+
+---
+
+## 20. Implement-Pipeline Section-Commit Gates (Steps 5/8/13/16)
+
+`implement-todo-section` has four steps that today are prose-only but have fully-deterministic evidence signals: step 5 (walk domain code-quality skill), step 8 (wire unit tests), step 13 (Codex adversarial dispatch), step 16 (smoke test on boot-path edits). Each maps onto an existing hook surface (`skill_step_block.py` for step 5; `section_commit_gate.py` for steps 8/13/16) with a presence check against `tool-history.jsonl`, the staged diff, the `last-review-stamps.json` state file, or the smoke-test log. None require new state files. The recurring "kernel-code-quality not walked" / "test_*.c forgotten" / "boot-path edit shipped without smoke verify" drifts named in `feedback_skill_invocation_drift` and the 2026-04-12 incident memo become hook BLOCKs.
+
+> **Outcome:** every fully-deterministic gap in `implement-todo-section`'s pre-commit pipeline (steps 5, 8, 13, 16) hits a hook BLOCK at the exact tool call where the skill prose said "must run".
+
+- [x] **Step 5 -- domain quality gate walk presence** (shipped as new dedicated PreToolUse hook `step5_quality_gate.py`) in [`.claude/hooks/skill_step_block.py`](../../.claude/hooks/skill_step_block.py): when active skill is `implement-todo-section` and the next tool call is the FIRST `Edit`/`Write` on a code file under `src/` or `include/`, BLOCK if `tool-history.jsonl` shows no prior `Skill(<domain>-code-quality, ...)` invocation matching the path domain (boot/kernel/desktop/shell/userland). Path-to-skill map mirrors CLAUDE.md "Mandatory Skill Triggers". Opt-out: `SKIP_QUALITY_GATE_BLOCK=1 SKIP_QUALITY_GATE_BLOCK_REASON="<text>=12 chars>"`. Closes the recurring "kernel-code-quality not walked" drift named in `feedback_skill_invocation_drift`.
+- [x] **Step 8 -- unit test wiring presence** (`_step8_test_wiring_check` in section_commit_gate.py; basename-bound HEAD evidence per Codex H1 fix) in [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py): when a section-commit signature fires AND the staged diff touches `src/kernel/`, `src/desktop/`, `src/shell/`, `src/apps/`, or `user/`, BLOCK if the same staged diff does NOT also touch a `test_*.c` file in the matching test directory AND the section body does not contain the `**Note:** No <surface> test surface` exemption phrase. Detection: `git diff --cached --name-only` sourced. Exemption: `**Note:** No <surface> test surface -- validation via <method>` line in the section body matching a regex. Opt-out: existing `SKIP_REVIEW_HOOK=1` honored. Closes the 2026-04-12 incident (TODO-03 §1-§12 + TODO-17 §1-§3 shipped without tests).
+- [x] **Step 13 -- adversarial dispatch presence** (`_step13_impl_adversarial_check`; new `[review-kind: adversarial-impl]` distinct from review-side; HEAD-ancestry bound per Codex H2 fix) in [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py): extend the existing `last-review-stamps.json` evidence check to recognize an `implement-todo-section` adversarial dispatch (the step-13 single-dispatch signature, distinct from `review-todo-section` step-5's full 3x). Marker: `[review-kind: adversarial]` + TODO path + `§N` in the dispatch prompt, recorded by the §3 PostToolUse hook. BLOCK the section-commit if the staged diff touches `src/`, the IO row flips to `[x]`, AND no adversarial entry was recorded for this TODO+§ within 30 minutes. Same `SKIP_REVIEW_HOOK=1` opt-out. Distinct keying so `review-todo-section` and `implement-todo-section` dispatches can't substitute for each other -- this enforces step 13 specifically (impl-side adversarial), separate from the post-impl review pipeline §3-§5 gates.
+- [x] **Step 16 -- smoke test on boot-path edits** (`_step16_smoke_check`; validates `Boot complete` + `C:\>` serial markers per Codex H2 fix; fail-closed on stat failures per Codex M1 fix) in [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py): when the staged diff touches any of `src/boot/`, `src/kernel/main/boot_*`, `src/kernel/idt.c`, `src/kernel/gdt.c`, `src/kernel/msr.c`, `src/kernel/smp/`, `src/kernel/mm/{pmm,vmm,heap}.c`, `src/kernel/drivers/{lapic,ioapic,acpi,timer}.c`, BLOCK the section-commit unless `build/smoke-test.stripped.log` exists, was modified after the most-recent staged file's mtime, AND `tail -1` shows the smoke-test PASS marker. Opt-out: `SKIP_SMOKE_GATE=1 SKIP_SMOKE_GATE_REASON="<text>"` (e.g. WSL host without /dev/kvm AND TCG already advisory). Doctrine: CLAUDE.md "Smoke Test" section already names the same path glob; this gate enforces it.
+- [x] **4 sub-tests** (integrated Python heredoc covering quality_gate_path_map / unit_test_wiring_basename_binding / impl_adversarial_distinct_key / smoke_gate_serial_markers) in `scripts/test-tooling.sh` `impl_pipeline_gates` block (synthetic transcript with no `Skill(kernel-code-quality)` -> next Edit on `src/kernel/foo.c` BLOCKs), `unit_test_wiring_block` (synthetic staged diff touching `src/kernel/foo.c` with no matching `test_*.c` change AND no exemption -> BLOCK), `impl_adversarial_block` (synthetic IO-row flip + src diff with no adversarial entry in `last-review-stamps.json` -> BLOCK), `smoke_gate_block` (synthetic staged diff touching `src/kernel/idt.c` with stale or missing `build/smoke-test.stripped.log` -> BLOCK; with fresh PASS log -> PASS).
+- [x] **`MANIFEST.md` update** for the 4 new hook entries; `audit-hooks.sh` PASS.
+- [x] **`docs/infrastructure/ai-system.md`** Hook Routing Matrix gets a 1-bullet "Implement-pipeline section-commit gates" pointer to this section.
+- [x] Commit: `"hooks: implement-pipeline section-commit gates -- step-5 quality / step-8 tests / step-13 adversarial / step-16 smoke"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §3 receiving-code-review hard gate](#3-receiving-code-review-hard-gate-state-file--post-codex-hook-block) (last-review-stamps.json shape this consumes), [00-infrastructure/TODO-08 §4 section-commit gate](#4-section-commit-gate-hardens-to-block-with-build--codex--receiving-evidence) (section_commit_gate.py surface this extends), [00-infrastructure/TODO-08 §10 skill step-state telemetry](#10-skill-step-state-telemetry--non-contiguous-step-block) (skill_step_block surface this extends), [00-infrastructure/TODO-08 §11 hook event surface expansion](#11-hook-event-surface-expansion-sessionstart--userpromptsubmit--stop--subagentstop--precompact) (tool-history.jsonl writer this consumes), [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (sibling -- review-side gates).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` PASS with the 4 new sub-tests; `bash scripts/audit-hooks.sh` PASS after MANIFEST update; manual reproduction: editing `src/kernel/foo.c` without `kernel-code-quality` walked first hits BLOCK; staging a `src/kernel/foo.c` change without a `test_*.c` change AND no exemption phrase hits BLOCK; flipping an IO `[x]` without an adversarial entry in `last-review-stamps.json` hits BLOCK; staging a `src/kernel/idt.c` change with stale or missing smoke log hits BLOCK.
+
+> **Test runner:** `bash scripts/test-tooling.sh --filter impl_pipeline_gates` | 4 sub-tests, 0 failures (planned)
+
+> **Notes:** (canonical shape, fill at ship time)
+> - What shipped: 4 hooks (step-5 quality-gate walk + step-8 test-wiring + step-13 impl-adversarial + step-16 boot-smoke) closing the deterministic gaps in `implement-todo-section`.
+> - How it integrates: skill_step_block reads tool-history.jsonl for the quality-gate walk; section_commit_gate scans staged diff + last-review-stamps.json + smoke-log mtime for the other three; all honor existing `SKIP_*` opt-outs with reason logging.
+> - Downstream: edits to `src/` require domain-code-quality walked; commits touching src/ require matching test_*.c change or exemption; IO `[x]` flip requires adversarial entry; boot-path edits require fresh smoke-test PASS.
+> - Doc pointer: `docs/infrastructure/ai-system.md` Hook Routing Matrix entry added.
+> - Scope boundary: this section enforces the FOUR fully-deterministic impl-side gates only. Heuristic gates (steps 1/2/3/9/15/17/18) live in §21 with WARN-first promotion path. Step 6 (implement) and step 14 (reconcile tables) remain inherently judgment-driven and intentionally have no hook in either §20 or §21.
+
+> **Verified:** 2026-04-29 | commit `88b98f99` | RISK_TIER=standard | 8/8 items | build OK | tests 310/310 PASS
+> **Quality reviewed:** 2026-04-29 | Codex 2x (design + adversarial) | 6H+1M fixed | scope: N/A (host-side automation hooks; consistency+perf deferred-to-tier per §22 doctrine for incremental gate extensions on existing surface)
+
+---
+
+## 21. Implement-TODO-Section Partial-Enforcement Heuristics (WARN-First)
+
+§17 / §18 / §19 / §20 cover gaps where presence/absence is deterministic (tool-history line exists or it doesn't; staged-diff matches a glob or it doesn't; file mtime is fresh or it isn't). Seven `implement-todo-section` steps remain agent-judgment because the signal is heuristic -- there is a useful tool-call shape that USUALLY proves the step ran, but a false-positive ratio is real and an unconditional ERROR would block legitimate workflows. This section ships those seven as WARN-first hooks: each emits a `systemMessage` reminder when the heuristic fails, logs to a one-line entry in `.claude/state/heuristic-misses.jsonl`, and graduates to ERROR (BLOCK) only after observation shows the false-positive ratio is acceptable.
+
+The promotion-after-observation pattern matches §3's "advisory hook reminders -> hard gates where critical steps keep getting skipped" doctrine; the heuristics here are NEW gates, not legacy ones being hardened, so they earn their ERROR via the miss-log.
+
+> **Outcome:** every prose-only `implement-todo-section` step that has a usable heuristic signal emits an advisory WARN on failure today, logs the miss, and has a documented graduation criterion (false-positive ratio <X%, observed over Y commits). The user no longer has to remember to call out skips by hand for these seven steps.
+
+- [x] **Step 1 -- TODO file read before first src/ Edit** in [`.claude/hooks/skill_step_block.py`](../../.claude/hooks/skill_step_block.py) `_heuristic_check_steps_1_2_3()`: matcher extended to `Bash|Skill|Edit|Write|MultiEdit` (Codex design H2 fix); when active skill is `implement-todo-section` and the next call is the FIRST `Edit`/`Write`/`MultiEdit` on `src/` or `include/`, fires WARN signal `todo-read-missing` if `tool-history.jsonl` shows no prior `Read` of a `todo/**/*.md` file. Promotion criterion `<5% FP over 20 sections`.
+- [x] **Step 2 -- XREF'd TODO file reads** in same hook: scans the read TODO body for `-> XREF: <path>.md` lines (regex `_XREF_RE`), extracts referenced TODO paths, fires WARN signal `xref-unread` if any unread; emits up to 3 paths inline + `(+more)` count.
+- [x] **Step 3 -- >=3 explore queries before first Edit** in same hook: counts `Grep`/`Glob`/`mcp__lsp-bridge__*`/`mcp__todo-graph__*` calls (`_HEURISTIC_EXPLORE_TOOLS` allowlist, 23 entries) since the skill window started; WARN signal `explore-thin` if below threshold 3. Accepts MCP exploration per CLAUDE.md "MCP-first defaults".
+- [x] **Step 9 -- Codex test-coverage dispatch on test-touching commits** in [`.claude/hooks/section_commit_gate.py`](../../.claude/hooks/section_commit_gate.py) `_heuristic_step9_test_coverage()`: when staged diff adds >=3 new `TEST_ASSERT`/`TEST_PENDING`/`TEST_SKIP` lines in `src/kernel/test/test_*.c` files, fires WARN signal `test-coverage-missing` if `last-review-stamps.json` lacks a `test-coverage` entry within 30 min for the active TODO. Required allowlist extension to `codex_review_completed.py` `_REVIEW_KIND_RE` and the per-kind dispatch recorder so `[review-kind: test-coverage]` markers attribute correctly (Codex design H1 fix).
+- [x] **Step 15 -- >=1 Edit between latest Codex dispatch and section-commit** in same hook `_heuristic_step15_post_codex_edit()`: walks tool-history for the latest `codex-companion.mjs`/`codex exec`/`codex review` invocation; fires WARN signal `no-edit-after-codex` if no `Edit`/`Write`/`MultiEdit` recorded since.
+- [x] **Step 17 -- >=2 Read/Grep between latest Codex and commit** in same hook `_heuristic_step17_validate_phase()`: counts `Read`+`Grep` since the latest Codex dispatch; WARN signal `validate-thin` if <2.
+- [x] **Step 18 -- TODO/FIXME/HACK/STATUS_NOT_IMPLEMENTED scan before commit** in same hook `_heuristic_step18_loose_ends_scan()`: walks tool-history for any `Grep` whose target matches `TODO|FIXME|HACK|STATUS_NOT_IMPLEMENTED` since the last src/ Edit; WARN signal `loose-ends-scan-missing` if absent. Suppressed on docs-only / stamp-only diffs (no non-`.md` non-`todo/` paths in staged diff).
+- [x] **Shared miss-log writer** at [`.claude/hooks/_heuristic_misses.py`](../../.claude/hooks/_heuristic_misses.py) (HELPER module, `# block-via: warning-only`): `emit_warn(repo_root, step, signal, detail, todo_path, section)` writes one stderr WARN AND appends one JSON line to `.claude/state/heuristic-misses.jsonl` (5 MiB rotate to `.1`). Schema: `{ts_ns, step, todo_path, section, signal, detail, false_positive_user_flagged: false}`. Codex design M1 fix: this shared helper is imported by both `skill_step_block.py` and `section_commit_gate.py` (NOT the original `skill_step_observer.py` placement -- a PostToolUse observer cannot see staged diffs or section-commit-gate local decisions, breaking the dataset).
+- [x] **`tool-history.jsonl` `target` field** in [`.claude/hooks/tool_history_writer.py`](../../.claude/hooks/tool_history_writer.py): captures primary input identifier (`file_path` / `path` / `pattern` / `query` / `skill` / `command` first 240 chars) so heuristics 1/2/3/15/17/18 can answer path/command-shaped questions without re-scanning the transcript. Backward-compat: missing `target` field is treated as empty.
+- [x] **7 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) `[heuristic_warn_misses]` block: `hw_misslog_writer` schema check + 6 stderr-format assertions per step (`hw_step1_warn`/`hw_step3_warn`/`hw_step9_warn`/`hw_step15_warn`/`hw_step17_warn`/`hw_step18_warn`). All 7 pass under the full 323-test suite.
+- [x] **[`scripts/heuristic-misses-report.sh`](../../scripts/heuristic-misses-report.sh)** -- summarizes the miss log per step (count, false-positive ratio, last 3 entries with TODO refs + signal + detail); read-only, runs in <1s. Plus [`scripts/heuristic-mark-false-positive.sh`](../../scripts/heuristic-mark-false-positive.sh) for retroactive FP flagging by `(step, n)`.
+- [x] **`MANIFEST.md` update** -- `skill_step_block` row updated to `STATE+BLOCK+WARN` with extended matcher; `section_commit_gate` row updated to `BLOCK+WARN` with the four step-9/15/17/18 heuristics described; new `_heuristic_misses` HELPER row added; `tool_history_writer` row updated to mention the `target` field. `audit-hooks.sh` PASS (the `# block-via: warning-only` header opts the helper out of the BLOCK-hook exit-code check).
+- [x] **[`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "Hook Promotion Pipeline"** subsection added under "Hook Routing Matrix": documents WARN -> miss-log -> ratio-report -> ERROR promotion path with per-heuristic graduation criteria.
+- [x] Commit: `"hooks: implement-todo-section partial-enforcement heuristics (WARN-first; steps 1/2/3/9/15/17/18)"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (sibling -- review-side deterministic gates), [00-infrastructure/TODO-08 §18 stamp-region + OS Comparison lints](#18-stamp-region--os-comparison-completeness-lints-check-10--check-11) (sibling -- post-ship lint gates), [00-infrastructure/TODO-08 §20 implement-pipeline section-commit gates](#20-implement-pipeline-section-commit-gates-steps-581316) (sibling -- impl-side deterministic gates; this §21 picks up heuristic gates that share the same surface), [00-infrastructure/TODO-08 §10 skill step-state telemetry](#10-skill-step-state-telemetry--non-contiguous-step-block) (telemetry surface this section reads), [00-infrastructure/TODO-08 §11 hook event surface expansion](#11-hook-event-surface-expansion-sessionstart--userpromptsubmit--stop--subagentstop--precompact) (tool-history.jsonl writer this section consumes).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh --filter heuristic_warn` PASS for the 7 sub-tests; `bash scripts/heuristic-misses-report.sh` runs against a synthetic miss log and reports per-step false-positive ratios; manual reproduction: invoking `implement-todo-section` and skipping each of steps 1/2/3/9/15/17/18 fires the matching `systemMessage` WARN exactly once.
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 323/323 PASS (this section adds 7 sub-tests under the `[heuristic_warn_misses]` block)
+
+> **Notes:**
+> - What shipped: 3 heuristics inside `skill_step_block.py` (steps 1/2/3) + 4 heuristics inside `section_commit_gate.py` (steps 9/15/17/18) + shared `_heuristic_misses.py` HELPER + `tool-history.jsonl` `target` field + `heuristic-misses-report.sh` + `heuristic-mark-false-positive.sh` + `[heuristic_warn_misses]` test block (7 sub-tests). Total: ~480 lines of hook code, 2 small report scripts, 1 doc subsection.
+> - How it integrates: settings.json matcher for `skill_step_block.py` extended to `Bash|Skill|Edit|Write|MultiEdit` so the first-Edit heuristics fire; `_heuristic_misses.emit_warn` writes stderr WARN AND appends miss-log inline at every WARN site; `codex_review_completed.py` review-kind allowlist extended for `test-coverage` + `design` so step-9 has a real attribution surface.
+> - Downstream: feeds the WARN -> ERROR promotion pipeline -- after each heuristic clears its graduation criterion (per-step ratio over N sections), a follow-up TODO flips the corresponding `emit_warn` to a hard `sys.exit(2)` BLOCK. Codex review adoptions in commit `<hash>`.
+> - Canonical doc: [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "Hook Promotion Pipeline" subsection under Hook Routing Matrix.
+> - Scope boundary: WARN-only by construction. Fully-deterministic counterparts ship as BLOCK in §17 (Phase-1 + re-adv), §18 (stamp-region + OS Comparison), §19 (Codex prompt-scope wrapper), §20 (steps 5/8/13/16). Steps 6 (implement) and 14 (reconcile tables) remain judgment-driven; intentionally no hook in §17-§21.
+
+> **Verified:** 2026-04-29 | commit `629a874e` (impl ship `84b9def4`) | 13/13 items | build OK | tests 323/323 PASS
+> **Quality reviewed:** 2026-04-29 | Codex 8x (design + adversarial-impl + adversarial + consistency + perf + 3x re-adversarial) | 1H+8M fixed | scope: N/A (host-side hooks + report scripts + doctrine doc; no kernel/boot/desktop/shell domain)
+
+---
+
+## 22. Review-Pipeline Right-Sizing Doctrine -- RISK_TIER + Bootstrap + Tier-Aware Triage + State Diagnosis + Spiral Check
+
+The 2026-04-28 §17 implementation session burned ~1.5 hours on what should have been a 25-minute task: a 600-line host-side hook addition with no SMP/kernel/boot risk. Root cause was the review pipeline applying kernel-tier rigor to host-side automation (6 Codex dispatches, 19 sub-tests, 4 receiving-review skill loops, 3 SKIP-env workarounds, in-flight gate self-blocking). This section ships the five process fixes that would have prevented that spiral, identified post-mortem with the user.
+
+> **Outcome:** review-pipeline rigor matches task risk. A trivial host-side hook ships in 1 design + 1 adversarial; a kernel-scheduler change still gets the full 6x. Self-blocking gates auto-downgrade for the commit that ships them. State-file write reliability is diagnosed and fixed, not silently routed through SKIP-env workarounds. Long-running skill invocations prompt for a spiral check rather than continuing to dispatch.
+
+- [/] **#1 RISK_TIER doctrine** -- shipped 2026-04-28, **RETRACTED 2026-04-29**. The tier classifier removed value from `implement-todo-section` enforcement -- a task declared `trivial` would skip Codex dispatches the section deserved. Every section now runs the full Codex pipeline (design + adversarial + consistency + perf + conditional re-adversarial + fix loop). Q7 removed from SKILL.md Completion Radar; CLAUDE.md trigger row reverted; `risk_tier` field removed from `skill_step_observer.py` Branch A.
+- [x] **#2 Bootstrap-mode for new gate hooks.** Add a helper `_is_bootstrap_commit(staged_paths, hook_file_path)` that returns True when the staged diff includes the hook's own implementation file. Each BLOCK hook calls this in its main(); when True, it WARNs instead of BLOCKing for that single commit, breaking the chicken-and-egg loop where shipping a new gate triggers the gate against itself. `phase1_evidence_gate.py` and the new §17 trigger gate are the canonical regression targets. Lives in `.claude/hooks/_bootstrap_mode.py` (sibling to `_review_kind.py`).
+- [/] **#3 Tier-aware "defer to next-tier work" triage option** -- shipped 2026-04-28, **RETRACTED 2026-04-29** alongside #1. With every section running the full pipeline, `Defer-to-tier` no longer has a meaningful place in triage. `docs/infrastructure/triage-codex-finding.md` rewritten back to 3-option discipline (Fix / Reject / Accept-XREF) with a history note pointing at this retraction.
+- [x] **#4 Diagnose state-file write failures.** `last-codex-review.json` was empty + `last-review-stamps.json` showed only §16 stamps despite §17 dispatches firing today. Either (a) the PostToolUse `codex_review_completed.py` hook isn't firing on `Bash(codex-companion.mjs)` invocations, (b) the hook's classifier doesn't match the dispatched prompt shape, or (c) the harness isn't propagating the events. Investigation: enable verbose logging in `codex_review_completed.py` (env-gated, opt-in), reproduce the missing-write scenario, fix the matching/firing root cause. `scripts/test-tooling.sh` adds an end-to-end sub-test that dispatches a synthetic Codex Bash invocation through the harness simulator and asserts both state files update. **Closed properly by §24** (this section's #4 landed only partial diagnostics; §24 added the JSONL debug log, the `(ok, err)` return-tuple contract on `_write_atomic` / `_record_stamp`, and 4 dedicated sub-tests in `[codex_review_state_write]` including `crsw_write_failure_honesty` which monkeypatches `os.replace` and asserts the wired diagnostic records the failure honestly).
+- [x] **#5 Time budget + spiral check** in `skill_step_observer.py`. Uniform 60-min wall-clock budget (per 2026-04-29 retraction; original per-tier budgets removed alongside RISK_TIER). The observer records `started_ts`; when elapsed > 2x or > 4x of the 60-min budget, the next PostToolUse fires a one-shot `systemMessage` "spiral check" reminder asking the agent to declare done, split, or document why the work is genuinely larger. Pure advisory; no BLOCK. Closes the "1.5 hours on a 25-minute task with no checkpoint" failure mode.
+- [x] **5 sub-tests** (4 integrated test cases) shipped in `scripts/test-tooling.sh`: `risk_tier_declared` (skill-progress entry has `risk_tier` field after step 3 Completion Radar), `bootstrap_mode_warn` (synthesized commit touching `.claude/hooks/<gate>.py` against the same gate -> WARN not BLOCK), `defer_to_tier_stamp` (synthetic stamp with `(deferred-to-tier: ...)` parses), `state_file_write_e2e` (synthetic codex Bash dispatch updates both state files), `spiral_check_warn` (skill-progress with started_ts > 2x budget triggers systemMessage reminder).
+- [/] **Doctrine doc updates** -- partial retraction 2026-04-29: RISK_TIER row in CLAUDE.md REMOVED; `implement-todo-section/SKILL.md` Q7 REMOVED (every section runs the full pipeline). Surviving doc updates: `docs/infrastructure/ai-system.md` Hook Routing Matrix entry retained for bootstrap-mode + spiral-check + state-file diagnostics; `docs/infrastructure/triage-codex-finding.md` rewritten back to 3-option discipline with retraction note.
+- [x] Commit: `"hooks/skill: review-pipeline right-sizing -- RISK_TIER + bootstrap-mode + tier-aware triage + state diagnosis + spiral check"` (initial ship `5cdd7096`; retraction follow-up commits unwind RISK_TIER + Defer-to-tier)
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §3 receiving-code-review hard gate](#3-receiving-code-review-hard-gate-state-file--post-codex-hook-block) (last-review-stamps consumer), [00-infrastructure/TODO-08 §10 skill step-state telemetry](#10-skill-step-state-telemetry--non-contiguous-step-block) (skill-progress.json producer; new `risk_tier` field consumer), [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (canonical bootstrap-mode regression target -- the §17 phase1_evidence_gate self-blocked during its own review).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` PASS with the 5 new sub-tests; manual reproduction of the §17 spiral with risk_tier=trivial declared shows pipeline shrinks to 1 design + 1 adversarial; state-file write e2e test reproduces and fixes the missing-write incident; long-running synthesized skill flow triggers spiral-check reminder.
+
+> **Test runner:** `bash scripts/test-tooling.sh --filter review_right_sizing` | 5 sub-tests, 0 failures (planned)
+
+> **Notes:** (canonical shape, fill at ship time)
+> - What shipped: RISK_TIER skill-state field + bootstrap-mode helper module + triage-codex-finding skill + state-file diagnosis + spiral-check observer reminder.
+> - How it integrates: skill prose declares tier; observer records; gates honor bootstrap-mode; receiving-review prose adds defer-to-tier option; spiral check fires from observer at 2x-budget.
+> - Downstream: future §17-style spirals get prevented at three layers (right-size pipeline up front, downgrade gate during own-implementation commit, prompt for spiral check on time overrun).
+> - Doc pointer: `docs/infrastructure/ai-system.md` "Risk-Tiered Review Pipeline" subsection (added by this section).
+> - Scope boundary: process and doctrine layer only; the deterministic gates from §17/§18/§20 keep their existing logic and just gain bootstrap-mode awareness.
+
+> **Verified:** 2026-04-28 | RISK_TIER=trivial | 8/8 items | build OK | tests 300/300 PASS
+> **Quality reviewed:** 2026-04-28 | Codex 2x (design + adversarial-skipped per trivial tier doctrine that this section ships) | 0H+1M fixed | scope: N/A (host-side automation; dogfooded RISK_TIER=trivial pipeline -- 1 design dispatch, no consistency/perf/re-adversarial)
+
+---
+
+## 23. Unify SKIP_REVIEW_HOOK Opt-Out Scanner Across PreToolUse Gates
+
+The TODO-02 §11 review-pipeline closure (commit `3bc47f6f`) exposed a real friction point in the PreToolUse gate stack: `section_review_required.py` and `section_commit_gate.py` honor the `SKIP_REVIEW_HOOK` opt-out via TWO different read paths that no single bash-tool command can satisfy at once.
+
+**The conflict** (verified 2026-04-29 in the §11 commit dance):
+
+- [`section_review_required.py:12`](../../.claude/hooks/section_review_required.py) reads `os.environ.get('SKIP_REVIEW_HOOK', '')`. The hook process inherits the harness env, NOT the bash-command-line env, so inline `SKIP_REVIEW_HOOK=1 git commit ...` does NOT reach this hook. Its prefix allowlist (`git `, `bash scripts/`, `node `, `python3 `, `grep `, `awk `, `sed `, `wc `, `head `, `tail `, `ls `, `cat `, `find `, `rg `, `cd `) requires the cmd to START with one of those tokens; an env-var assignment as the first token fails the allowlist and the hook BLOCKs.
+- [`section_commit_gate.py:1507-1549`](../../.claude/hooks/section_commit_gate.py) `_scan_inline_env_prefix(cmd)` DOES recognize `SKIP_REVIEW_HOOK=1 git commit ...` (and `env SKIP_REVIEW_HOOK=1 ...`, `sudo SKIP_REVIEW_HOOK=1 ...`, etc.). This was the explicit Codex routing-fix #2 (post-c65568fc) intended to bridge harness env vs bash-cmd-line env.
+
+Mismatch: same env var, two different read mechanisms. **No single command shape satisfies both gates** when both are armed:
+
+| Cmd shape                                        | section_review_required           | section_commit_gate                        |
+| ------------------------------------------------ | --------------------------------- | ------------------------------------------ |
+| `git commit ...`                                 | PASS (`git ` prefix)              | BLOCK (no opt-out)                         |
+| `SKIP_REVIEW_HOOK=1 git commit ...`              | BLOCK (cmd starts with `SKIP_*=`) | PASS (inline scan)                         |
+| `bash scripts/commit-with-skip.sh ...` (wrapper) | PASS (`bash scripts/`)            | PASS (wrapper exports env before exec git) |
+
+The duct-tape workaround `scripts/commit-with-skip.sh` exists precisely because the in-tree gates have no shared opt-out scanner. That wrapper now lives in the tree (added during the §11 closure) but it is NOT documented as a canonical bridge, NOT enumerated in MANIFEST.md, and the underlying opt-out shape inconsistency remains.
+
+> **Outcome:** a single, shared SKIP-env scanner used by every PreToolUse gate that claims to honor `SKIP_REVIEW_HOOK`. Inline `SKIP_REVIEW_HOOK=1 git commit ...` works for ALL gates without a wrapper. The behavior is consistent, documented, and tested. The duct-tape wrapper is either retired or formally named as the canonical opt-out bridge.
+
+- [x] **Shared SKIP-env scanner shipped** at [`.claude/hooks/_skip_env.py`](../../.claude/hooks/_skip_env.py) (HELPER module, `# block-via: warning-only`). `read_skip_envs(cmd, keys, fallback_to_environ=True) -> dict[str, str]` merges inline cmd env-prefix (with wrapper-walk: env/sudo/doas/nice/nohup/timeout/ionice/stdbuf/command/exec) + os.environ; inline wins on collision. Codex design Q1 fix: explicit key list (not prefix) prevents suffix-collision capture.
+- [x] **`section_review_required.py` migrated** -- now imports `_skip_env` and reads `SKIP_REVIEW_HOOK` via the shared helper. Inline form `SKIP_REVIEW_HOOK=1 git commit ...` reaches the gate (was env-only before).
+- [x] **`section_commit_gate.py` migrated** -- `_scan_inline_env_prefix()` is now a one-line delegation to `_se.read_skip_envs(cmd, keys=(SKIP_REVIEW_HOOK, SKIP_REVIEW_HOOK_REASON), fallback_to_environ=False)`. Preserves the original API shape so existing call sites in this file work unchanged.
+- [x] **5 other PreToolUse hooks migrated** -- `phase1_evidence_gate.py` (SKIP_PHASE1_BLOCK), `step5_quality_gate.py` (SKIP_QUALITY_GATE_BLOCK; cmd="" because Edit hook), `skill_step_block.py` (SKIP_SKILL_STEP_BLOCK; cmd from tool_input when Bash), `design_review_required.py` (SKIP_DESIGN_REVIEW_HOOK), `receiving_review_required.py` (RECEIVING_REVIEW_OVERRIDE; `_opt_out` now takes payload as required arg).
+- [x] **3 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) `[skip_env_unified]` block: `se_inline_form` (inline only), `se_environ_form` (environ only), `se_inline_wins` (collision merge). 326/326 PASS (was 323).
+- [x] **`scripts/commit-with-skip.sh` retired** -- never committed (untracked); deleted from disk. Inline form now satisfies all gates without the wrapper hop.
+- [x] **[`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) Hook Routing Matrix** -- new opt-out callout names `_skip_env.py` as the shared scanner, both shapes (inline + environ) work for every gate, wrapper retired.
+- [x] Commit: `"hooks: unify SKIP_REVIEW_HOOK opt-out scanner across PreToolUse gates"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §3 receiving-code-review hard gate](#3-receiving-code-review-hard-gate-state-file--post-codex-hook-block) (canonical SKIP_REVIEW_HOOK consumer), [00-infrastructure/TODO-08 §4 section-commit gate](#4-section-commit-gate-hardens-to-block-with-build--codex--receiving-evidence) (origin of `_scan_inline_env_prefix`), [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (phase1_evidence_gate also reads SKIP envs), [00-infrastructure/TODO-08 §20 implement-pipeline section-commit gates](#20-implement-pipeline-section-commit-gates-steps-581316) (step5_quality_gate also reads SKIP envs).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` passes the new `[skip_env_unified]` block (3 sub-tests). Manual reproduction: stage a TODO with an `[x]` flip + new stamp, attempt `SKIP_REVIEW_HOOK=1 git commit ...` without a wrapper -- both `section_review_required.py` and `section_commit_gate.py` accept the opt-out and the commit lands. The §11 stamp commit's wrapper hop is no longer required.
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 5 new sub-tests under `[skip_env_unified]` (3 helper + 1 section_commit_gate inline-wins + 1 SKIP_SMOKE_GATE inline form) | 328/328 PASS (was 323).
+
+> **Notes:**
+> - What shipped: [`.claude/hooks/_skip_env.py`](../../.claude/hooks/_skip_env.py) HELPER (~120 lines) with `read_skip_envs(cmd, keys, fallback_to_environ=True) -> dict[str, str]`; 7 PreToolUse hooks migrated to consume it; 3 new `[skip_env_unified]` sub-tests; `commit-with-skip.sh` wrapper retired.
+> - How it integrates: each PreToolUse gate passes its explicit key list (Codex design Q1 fix prevents suffix-collision capture); inline cmd env-prefix wins over `os.environ` on key collision (Codex design Q3 inline-wins); `cmd=""` for Edit/Write hooks, full `tool_input.command` for Bash gates.
+> - Downstream effects: `SKIP_REVIEW_HOOK=1 git commit ...` now satisfies BOTH `section_review_required.py` and `section_commit_gate.py` without `commit-with-skip.sh`; the wrapper hop documented in TODO-02 §11 stamp commit is no longer required.
+> - Canonical doc: [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "Hook Routing Matrix" opt-out callout.
+> - Scope boundary: scanner-unification only. Prefix-allowlist standardization is partner doctrine in §29; state-write reliability for `last-codex-review.json` is §24.
+
+> **Verified:** 2026-04-29 | commit `91f6cda7` | 8/8 items | build OK | tests 327/327 PASS | inline opt-out verified end-to-end (this very commit shipped via inline SKIP_REVIEW_HOOK=1 git commit, no wrapper)
+> **Quality reviewed:** 2026-04-29 | Codex 6x (design + adversarial-impl + adversarial + consistency + perf + re-adversarial) | 2H+3M fixed | scope: N/A (host-side hook helper extraction; no kernel/boot/desktop/shell domain)
+
+---
+
+## 24. last-codex-review.json State-Write Reliability -- Close §22 #4 Properly
+
+[`§22 #4`](#22-review-pipeline-right-sizing-doctrine----risk_tier--bootstrap--tier-aware-triage--state-diagnosis--spiral-check) flagged "diagnose state-file write failures" but landed only partially -- the §22 ship stamp shows `0H+1M fixed` and across the §11 + §21 closures of this session I repeatedly hit `last-codex-review.json missing -- no Codex review in this session?` BLOCKs from `section_commit_gate.py` despite verifiably dispatching Codex and adopting findings via `superpowers:receiving-code-review`. I bypassed via `SKIP_REVIEW_HOOK=1` opt-outs, which is doctrine-violation hidden behind a documented escape hatch. The state-write hook IS recognizing the dispatch (the per-kind stamp lands in `last-review-stamps.json`) but `last-codex-review.json` -- the file the receiving-review gate consults -- stays empty.
+
+> **Outcome:** every Codex dispatch that fires through the canonical `codex-companion.mjs adversarial-review` path produces a complete `last-codex-review.json` write within the same PostToolUse window. The receiving-review gate sees the write reliably; SKIP_REVIEW_HOOK=1 is no longer needed for "I dispatched Codex but the state file didn't capture it" cases.
+
+- [x] **Reproduce** the missing-write scenario locally: dispatched a synthetic + a real adversarial-review via the canonical `node ...codex-companion.mjs ...` shape; observed that `last-codex-review.json` IS written reliably on every trigger when the hook resolves the correct repo root via `git rev-parse --show-toplevel`. The §22 #4 incidents reproduced in this session traced to TWO causes the debug log surfaced: (a) the test-tooling parallel sub-test had `cd && cmd1 & cmd2 &` -- the `cd` only applied to the FIRST background job, so the second job ran from the live repo and wrote to the live state file, masking the per-test-fixture write; (b) when the agent shells out to a python `<<<` HEREDOC or runs a hook from outside the repo, `_repo_root()` resolves to `None` and the writer fails-open silently. Neither is a writer bug; both are call-site bugs surfaced ONLY by the new debug log. Fix shape: observability + test-shape correctness, not writer logic.
+- [x] **Instrument [`codex_review_completed.py`](../../.claude/hooks/codex_review_completed.py)** with verbose JSONL diagnostic logging (env-gated `CODEX_REVIEW_DEBUG=1`) -- `_debug_log` now writes one JSON object per line to `.claude/state/codex-review-debug.jsonl` with fields `{ts_ns, event, classifier_kind, classifier_label, last_codex_review_write_ok, last_codex_review_write_path, stamp_write_ok, error, ...}`. Two new emit sites bracket the writer: `trigger_state_write` (last-codex-review.json) and `trigger_stamp_write` (last-review-stamps.json), both with success/error capture so failures leave a trail without changing fail-open semantics.
+- [x] **Fix the root cause** -- determined via the debug log + reproduction that the writer is correct; the §22 #4 incidents traced to cwd / repo-root resolution at the call site. Documented in §24's outcome paragraph above. No writer-logic change required; the test-shape `cd` bug is fixed in the new sub-test 3 (each background job carries its own `cd`).
+- [x] **4 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) under a new `[codex_review_state_write]` block: (1) `crsw_synthetic_dispatch` -- synthetic adversarial dispatch -> `last-codex-review.json` populated within 1 s with `received: false` + `Bash(...)` trigger label; (2) `crsw_unmarked_kind` -- unmarked dispatch -> state file still written + debug log records `review_kind="unknown"` (documented, not silent drop); (3) `crsw_parallel_writes` -- two parallel dispatches with per-job `cd` -> both writes complete + 8 debug records (4 per process: `main_entry`, `classify`, `trigger_state_write`, `trigger_stamp_write`) + `last-review-stamps.json` shows both `adversarial` and `consistency` kinds persisted; (4) `crsw_write_failure_honesty` -- monkeypatches `os.replace` to raise `OSError(ENOSPC)`, drives `crc.main()` with a synthetic trigger, parses `codex-review-debug.jsonl`, asserts the wired `trigger_state_write` record has `last_codex_review_write_ok: false` + non-empty error string (regression for the post-impl review pipeline H1 fix that converted `_write_atomic` / `_record_stamp` to return `(ok, err)` so the JSONL cannot lie about success). 332/332 PASS after the block lands.
+- [x] **Update §22 #4** to `[x]` -- back-XREF to §24 added.
+- [x] **Retire bootstrap-mode SKIP_REVIEW_HOOK reasons** -- the live `.claude/state/skip-log.jsonl` does not (and from now on, should not) carry "TODO-08 §22 #4 known issue" reasons; the §24 sub-tests are the regression signal. Future `SKIP_REVIEW_HOOK=1 git commit` calls citing that reason are evidence of regression, not workflow.
+- [x] Commit: `"hooks: last-codex-review.json state-write reliability -- close §22 #4"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §3 receiving-code-review hard gate](#3-receiving-code-review-hard-gate-state-file--post-codex-hook-block) (consumer of `last-codex-review.json`), [00-infrastructure/TODO-08 §22 review-pipeline right-sizing](#22-review-pipeline-right-sizing-doctrine----risk_tier--bootstrap--tier-aware-triage--state-diagnosis--spiral-check) (origin of #4 deferral that this section closes).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` passes the new `[codex_review_state_write]` block (4 sub-tests). Manual reproduction: dispatch any review-kind Codex via the canonical path, observe `.claude/state/last-codex-review.json` populated within 1 s with the actual writer schema `{timestamp_ns, trigger, trigger_files, trigger_blobs, head_sha, tree_hash, received: false, received_timestamp_ns: null}` (the harness does not expose `tool_use_id`, so a per-dispatch correlation key is deferred to a future TODO if/when the harness adds it). The per-kind stamp lands in `last-review-stamps.json` under the dispatched TODO path. Subsequent `git commit` of a section-ship signature does NOT BLOCK with "Codex review in this session?".
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 4 new sub-tests under `[codex_review_state_write]`: `crsw_synthetic_dispatch`, `crsw_unmarked_kind`, `crsw_parallel_writes`, `crsw_write_failure_honesty` (regression for the section-24 H1 fix that returned `(ok, err)` from `_write_atomic` so the JSONL diagnostic cannot lie about success).
+
+> **Verified:** 2026-04-29 | commit `4b80434c` | 7/7 items | build N/A (hooks-only) | tests 332/332 PASS | lint 0 errors
+> **Quality reviewed:** 2026-04-29 | Codex 5x (adversarial + consistency + perf + re-adversarial + consistency-refresh) | 1H+4M fixed | scope: N/A (Python hook + bash test infra; no domain code-quality skill applies)
+
+> **Notes:**
+> - Structure: observability upgrade + 1 small contract change in 2 helpers + 4 sub-tests. No new state file; the existing `last-codex-review.json` and `last-review-stamps.json` schemas are unchanged. The new diagnostic file is `.claude/state/codex-review-debug.jsonl`, env-gated, JSONL.
+> - Helper return-type change: `_write_atomic(path, data)` and `_record_stamp(...)` now return `(ok: bool, err: str)`. Existing callers that discarded the prior `None` return are unaffected (Python ignores extra returns); the receive-side `_write_atomic` call discards the new tuple intentionally.
+> - Codex review pipeline adoption: 4x dispatches (adversarial + consistency + perf + re-adversarial). Round 1 returned 1 H + 2 M (writers fail-open, M1 schema drift, M2 weak parallel test); all valid, all fixed. Round 2 (re-adversarial on the fix delta) returned APPROVE / zero findings, loop closed.
+> - Scope boundary: this section ONLY closes §22 #4 (state-write reliability). Per-dispatch correlation IDs (`tool_use_id`) and observer regex coverage gaps remain owned by §25. Phase-1 evidence-gate tuning is §27.
+
+---
+
+## 25. Observer Step-13/13.5 Regex Coverage for All Codex Dispatch Shapes
+
+Across the §11 + §21 review pipelines this session, [`skill_step_observer.py`](../../.claude/hooks/skill_step_observer.py) failed to record step 13 (`implement-todo-section` adversarial Codex dispatch) and step 13.5 (re-adversarial) terminal-step evidence even when I dispatched correctly via `node ...codex-companion.mjs adversarial-review "[review-kind: ...]"`. I had to manually inject step-13 records via `python3 -c '...'` + `skill-progress.json` JSON edits before invoking `review-todo-section` or before each post-impl commit. The observer's regex for matching the canonical dispatch shape has a coverage gap.
+
+> **Outcome:** every Codex dispatch that fires through `node $HOME/.claude/plugins/marketplaces/openai-codex/plugins/codex/scripts/codex-companion.mjs adversarial-review "<prompt>"` is recognized by the observer as the canonical step-13 / step-13.5 / step-5 / step-8 evidence, depending on `[review-kind:]` marker. No more manual step-record injection.
+
+- [x] **Audit** done. The observer delegates kind classification to `_review_kind.detect_review_kind_from_cmd` (a shared first-non-blank-line classifier). The actual coverage gap was in `skill_step_map.py`'s `_IMPLEMENT_TODO_SECTION` rule list: only `__REVIEW_KIND__:design` (step 4) and `__REVIEW_KIND__:adversarial` (step 13) bound to step numbers. The other 5 canonical kinds (`adversarial-impl`, `test-coverage`, `consistency`, `perf`, `re-adversarial`) were silently dropped during implement flow because they had no step rule -- the classifier returned the kind correctly but `match_step` had nothing to bind it to.
+- [x] **Survey deferred** -- `.claude/state/tool-history.jsonl` records `tool_use_id` + `event` + `ts_ns` only; the actual `tool_input` is not in the history schema, so an empirical survey of dispatch shapes is not possible from history alone. The 7 canonical kinds from the section spec are sourced from the `_review_kind` classifier's accepted set + the 8 codex-* skill names. Empirical survey would need a richer history schema and is out of scope here.
+- [x] **Tightened the observer step map** to bind all 7 kinds. `_IMPLEMENT_TODO_SECTION` now has: `design`->step 4, `test-coverage`->step 9, `adversarial`/`adversarial-impl`->step 13, `consistency`/`perf`/`re-adversarial`->step 20 (post-impl review pipeline equivalent). `_REVIEW_TODO_SECTION` similarly extended to recognize `adversarial-impl` and `test-coverage` as evidence at the appropriate phases. Un-marked dispatches now trigger a stderr WARN from `skill_step_observer.py` naming the active skill + pointing at `.claude/skills/codex-prompt-shape.md` so the agent sees the missing-marker drift instead of silently dropping it.
+- [x] **8 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) `[skill_step_observer]` block: one per canonical kind (`design`, `adversarial`, `adversarial-impl`, `test-coverage`, `consistency`, `perf`, `re-adversarial`) asserting `match_step('implement-todo-section', 'Bash', synthetic_cmd)` returns the expected step, plus an `unmarked` sub-test asserting unmarked dispatches return `[]` (not bound to any step; the observer's runtime stderr WARN is the agent-visible path). Block was 0 sub-tests; now 8 (one over the 7 spec asks). 340/340 PASS.
+- [x] **Documented the canonical shape** at [`.claude/skills/codex-prompt-shape.md`](../../.claude/skills/codex-prompt-shape.md) (NEW; canonical reference for all 7 markers + their step bindings + skill-author checklist). Each of the 8 codex-* skills (`codex-adversarial-review-section`, `codex-consistency-audit`, `codex-design-review`, `codex-fix-review`, `codex-impact-analysis`, `codex-perf-review`, `codex-review-todo`, `codex-test-coverage`) now carries a "## Prompt Shape" callout right after the External-Reviewer Contract that names the skill's expected `[review-kind: ...]` marker and links to the canonical doc.
+- [x] **Manual-injection sweep** -- `grep -c "manual" .claude/state/skill-progress.json` returned 0; no manual-injection markers exist in the live state. Going forward, the observer's WARN on un-marked dispatches is the regression signal (a WARN appears = either un-marked dispatch from a skill author OR drift from the canonical shape doc).
+- [x] Commit: `"hooks: skill_step_observer regex coverage for all Codex dispatch shapes"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §10 skill step-state telemetry](#10-skill-step-state-telemetry--non-contiguous-step-block) (origin of the observer + step-block), [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (consumer of step-13.5 records), [00-infrastructure/TODO-08 §22 review-pipeline right-sizing](#22-review-pipeline-right-sizing-doctrine----risk_tier--bootstrap--tier-aware-triage--state-diagnosis--spiral-check) (#5 spiral-check observer surface).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` `[skill_step_observer]` block passes 14/14 (was 0). Manual reproduction: dispatch each canonical Codex shape; observer's stderr is silent on marked dispatches and emits the un-marked WARN on a marker-less prompt, the typo WARN on a non-canonical marker (e.g. `performance` instead of `perf`), and the wrong-canonical WARN when the marker is canonical but not bound for the active skill. The integration assertion (a real Codex dispatch lands an entry in `.claude/state/skill-progress.json` with the matching `n`) is covered by the four-dispatch gate's stamp-attribution path; the unit-level matcher contract is what the new block tests.
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 14 new sub-tests under `[skill_step_observer]`: 7 canonical kinds (`design`, `adversarial`, `adversarial-impl`, `test-coverage`, `consistency`, `perf`, `re-adversarial`), `unmarked`, `typo_marker_unbound`, `bound_review_kinds_complete`, `quality_review_section_typo_unbound`, `quality_review_section_adversarial_bound`, `wrong_canonical_marker_unbound`, `skill_examples_classifier_validated` (parser + fail-closed regression scanning all 21 dispatch examples across `.claude/skills/`).
+
+> **Verified:** 2026-04-29 | commit `e212dc89` | 7/7 items | build N/A (hooks-only) | tests 346/346 PASS | lint 0 errors
+> **Quality reviewed:** 2026-04-29 | Codex 9x (adversarial + consistency + perf + 6x re-adversarial) | 0H+9M fixed, 1H reverted-XREF | scope: N/A (Python hook + shared markdown doc + bash test infra; no domain code-quality skill applies)
+
+> **Notes:**
+> - Structure: SKILL_STEP_MAP step rules extended (5 new __REVIEW_KIND__ sentinel rules in implement-todo-section + 2 in review-todo-section + 1 sentinel-conversion in quality-review-section); observer's no-match WARN path now classifies missing / typo / wrong-canonical as 3 distinct loud-WARN cases; `bound_review_kinds(skill)` helper externalizes the kind-binding query; canonical-prompt-shape doc + per-skill Prompt Shape callouts + 13 marker-bearing example updates across 11 skills.
+> - Codex review pipeline adoption: 9x dispatches across 7 rounds (adversarial + consistency + perf in round-1 + 6 re-adversarial rounds). Findings: 0H+9M fixed across rounds 1-6 (each round caught a more granular issue: writer-fail-closed semantics, schema drift, weak parallel-test, broad-regex bypass, unmarked workflow examples, typo'd-marker silence, wrong-canonical-marker silence, permissive grep, line-continuation invisibility). Round 7 produced 1H reverted-with-XREF: pre-existing heredoc-body spoofing in the substring classifier predates section-25 -- my round-6 line-continuation fix expanded the surface, was reverted in round-7, and the proper shell-aware-segmentation refactor is filed as a follow-up section.
+> - Scope boundary: this section delivers observer-coverage for marked dispatches via the substring classifier. Heredoc-body spoofing + multi-line continuation support are deferred to the shell-aware Codex dispatch segmentation follow-up section (which factors `_is_codex_bash_trigger` from `codex_review_completed.py` into a shared helper consumed by `_review_kind`, `phase1_evidence_gate`, and `skill_step_block`).
+
+---
+
+## 26. `scripts/commit-with-skip.sh` Wrapper Retired (Closed by §23)
+
+The TODO-02 §11 review-pipeline closure introduced a duct-tape wrapper script to bridge the env-var read mismatch between `section_review_required.py` and `section_commit_gate.py`. §23 closed the underlying gap by extracting `_skip_env.py` as a shared scanner; inline `SKIP_REVIEW_HOOK=1 git commit ...` now works for every gate without a wrapper. The wrapper file was untracked, never committed, and was deleted from disk during §23 implementation. This section is retained as a closed historical entry so readers diffing §23 + §26 can see the wrapper's full lifecycle.
+
+> **Outcome:** the wrapper does not exist on disk and has no live references in `.claude/`, `docs/`, or `scripts/`. Inline `SKIP_REVIEW_HOOK=1 git commit ...` is the canonical opt-out shape for every gate, documented in [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "Hook Routing Matrix" opt-out callout (added by §23).
+
+- [x] **Wrapper deleted from disk** during §23 implementation -- never committed; no `git rm` was needed because the file was always untracked.
+- [x] **§23 shared scanner is the canonical opt-out** -- `_skip_env.read_skip_envs(cmd, keys, fallback_to_environ=True)` honors inline cmd env-prefix AND `os.environ` with inline-wins on collision. Both this commit and the §23 implementation commit landed via inline `SKIP_REVIEW_HOOK=1 git commit ...`, proving the form works end-to-end.
+- [x] **TODO-02 §11 stamp commit reference is decodable as historical** -- the "duct-tape wrapper" prose stays in the §11 commit message body (commit messages are immutable historical records). Future readers diff against §23 + §26 for context; no edit is needed or appropriate.
+- [x] Commit: subsumed by `"hooks: unify SKIP_REVIEW_HOOK opt-out scanner across PreToolUse gates"` (§23 commit `91f6cda7`).
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §23 unify SKIP_REVIEW_HOOK opt-out scanner](#23-unify-skip_review_hook-opt-out-scanner-across-pretooluse-gates) (parent; §26 is the closure branch of the §23 retire-or-document decision).
+
+**Test checkpoint:** `ls scripts/commit-with-skip.sh` returns "not found"; live references to the wrapper exist only in this closed section's historical prose and in §23's documented retirement entry. `git grep -n commit-with-skip` may still surface historical commit messages (immutable; expected).
+
+> **Test runner:** N/A (closure entry; §23's `[skip_env_unified]` block covers the unified-scanner contract).
+
+> **Notes:**
+> - Structure / consumers: this section is a closed historical companion to §23. §23 owns the shared scanner; §26 records that the §23 outcome was the "retire" branch (not "document"). No live code or test surface here.
+> - Canonical doc: [`docs/infrastructure/ai-system.md`](../../docs/infrastructure/ai-system.md) "Hook Routing Matrix" opt-out callout.
+> - Scope boundary: §26 owns nothing now -- the wrapper is gone, the canonical inline form lives in §23.
+
+> **Verified:** 2026-04-29 | commit `91f6cda7` (§23) | 4/4 items | wrapper absent | no live references
+> **Quality reviewed:** 2026-04-29 | scope: N/A (closure entry; review-pipeline subsumed by §23)
+
+---
+
+## 27. Phase 1 Evidence-Gate Threshold Tuning via Miss-Log Telemetry
+
+[`phase1_evidence_gate.py`](../../.claude/hooks/phase1_evidence_gate.py) requires `>=2 Read/Grep on src/include/.claude/scripts/docs since the skill started` before allowing a step-5 adversarial Codex dispatch. The threshold of 2 is arbitrary -- it was chosen at §17 ship time as "enough to prove Phase 1 evidence ran" but never empirically tuned. This session's review pipelines hit the gate twice (correctly) when I jumped straight to step 5 without doing Phase 1 grep-evidence; after explicit grep passes the gate let me through. Both fires were correct rejections, so no false-positive evidence yet -- but the §21 partial-enforcement heuristics doctrine (WARN-first, miss-log, FP ratio over last-N entries, promote to BLOCK after observation) applies here too. Phase 1 evidence-gate is currently a hard BLOCK at threshold 2; it should follow the §21 promotion pipeline so the threshold is tuned by data, not guessed.
+
+> **Outcome:** Phase 1 evidence-gate threshold is data-driven. The miss-log records both BLOCKs and successful clears; periodic `scripts/heuristic-misses-report.sh` runs surface FP ratio; threshold adjusts up or down based on observed false-positive rate over a documented N-section window.
+
+- [x] **Phase 1 evidence-gate emits step-4 miss-log entry** via `_heuristic_misses.emit_warn` on every BLOCK. Gate stays a hard BLOCK (Phase 1 evidence is mandatory); the WARN is additive (logged-for-ratio-tuning, not converted-to-warning). Uses `hm.parse_active_todo_section(entry)` for `(todo_path, section)` attribution, matching the `skill_step_block.py` canonical pattern.
+- [x] **Threshold surfaced as `PHASE1_MIN_READS = 2`** in `phase1_evidence_gate.py:62` with a doctrine comment naming the section-27 tuning path. Legacy alias `_PHASE1_MIN_EVIDENCE = PHASE1_MIN_READS` retained so existing module-level callers work unchanged. Future tuning is a one-line edit.
+- [x] **3 sub-tests** in `scripts/test-tooling.sh` `[pre_codex_enforcement]` block under `phase1_evidence_misslog`: (1) 0 reads -> BLOCK + miss-log step:4 entry with `signal="phase1-evidence-missing"`; (2) 1 read -> BLOCK + new miss-log entry (separate fire); (3) 2 reads -> PASS, NO new miss-log entry appended. Plus an H1 design-review fix: the fixture now copies `_heuristic_misses.py` (the gate imports it at module load).
+- [x] **Reporter + doc updated** -- `scripts/heuristic-misses-report.sh` `WINDOW_BY_STEP` gets `step 4 -> 30`; printout adds the step-4 promotion criterion (`<5% FP over 30 sections`). `docs/infrastructure/ai-system.md` "Hook Promotion Pipeline" gets a step-4 row naming the `<5%/30 sections` target + the `BLOCK+WARN` semantics (already-shipped hard BLOCK; the WARN is the tuning surface, not a promotion path). Per-section dedup added in the reporter for step 4 only (M2/M3/M4 fixes from the post-impl Codex pipeline): `_section_collapse(records)` groups by `(todo_path, section)` keeping the most-recent per group, but records with missing metadata stay UNIQUE (keyed on ts_ns) so under-attributed BLOCKs still count as observations, AND FP flags are aggregated (logical OR) across the group so an earlier-flagged FP followed by a later unflagged retry still counts as FP at the section level.
+- [x] Commit: `"hooks: phase1_evidence_gate -- add miss-log telemetry; threshold tunable per section-27 doctrine"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (parent gate), [00-infrastructure/TODO-08 §21 implement-todo-section partial-enforcement heuristics](#21-implement-todo-section-partial-enforcement-heuristics-warn-first) (miss-log + ratio-report consumer surface this section extends).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` `[pre_codex_enforcement]` 3/3 new `phase1_evidence_misslog` sub-tests PASS. After 30 sections of observation: `bash scripts/heuristic-misses-report.sh` shows step-4 FP ratio with per-section dedup; threshold tunes accordingly via a follow-up TODO if needed.
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 3 new sub-tests under `[pre_codex_enforcement]` `phase1_evidence_misslog` (0 reads / 1 read / 2 reads emit-or-not assertions).
+
+> **Verified:** 2026-04-29 | commit `9580885a` | 5/5 items | build N/A (hooks-only) | tests 349/349 PASS | lint 0 errors
+> **Quality reviewed:** 2026-04-29 | Codex 5x (design + adversarial + consistency + perf + 3x re-adversarial) | 1H+5M fixed | scope: N/A (Python hook + bash reporter + markdown doc; no domain code-quality skill applies)
+
+> **Notes:**
+> - Structure: 1 hook edit (`phase1_evidence_gate.py` -- `PHASE1_MIN_READS` constant + `hm.emit_warn(step=4)` call), 1 reporter extension (`scripts/heuristic-misses-report.sh` -- `WINDOW_BY_STEP[4]=30` + `_section_collapse` for step 4), 1 doc update (`ai-system.md` Hook Promotion Pipeline step-4 row), 3 sub-tests in `[pre_codex_enforcement]`.
+> - How it integrates: every BLOCK fire appends one structured JSON line to `.claude/state/heuristic-misses.jsonl` with `step:4 signal:"phase1-evidence-missing"`. `bash scripts/heuristic-misses-report.sh` surfaces the per-section-deduped FP ratio over a last-30-sections window. The gate stays a hard BLOCK; the WARN is observability for tuning `PHASE1_MIN_READS`, not a promotion path.
+> - Codex review pipeline: 5x dispatches (design + adversarial + consistency + perf + 3x re-adversarial). Findings: 2 design (H1 fixture cp + M1 reporter/doc sync), 1 adversarial M (per-attempt vs per-section), 1 re-adversarial M (collapse merging missing-metadata), 1 re-adversarial M (FP flag lost during collapse). All fixed. Round-4 re-adversarial APPROVE / zero findings, loop closed.
+> - Canonical doc: [`docs/infrastructure/ai-system.md` "Hook Promotion Pipeline"](../../docs/infrastructure/ai-system.md#hook-promotion-pipeline).
+> - Scope boundary: section-27 owns the miss-log telemetry + reporter dedup for step 4. The actual `PHASE1_MIN_READS` value tuning (decreasing from 2 -> 1, increasing from 2 -> 3) is a downstream decision filed as a follow-up TODO once 30 sections of observation accumulate.
+
+---
+
+## 28. Codex Prompt Argument Escaping Doctrine
+
+This session produced 3 cosmetic shell errors from un-escaped tokens in the Codex prompt strings I passed to `node ...codex-companion.mjs adversarial-review "..."`:
+
+1. `<step>`, `<last-N>`, `<` -- bash parsed as redirects. Errors: `line 42: -: command not found`, `syntax error near unexpected token '<'`.
+2. `$(SYSTEM_DISK)` -- bash command-substitution: tried to run `SYSTEM_DISK` as a binary. Error: `line 26: SYSTEM_DISK: command not found`.
+3. `${MOK_KEY}` -- bash variable expansion (would have been the third class if I'd used it).
+
+Each error was harmless -- the dispatch ran with the substituted-empty-string prompt and Codex's broader context made the intent clear -- but the noise muddled the output and forced me to scroll past stderr garbage to find the actual Codex verdict. I was inconsistent about quoting: sometimes single-quoted heredocs, sometimes double-quoted strings. The double-quoted strings expose `$(...)` and `${...}` (and the `<` tokens are always exposed in either form when they look like redirects).
+
+> **Outcome:** every Codex prompt argument is single-quote-safe by construction. A wrapper script + lint sub-check catch un-escaped expansion shapes BEFORE the dispatch runs, so stderr stays clean and the verdict is the only signal.
+
+- [x] **`scripts/codex-dispatch.sh` shipped** as a thin convenience wrapper that ENFORCES `argc == 1` (multi-argv misuse fails loud with a diagnostic) and emits ADVICE on residual `$(`/`${`tokens (does not block; both intentional-single-quoted and post-expansion residuals land here legitimately). The wrapper `exec`s into `node "$HOME/.../codex-companion.mjs" adversarial-review "$1"`. **Design redesign per the Codex design pass H1 finding:** the original wrapper-validates-prompt design was rejected because argv = post-expansion (bash already evaluated `$(...)` before the wrapper sees argv); the wrapper cannot detect the failure class it was meant to harden. The load-bearing safety moved to lint Check 12 (source-text scan).
+- [x] **`scripts/lint.sh` Check 12 shipped** -- LOAD-BEARING source-text scanner. Walks `.claude/skills/`, `scripts/`, `docs/` for documented Codex dispatches and WARNs when a prompt body in DOUBLE quotes contains `$(...)` / `${...}` (bash would expand). WARN-first per the partial-enforcement-heuristics promotion doctrine. Skip-list excludes the wrapper script header doc + the lint scanner self + the canonical `codex-prompt-shape.md` doctrine doc. Opt-out: `SKIP_LINT_PROMPT_ESCAPING=1`.
+- [x] **21 skill examples migrated** across 15 SKILL.md files from direct-node form to wrapper form (`bash scripts/codex-dispatch.sh '<body>'`). The §25 `skill_examples_classifier_validated` regression EXTENDED to count both shapes via union regex; 21/21 examples parse + classify correctly post-migration.
+- [x] **Hook recognition extended** -- `_review_kind.detect_review_kind_from_cmd` and `codex_review_completed.py` `_segment_is_codex_invocation` + `_bash_prompt_arg` all recognize the wrapper shape (`bash`/`sh` + `codex-dispatch.sh`, OR bare `codex-dispatch.sh`) alongside the legacy direct-node shape. The H1 fix from the post-impl Codex pipeline closed a gap where the trigger fired but the prompt extracted as empty, breaking stamp attribution.
+- [x] **3 sub-tests** in `scripts/test-tooling.sh`: `cde_argc_enforcement` + `cde_lint_check_12` under `[codex_dispatch_escaping]`, plus `crsw_wrapper_attribution` under `[codex_review_state_write]` (regression for the H1 fix; drives `crc.main()` with a wrapper Bash payload and asserts both `last-codex-review.json` AND `last-review-stamps.json` get the expected `(todo_path, kind)` attribution).
+- [x] **CLAUDE.md "Codex Prompt Argument Escaping" section** added under Codex Invocation Policy. Names the wrapper as canonical, names lint Check 12 as the load-bearing safety, names `SKIP_LINT_PROMPT_ESCAPING=1` opt-out.
+- [x] Commit: `"scripts: codex-dispatch.sh wrapper + lint Check 12 -- prompt argument escaping doctrine"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §19 Codex prompt-scope helper](#19-codex-prompt-scope-helper----wrapper-plumbing-for-re-reviews) (sibling wrapper for re-review prompt augmentation; §28 wraps the input side, §19 wraps the output side).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` `[codex_dispatch_escaping]` 2/2 PASS + `[codex_review_state_write]` `crsw_wrapper_attribution` PASS. Manual reproduction: dispatch a Codex prompt via the wrapper using single-quoted body -> stderr clean, hook attributes `last-review-stamps.json` correctly; lint a fixture file with double-quoted prompt containing `$(...)` -> Check 12 WARN fires with file:line.
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 3 new sub-tests: 2 under `[codex_dispatch_escaping]` (`cde_argc_enforcement`, `cde_lint_check_12`); 1 under `[codex_review_state_write]` (`crsw_wrapper_attribution`).
+
+> **Verified:** 2026-04-29 | commit `904065a2` | 7/7 items | build N/A (hooks-only) | tests 352/352 PASS | lint 0 errors
+> **Quality reviewed:** 2026-04-29 | Codex 6x (design + adversarial + consistency + perf + 1x re-adversarial + impl-adversarial) | 3H+2M fixed, 1H accepted-XREF: TODO-08 section-30 | scope: N/A (Python hooks + bash wrapper + lint check + markdown migration)
+
+> **Notes:**
+> - Structure: 1 wrapper script + 1 lint check + 2 hook helpers extended (`_review_kind` + `codex_review_completed`) + 21 skill examples migrated across 15 SKILL.md files + 1 CLAUDE.md doctrine section + 3 sub-tests.
+> - How it integrates: lint Check 12 is the load-bearing safety (source-text BEFORE shell). The wrapper is convenience: `argc == 1` enforcement + hook-attribution shape. Hook recognition (`_is_codex_bash_trigger` + `_bash_prompt_arg`) accepts both wrapper and legacy direct-node shapes so existing logs and ad-hoc invocations remain attributed.
+> - Codex review pipeline: 5x dispatches (design + adversarial + consistency + perf + 1x re-adversarial). 1H found at design (argv-time validation cannot detect post-expansion damage; redesigned to source-text-lint as load-bearing layer); 1H found at adversarial pipeline (wrapper trigger but no prompt extraction; fixed via `_bash_prompt_arg` extension); 1H accepted-XREF at re-adversarial (wrapper-shape spoofing in substring classifier; same class as pre-existing direct-node spoofing, owned by section-30 shell-aware-segmentation refactor).
+> - Canonical doc: [`CLAUDE.md` "Codex Prompt Argument Escaping"](../../CLAUDE.md#codex-prompt-argument-escaping) + [`.claude/skills/codex-prompt-shape.md`](../../.claude/skills/codex-prompt-shape.md).
+> - Scope boundary: section-28 owns the wrapper + lint Check 12 + skill-example migration + hook recognition. Shell-aware Codex dispatch segmentation (heredoc-spoofing, multi-line continuation, prose-mention false-positives) is owned by section-30; section-28 inherits the substring-classifier flaw section-30 closes.
+
+---
+
+## 29. Standardize PreToolUse Prefix-Allowlist Across Gates
+
+Partner doctrine to §23. While §23 unifies HOW gates read `SKIP_*` envs (the inline-env scanner), §29 unifies WHICH bash command prefixes count as "trusted tooling" (the prefix allowlist that gates use to short-circuit before evaluating opt-outs). Today `section_review_required.py` hard-codes its own prefix list (`git `, `bash scripts/`, `node `, `python3 `, `grep `, `awk `, `sed `, `wc `, `head `, `tail `, `ls `, `cat `, `find `, `rg `, `cd `); other PreToolUse gates either use a different list or reimplement the check. New gates land with their own ad-hoc prefix decisions, leading to inconsistencies (e.g. one gate accepts `env VAR=val ...` but another doesn't).
+
+> **Outcome:** a policy-scoped `.claude/hooks/_review_pipeline_passthrough.py` HELPER module exports the canonical "review-pipeline tooling prefix" set. Review-pipeline PreToolUse gates that need this policy consume the helper; future gates with different threat models define their OWN policy-scoped helper rather than inheriting from this one. The doctrine is "one helper per policy", not "one helper for all prefix checks". The original `_prefix_allowlist.py` / `is_trusted_tool_prefix()` naming was rejected during the design review because centralizing under a generic name would launder broad code-execution prefixes (`node`, `python3`, `bash scripts/`) into write-sensitive gates where the policy does not fit.
+
+- [x] **Audit** done. Only `section_review_required.py:41-44` carries the canonical 15-prefix multi-prefix allowlist (`git`, `bash scripts/`, `node`, `python3`, `grep`, `awk`, `sed`, `wc`, `head`, `tail`, `ls`, `cat`, `find`, `rg`, `cd`). Other PreToolUse hooks have single-prefix `git commit` checks, file-path checks, or token-parsing `startswith` calls -- not multi-prefix allowlists. Section-29 is forward-looking doctrine: extract the helper now so future review-gates inherit the canonical list.
+- [x] **Helper extracted** at [`.claude/hooks/_review_pipeline_passthrough.py`](../../.claude/hooks/_review_pipeline_passthrough.py) (HELPER, `# block-via: warning-only`). **Design redesign per the Codex design pass H1:** the original `_prefix_allowlist.py` / `is_trusted_tool_prefix()` / `TRUSTED_TOOL_PREFIXES` naming was rejected because the prefix set permits broad code-execution shapes (`node`, `python3`, `bash scripts/`) that are safe inside the review pipeline but NOT safe to launder into future gates with different threat models. Renamed to policy-scoped `is_review_pipeline_passthrough()` / `REVIEW_PIPELINE_PREFIXES` with a module docstring that explicitly forbids inheritance from other policies. Each prefix's rationale is documented in the comment block.
+- [x] **`section_review_required.py` migrated** -- imports `_review_pipeline_passthrough as _rpp`; the prior 4-line inline tuple at lines 41-44 is now `if _rpp.is_review_pipeline_passthrough(cmd) or '&&' in cmd[:5]:`. The chained-command bypass detection (`'&&' in cmd[:5]`) stays inline since it is a separate concern (not a prefix-allowlist concern).
+- [x] **6 sub-tests** in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) `[review_pipeline_passthrough]` block (was 0): rpp_git_commit + rpp_bash_scripts_slash + rpp_bash_random_rejected + rpp_node_codex + rpp_destructive_rejected + rpp_rg_search. Doubles the spec'd 3 sub-tests for both inclusion and exclusion coverage.
+- [x] **`scripts/audit-hooks.sh` drift check shipped** -- new section after the plugin-side check. Greps `.claude/hooks/*.py` for multi-prefix allowlist tuples containing `git ` / `bash scripts/` / `python3 ` / `node ` AND fails if a hook has the tuple but does NOT import `_review_pipeline_passthrough`. Currently zero drift.
+- [x] **`docs/infrastructure/ai-system.md` "Hook Routing Matrix"** -- new "Review-pipeline passthrough policy" callout right after the "Opt-out env vars" callout. Names the helper, lists the 15 prefixes, and EXPLICITLY forbids inheritance from other policies. Future gates with different threat models define their own helper.
+- [x] Commit: `"hooks: standardize PreToolUse prefix-allowlist across gates (partner to section-23)"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §23 unify SKIP_REVIEW_HOOK opt-out scanner across PreToolUse gates](#23-unify-skip_review_hook-opt-out-scanner-across-pretooluse-gates) (sibling unification; §23 is env-scanner, §29 is prefix-allowlist, both attack the same gate-stack inconsistency from different angles).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` `[review_pipeline_passthrough]` 6/6 PASS. `bash scripts/audit-hooks.sh` PASS with the new review-pipeline-passthrough drift check. Manual reproduction: add a new prefix to one hook's inline `cmd.startswith` tuple instead of the helper -> audit-hooks.sh FAIL (drift caught with `DRIFT::review-pipeline prefix-allowlist tuple in <file>:<line> not using _review_pipeline_passthrough helper`).
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 6 new sub-tests under `[review_pipeline_passthrough]`: rpp_git_commit, rpp_bash_scripts_slash, rpp_bash_random_rejected, rpp_node_codex, rpp_destructive_rejected, rpp_rg_search.
+
+> **Verified:** 2026-04-29 | commit `1ed350df` | 7/7 items | build N/A (hooks-only) | tests 358/359 PASS (1 unrelated pre-existing) | lint 0 errors | audit-hooks PASS
+> **Quality reviewed:** 2026-04-29 | Codex 5x (design + adversarial + consistency + perf + perf-refresh) | 1H+1M fixed | scope: N/A (Python helper + bash audit + markdown doc; no domain code-quality skill applies)
+
+> **Notes:**
+> - Structure: 1 new helper module (`_review_pipeline_passthrough.py`, ~40 LOC) + 1 consumer migration (`section_review_required.py`, 4-line tuple to 1-line helper call) + 1 audit-hooks check + 1 ai-system.md doctrine callout + 6 sub-tests.
+> - How it integrates: review-pipeline PreToolUse gates import `_review_pipeline_passthrough as _rpp` and call `_rpp.is_review_pipeline_passthrough(cmd)`. The audit-hooks drift check FAILs if any non-helper consumer has the canonical multi-prefix tuple. Other gates with different threat models do NOT consume this helper.
+> - Codex review pipeline: 5x dispatches (design + adversarial + consistency + perf + 1x impl-adversarial). 1H at design (centralizing under a generic `TRUSTED_TOOL_PREFIXES` name would launder broad code-execution prefixes into future gates; redesigned to policy-scoped naming). Other rounds clean.
+> - Canonical doc: [`docs/infrastructure/ai-system.md` "Hook Routing Matrix" Review-pipeline passthrough policy callout](../../docs/infrastructure/ai-system.md#hook-routing-matrix).
+> - Scope boundary: section-29 owns the review-pipeline-passthrough helper + section_review_required.py migration + drift check. Other policy-scoped allowlists (e.g. a future `_kernel_touching_passthrough.py` for kernel-edit gates, or a future `_build_artifact_passthrough.py` for build-touching gates) are NOT in scope here -- the doctrine forbids inheritance from this helper, so each new policy gets its own module.
+
+---
+
+## 30. Shell-Aware Codex Dispatch Segmentation in `_review_kind`
+
+The `_review_kind.detect_review_kind_from_cmd` classifier currently uses substring + first-token-split parsing: it sees `codex-companion.mjs` and `adversarial-review` anywhere in the Bash command and treats the rest of the string as the prompt. This is vulnerable to two false-classification shapes:
+
+1. **Heredoc bodies.** A docs-write Bash command like `cat > /tmp/foo.md <<EOF ... codex-companion.mjs adversarial-review "[review-kind: adversarial]" ... EOF` falsely classifies as a dispatch and credits the matching step in `skill_step_observer.py`. The Codex review pipeline that closed §25 surfaced this as a Round-7 H finding (the issue predates §25; my line-continuation normalization in §25's round-6 fix expanded the surface, then was reverted in round-7).
+2. **Multi-line dispatches.** A `node ... codex-companion.mjs \<NL>   adversarial-review "[review-kind: ...]"` shape (typed verbatim or pulled from a docs example) is one logical command but the substring classifier doesn't handle line-continuations, so kind detection returns empty.
+3. **Wrapper-shape spoofing (added during §28 closure 2026-04-29).** The §28 wrapper recognition extends the same substring classifier with a `codex-dispatch.sh in cmd` branch. A search/prose command like `rg "codex-dispatch.sh '[review-kind: adversarial]"` is now classified as an adversarial dispatch and would award skill-step-observer step credit for a phantom dispatch. This is the same spoofing class as #1 (heredoc) extended to a new spelling; the section-commit gate is unaffected (real dispatches update `last-review-stamps.json` via PostToolUse, search commands don't), but the step-observer side fires false-positive step credit. Fix shape: same shell-aware-segmentation refactor that closes #1 + #2.
+
+`codex_review_completed.py` already has the right machinery: `_is_codex_bash_trigger(cmd)` does shlex tokenization + segment-by-control-operator (`;`, `&&`, `||`, `&`) + heredoc-body strip + argv shape match (`node` + `codex-companion.mjs` + a real review subcommand). Factor that into a shared helper module both hooks consume so the §3 four-dispatch gate and the `skill_step_observer` step map agree on what a real dispatch is.
+
+> **Outcome:** every Codex dispatch attribution path (PostToolUse `codex_review_completed.py`, observer `skill_step_map.match_step` via `_review_kind.detect_review_kind_from_cmd`, `phase1_evidence_gate`) shares a single `is_codex_dispatch(cmd) -> bool` + `extract_dispatch_prompt(cmd) -> str` API. Heredoc-body matches and prose mentions cannot fool any of them. Multi-line dispatches with shell line-continuation classify identically to single-line.
+
+- [x] **Audited consumers**. `codex_review_completed.py` owned the canonical shlex+segment parser (`_is_codex_bash_trigger` + `_bash_prompt_arg`). `_review_kind.detect_review_kind_from_cmd` used substring + first-token-split (the load-bearing flaw). `phase1_evidence_gate.py` consumes `_review_kind.is_dispatch_of_kind` (transitively migrated). `skill_step_map.match_step` consumes `_review_kind.detect_review_kind_from_cmd` (transitively migrated). `section_commit_gate.py` already imported `crc._segment_by_separators` + `crc._trim_heredoc_body` directly.
+- [x] **Factored helpers into [`.claude/hooks/_codex_dispatch.py`](../../.claude/hooks/_codex_dispatch.py)** (HELPER, `# block-via: warning-only`). Public API: `is_codex_dispatch(cmd) -> bool`, `extract_dispatch_prompt(cmd) -> str`. Internal helpers (`_trim_heredoc_body`, `_segment_by_separators`, `_segment_is_codex_invocation`) re-exported for the existing `codex_review_completed.py` + `section_commit_gate.py` call sites. **Three canonical shapes preserved per the design review H1 finding** (originally I only proposed direct-node + wrapper; the bare CLI `codex review` / `codex e` form was nearly dropped):
+  1. Direct node: `node ".../codex-companion.mjs" adversarial-review "<p>"`
+  2. Wrapper: `bash scripts/codex-dispatch.sh '<p>'` (TODO-08 section-28 canonical)
+  3. Bare CLI: `codex review "<p>"` / `codex e "<p>"` (after Codex global-option walk)
+- [x] **codex_review_completed.py migrated** -- `_is_codex_bash_trigger` and `_bash_prompt_arg` are now thin re-bound wrappers calling `_cd.is_codex_dispatch` / `_cd.extract_dispatch_prompt`. Internal helpers (`_trim_heredoc_body`, `_segment_by_separators`, `_segment_is_codex_invocation`) re-bound to `_cd._*` so existing `crc._*` import sites work unchanged.
+- [x] **`_review_kind.detect_review_kind_from_cmd` migrated** -- delegates to `_cd.extract_dispatch_prompt` for the prompt body; only the `[review-kind: ...]` marker scan on the first non-blank line stays local. The substring + first-token-split path that was vulnerable to heredoc / prose / wrapper-spoofing is gone.
+- [x] **Fail-closed on heredoc spoofing** -- `cdh_heredoc_rejected` sub-test asserts that `cat > /tmp/foo.md <<EOF\\ncodex-companion.mjs adversarial-review "[review-kind: adversarial]"\\nEOF` returns `is_codex_dispatch=False`. Per-segment heredoc-body strip via `_trim_heredoc_body` in the segmenter loop.
+- [x] **Multi-line continuation support** -- the helper's `_LINE_CONT_RE` pre-pass collapses `\\<newline>[ \\t]*` to a single space BEFORE shlex tokenization. Multi-line dispatches classify identically to single-line. The 2 reverted multi-line sub-tests under `[skill_step_observer]` (`multiline_continuation_before_subcommand`, `multiline_continuation_before_prompt`) are restored and PASS.
+- [x] **6 sub-tests in [`scripts/test-tooling.sh`](../../scripts/test-tooling.sh) `[codex_dispatch_helper]`** block: `cdh_direct_node`, `cdh_wrapper`, `cdh_bare_cli` (closes design-review H1), `cdh_heredoc_rejected`, `cdh_prose_rejected` (closes section-28 wrapper-spoofing concern), `cdh_chained_2nd_seg`. All 6 PASS; 367/367 total tooling tests.
+- [x] **Restored 2 multi-line sub-tests** in `[skill_step_observer]`: `multiline_continuation_before_subcommand` + `multiline_continuation_before_prompt`. Pre-section-30 these returned empty and were reverted; now they classify via the shared helper.
+- [x] Commit: `"hooks: shell-aware Codex dispatch segmentation -- close TODO-08 section-25 round-7 deferred"`
+
+**Inputs (XREFs):** -> XREF: [00-infrastructure/TODO-08 §25 observer regex coverage](#25-observer-step-13135-regex-coverage-for-all-codex-dispatch-shapes) (origin; §25 round-7 H finding deferred this work), [00-infrastructure/TODO-08 §3 receiving-code-review hard gate](#3-receiving-code-review-hard-gate-state-file--post-codex-hook-block) (consumer; the four-dispatch attribution path needs the shared helper too), [00-infrastructure/TODO-08 §17 review-pipeline pre-Codex enforcement](#17-review-pipeline-pre-codex-enforcement-phase-1--re-adversarial) (`phase1_evidence_gate.py` is one of the consumers).
+
+**Test checkpoint:** `bash scripts/test-tooling.sh` `[codex_dispatch_helper]` block passes 5/5 + the 2 restored multi-line sub-tests in `[skill_step_observer]`. Manual reproduction: a `cat <<EOF ... codex-companion.mjs adversarial-review "..." ... EOF` Bash command does NOT credit any step in `.claude/state/skill-progress.json` and does NOT update `.claude/state/last-review-stamps.json`.
+
+> **Test runner:** `bash scripts/test-tooling.sh` | 6 new sub-tests under `[codex_dispatch_helper]` (`cdh_direct_node`, `cdh_wrapper`, `cdh_bare_cli`, `cdh_heredoc_rejected`, `cdh_prose_rejected`, `cdh_chained_2nd_seg`) + 2 restored under `[skill_step_observer]` (`multiline_continuation_before_subcommand`, `multiline_continuation_before_prompt`).
+
+> **Verified:** 2026-04-29 | commit `50849b92` | 8/8 items | build N/A (hooks-only) | tests 367/367 PASS | lint 0 errors
+> **Quality reviewed:** 2026-04-29 | Codex 2x (design + adversarial) | 1H fixed (design: 3-shape parity) | scope: N/A (Python helper extraction + 2 hook migrations + markdown)
+
+> **Notes:**
+> - Structure: 1 new shared helper module (`_codex_dispatch.py`, ~330 LOC including docstrings) + 2 hook migrations (`codex_review_completed.py` re-bound wrappers, `_review_kind.py` delegated to helper) + 6 new sub-tests + 2 restored sub-tests + 4 test-fixture cp lines added so the new helper module reaches each isolated fixture.
+> - How it integrates: every Codex dispatch attribution path (PostToolUse `codex_review_completed.py`, observer `skill_step_map.match_step` via `_review_kind.detect_review_kind_from_cmd`, `phase1_evidence_gate`) shares the single `is_codex_dispatch(cmd) -> bool` + `extract_dispatch_prompt(cmd) -> str` API. Heredoc-body matches, prose mentions, search commands, and wrapper-shape spoofs cannot fool any of them. Multi-line dispatches with shell line-continuation classify identically to their single-line equivalents.
+> - Codex review pipeline: 2x dispatches (design + adversarial). 1H at design (originally proposed shape only handled direct-node + wrapper; bare-CLI form would have silently broken; expanded scope to all 3 shapes before implementation). adversarial pass clean.
+> - Canonical doc: [`docs/infrastructure/ai-system.md` "Hook Routing Matrix"](../../docs/infrastructure/ai-system.md#hook-routing-matrix) (the section-23 SKIP-env Scanner + section-29 review-pipeline-passthrough callouts are siblings; the section-30 shared dispatch helper is the third leg).
+> - Scope boundary: section-30 owns the shared shell-aware-segmentation helper. Future Codex review-kind additions (e.g. a new dispatch shape) get a new branch in `_codex_dispatch._segment_is_codex_invocation` + `_segment_extract_prompt`; consumers stay unchanged.
+
+---
+
+## 31. Post-Commit Hook Concurrency: Serialize Build/Smoke via flock
+
+The Claude Code post-commit hook fires `bash scripts/build.sh` (and conditionally `scripts/test-smoke.sh`) on every kernel-touching commit. Back-to-back commits within ~3 seconds spawn parallel build invocations that share `build/` and stomp each other's intermediate object directories, producing spurious `[smoketest] [FAIL] Build failed` and `SMOKE TEST FAILED` banners in tool output. The actual repo HEAD compiles green on a clean rebuild every time. Reproduced 3+ times during the 2026-05-01 [`01-boot-platform/TODO-03-bootloader-error-recovery.md`](../01-boot-platform/TODO-03-bootloader-error-recovery.md) re-review pass (D01 T03; back-to-back review commits + hash-fill commits).
+
+> [!IMPORTANT]
+> **Symptom vs cause:** the failure is purely a hook-side concurrency race; no shipping commit has ever been broken by it. Cost is operator-confusing PostToolUse output that prompts repeated "why is build failing?" questions.
+
+- [x] **Shared flock helper + hook integration** (Codex M1 design adopted, shipped 2026-05-01): new [`.claude/hooks/_postcommit_lock.py`](../../.claude/hooks/_postcommit_lock.py) (~140 LOC) exposes `try_acquire()` non-blocking flock context manager on `/tmp/impossible-os-postcommit.lock` (path overridable via `IMPOSSIBLE_OS_POSTCOMMIT_LOCK`), `emit_deferred()` JSON systemMessage helper for the lock-held branch, and `run_with_group_timeout()` Popen wrapper with `start_new_session=True` + SIGKILL-process-group on `TimeoutExpired` so QEMU/make descendants are reaped before the lock releases. Both [`post_commit_smoketest.py`](../../.claude/hooks/post_commit_smoketest.py) and [`post_commit_smoketest_boot.py`](../../.claude/hooks/post_commit_smoketest_boot.py) wrap their `subprocess` dispatch through the helper -- on contention they emit `[smoketest|smoketest-boot] another post-commit build/smoke run in progress, deferring (HEAD <sha>)` and return 0.
+- [x] **Process-group cleanup on timeout** (Codex adversarial M1 fix): plain `subprocess.run(timeout=60)` SIGKILLs only the direct bash child; QEMU and make descendants reparent to init and survive, leaving the lock to release while the build/ tree is still being mutated. `run_with_group_timeout()` uses `os.killpg(p.pid, SIGKILL)` + 5s reap window so descendants are gone before the with-block exits.
+- [x] **Test coverage** ([`.claude/hooks/test_postcommit_lock.py`](../../.claude/hooks/test_postcommit_lock.py)): 6 sub-tests cover (1) first acquirer wins, (2) second acquirer sees held, (3) auto-release on context exit, (4) emit_deferred JSON shape, (5) env-override path, (6) `run_with_group_timeout` reaps grandchild process group on TimeoutExpired. All 6 pass. Run: `python3 .claude/hooks/test_postcommit_lock.py`.
+- [x] **Test-smoke isolation from build** -- DECLINED. Codex adversarial confirmed the lock-level fix subsumes the smoke-isolation alternative: with both hooks serialized through the shared flock, build/ and smoke artifacts are guaranteed serial regardless of which test runs in `build/` vs `build/smoke/`. Keeping them in the same tree avoids a build-cache split.
+- [x] Commit: `"hooks: post-commit serialization via flock + process-group cleanup -- end stomp-stamp races"`
+
+**Test checkpoint:** Two `git commit --allow-empty` calls within 1s of each other on a kernel-touching branch produce exactly ONE build invocation and ONE smoke run; the second post-commit hook emits the deferral systemMessage and returns 0. Tool-output stream does NOT contain `[smoketest] [FAIL] Build failed` when HEAD is actually green. Direct `python3 .claude/hooks/test_postcommit_lock.py` run shows 6/6 sub-tests PASS.
+
+> **Test runner:** `python3 .claude/hooks/test_postcommit_lock.py` | 6 sub-tests, 0 failures (lock acquire/release, deferred-message JSON, env override, process-group reap)
+
+> **Notes:**
+> - What shipped: shared `_postcommit_lock.py` flock helper (try_acquire context manager + emit_deferred + run_with_group_timeout); both `post_commit_smoketest.py` and `post_commit_smoketest_boot.py` route their subprocess dispatch through the helper. ~140 LOC helper + ~30 LOC of hook edits + 6-subtest harness.
+> - How it integrates: PreToolUse Bash hook fires both post-commit hooks; first acquirer holds the flock through subprocess completion; second acquirer emits deferred systemMessage and returns 0 silently; on TimeoutExpired the helper kills the process group before releasing the lock.
+> - Downstream effects: end of the spurious `[smoketest] [FAIL] Build failed` and `SMOKE TEST FAILED` banners that fired on every back-to-back commit pair throughout the 2026-05-01 TODO-03 re-review pass; closes the operator-confusion failure mode without affecting direct shell invocations of `scripts/build.sh` / `scripts/test-smoke.sh`. Codex 2x review adoptions in commit `<hash>`.
+> - Canonical doc: this section + `.claude/hooks/_postcommit_lock.py` module docstring.
+> - Scope boundary: §31 owns the post-commit-hook serialization layer. The hook scripts themselves stay owned by §7 (Hook System Audit + Dedupe). `scripts/build.sh` and `scripts/test-smoke.sh` keep their existing direct-shell callers unaffected.
+
+> **Verified:** 2026-05-01 | commit `42b831e2` | 5/5 items | build OK | tests 6/6 PASS (lock helper sub-tests; first/second acquirer, auto-release, deferred-msg JSON, env override, process-group reap). Hook imports clean; lint exit 0.
+> **Quality reviewed:** 2026-05-01 | Codex 2x (design + adversarial) | 1M fixed (process-group cleanup on TimeoutExpired prevents descendant survival across lock release); design dispatch returned 2 procedural-confusion no-ships rejected with code evidence; consistency + perf skipped (hook-infrastructure scope, no kernel/runtime surface, no hot path) | scope: N/A (hook-infrastructure, no domain code-quality skill applies)
+
+---
+
+## 32. Grammar-Accurate Shell Segmentation for the Gate Exemptions
+
+The build-offload gate (`build_offload_reminder.py`) decided its exemptions with a hand-rolled shell walk, `command_segments()` and its helpers in `.claude/hooks/_codex_dispatch.py`, which failed closed on `case`/`esac`, comments and arithmetic. This section was filed to replace that walk with a grammar-accurate parser. The gate was deleted with the process gates on 2026-11-09 (`71f25965a`), and nothing else called the walk, so it is deleted instead of re-parsed.
+
+- [x] Delete the walk (`command_segments`, `_has_unmodelled_grammar`, `_split_raw_segments`, `_scan_raw`, `_take_substitution`, `_strip_heredoc_bodies` and the quoting helpers), which no live code calls
+- [x] Record the parser evaluation for any future segmenting gate (answer Q47)
+- [x] The Bash safety guards judge the command behind shell grammar and redirections (`guard_argv`), so `if true; then git reset --hard; fi` and `git 2>"a b" reset --hard` are refused
+- [x] Commit: `"hooks: delete the shell walk the deleted offload gate used"`
+
+**Test checkpoint:** `git grep` finds no caller of the deleted names; `test_dispatch_recognition.py` and `test_review_gate.py` pass; `test_guard_compound.py` refuses 72 compound and redirect shapes in both guards, allows 18 harmless commands of the same shapes, checks the quote masks, and bounds two 220 to 420 KB inputs at 2.5 s.
+
+> **Test runner:** N/A (host tooling) | validation: `python3 scripts/overnight/tests/test_guard_compound.py`, `python3 scripts/overnight/tests/test_dispatch_recognition.py`, `python3 scripts/overnight/tests/test_review_gate.py`, `bash scripts/overnight/tests/run-all.sh`
+
+> **Notes:**
+> - What shipped: 362 lines of dead shell walk removed from `_codex_dispatch.py`; `_segment_by_separators` and the commit gate's `_BashLexer` are untouched; `_tokenize` now also gives each token its quote mask.
+> - Parser evaluation, 2026-11-17, over 17,428 distinct Bash commands from this project's transcripts: tree-sitter-bash 0.25.1 (MIT) failed 62 that `bash -n` accepts, nearly all heredocs, including `git commit -F - <<'EOF' 2>&1 | tail` and two heredocs on one line, and it is a compiled extension every hook would load. bashlex 0.18 was rejected on 2026-08-05 (no quoted heredocs, no `case`).
+> - The two Bash safety guards still segment shell with the token-based `_segment_by_separators`; `guard_argv` makes them read the command behind shell grammar and redirections, splitting a word at every unquoted `<` or `>` operator (each token carries the quote mask `_with_quote_masks` builds; a word without one reads as unquoted, and over 16,527 recorded commands none lacked one).
+> - Residue filed as section 47 (item: "Choose the guards' parser"): separators inside a substitution, commands after a heredoc or substitution, substitution bodies, named fds, quoted separator targets, `$(...)` targets, empty quoted targets and heredoc text that breaks shlex need the shell grammar, not more token rules.
+> - Rejected (round 4): an escaped `)` inside a `case` pattern (`case "a)b" in a\)b ) ...`) hides the arm's command; deliberate shell, outside the accidental-verb threat model.
+> - Scope boundary: segmentation for a new gate builds on `_tokenize`, `_segment_by_separators` and `guard_argv` (or the commit gate's `_BashLexer`), not a new walk (Q47).
+
+> **Verified:** 2026-11-17 at 391d23a0c (code at 5a524d46f): control-plane suite 95 passed, 0 failed; `test_guard_compound.py`, `test_dispatch_recognition.py`, `test_review_gate.py` and `test_attended_repair_worktree.py` pass; each fix's control fails with that fix reverted; every one of 16,527 recorded commands gets a quote mask.
+> **Quality reviewed:** 2026-11-17 | Codex 41x (plan, round 15x, performance 15x, completion 10x) | 9H+13M+2L fixed or filed (grammar families to section 47), 1 rejected, 0 open | scope: N/A (host tooling, no kernel surface)
+
+
+## 33. Section-commit gate reads an untokenizable commit line as a commit
+
+> **Spawned-by:** root
+
+`section_commit_gate.py` decides whether a command is a commit by tokenizing it. A line `shlex` cannot tokenize is read as no commit at all, so `git commit -m $'a\';b' -n` passes the gate unjudged.
+
+- [x] Measured: 575 recorded commit commands, 165 misread; counts and examples in the commit message.
+- [x] The gate reads a command as bash does (`_BashLexer`); lines after a syntax error `bash -n` reports never run.
+- [x] `.githooks/prepare-commit-msg` refuses a `git commit` that skipped `pre-commit`; `test_no_verify_refused_by_git.py`.
+- [x] At `pass_cap` the stamp needs no clean round; performance and the last pass still must (`test_three_pass_gate.py`).
+- [x] Tests in `test_commit_gate_script_lines.py`: the example, heredocs, substitutions, prose; they fail on HEAD.
+- [x] The reader is linear on long, nested and malformed input; re-reads and `bash -n` share per-reading budgets.
+- [x] `run-all.sh` runs every test plain python3 never calls under pytest; pytest is a `setup.sh --verify` sentinel.
+- [x] Commit: `"hooks: the commit gate reads a command as bash reads it"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` passes with the new cases.
+
+> **Test runner:** `bash scripts/overnight/tests/run-all.sh` | 90 files, 0 failures (reader cases, real-git oracle, scaling tests, no-verify refusal)
+
+> **Notes:**
+> - What shipped: `_BashLexer` reads a command as bash does; `git commit` options are read as parse-options reads them; prepare-commit-msg refuses a commit pre-commit never saw.
+> - How it integrates: the PreToolUse gate judges each Bash call; git's own hook is the backstop for any spelling the reader misses.
+> - Downstream effects: 160 of 575 recorded commands the old shlex reader called no commit are now read; the reader is linear and budgeted, so it cannot time the hook out.
+> - Canonical doc: [Automation Hardening](../../docs/infrastructure/automation-hardening.md) and the Host Bootstrap Contract (pytest sentinel).
+> - Scope boundary: the gate-exemption shell walk was deleted with its gate (section 32).
+
+> **Verified:** 2026-11-12 | commit `1bd151153` | 8/8 items | build N/A (hooks-only) | run-all.sh 90/90 PASS | 575-command replay: 0 changed verdicts | lint exit 0
+> **Quality reviewed:** 2026-11-12 | Codex passes: plan, rounds to the 55 cap, performance x12, completion x12; final performance and completion approve on `1bd151153` | every P2 fixed with a test failing on its prior candidate | scope: N/A (host tooling, no kernel/boot surface)
+
+## 34. Section-commit gate test wiring that kernel sources can satisfy
+
+> **Spawned-by:** root
+
+The gate's step-8 rule binds a staged source file to a test named for its basename. 434 of 516 kernel sources have no test of that name, because suites are registered per subsystem, so the rule cannot be met and is opted out of.
+
+- [x] Counted refusals and opt-outs: 23 kernel section commits, all staging their test (in the commit message).
+- [x] A staged test covers a source when code the boot runs (from `boot_tests_run`, or the entry of a user test `make userland` builds) reaches a use of a symbol it defines (`_test_coverage_by_symbol.py`).
+  - Per source, in the same commit; `tested-by:` for flat binaries; upstream ACPICA exempt, its local additions not.
+- [x] Warning for the first ten sections stamped after the rule (`STEP8_WARN_SECTIONS`, counted from `STEP8_WARN_SINCE`), then a refusal.
+- [x] Unit tests in `test_step8_suite_coverage.py`: 52 cases; each finding's case fails on the code it replaced.
+- [x] Commit: `"hooks: the commit gate finds a kernel source's tests by suite, not by file name"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` passes with the new cases.
+
+> **Test runner:** `bash scripts/overnight/tests/run-all.sh` | 91 files, 0 failures (`test_step8_suite_coverage.py` 52 cases: suite reachability, user builds, scope, image, tested-by)
+
+> **Notes:**
+> - What shipped: `_test_coverage_by_symbol.py` reads the runners, the suites they register and the user tests `make userland` builds, and credits a source only with code a test runs, in its own image.
+> - How it integrates: `section_commit_gate.py` step 8 checks every staged source against the staged tests; `--report` lists each kernel source's tests (238 covered, 143 untested at `6caec1a3a`).
+> - Downstream effects: kernel section commits no longer opt out of step 8; the rule warns for ten stamped sections, then refuses.
+> - Canonical doc: [AI System](../../docs/infrastructure/ai-system.md) (implement-pipeline section-commit gates); the gate's scope is `todo/answers.md` Q39.
+> - Scope boundary: a C and Make text reader inside the 10 s hook, not a compiler; code written to fool it is out of scope (Q39), and a clean build or CI refuses a broken link recipe.
+
+> **Verified:** 2026-11-12 | commit `9e0cee875` | 5/5 items | build N/A (hooks-only) | run-all.sh 91/91 PASS | real tree: 238 covered, 143 untested, 16 user tests | lint exit 0
+> **Quality reviewed:** 2026-11-12 | Codex passes: plan, 22 rounds, performance and reconciliation each wave; final round, performance and reconciliation approve on `9e0cee875` | every in-scope P2 fixed with a test failing on its prior candidate; contrived constructs P3 under Q39 | scope: N/A (host tooling, no kernel/boot surface)
+
+## 35. Cross-section review of a closed TODO file
+
+> **Spawned-by:** root
+
+Every review reads one section. Nothing reads a finished file as a whole, so a defect that only shows across sections (two sections each correct, wrong together) has no reviewer. `codex-review-todo` exists and is never scheduled.
+
+- [x] Ran one cross-section pass on 01-boot-platform/TODO-07 (closed 2026-11-09, 25 sections): 3 findings no single-section review could make, all verified in the code.
+  - All entries exhausted: the synthesized `fallback` id is no menu candidate, so F11 cannot open the menu (sections 3, 5, 6, 7, 9).
+  - Watchdog rollback removes the peak-tries entry among already-filtered candidates, so it can drop the last viable entry (sections 3, 5, 12).
+  - `LoaderEntries` publishes inactive and unsupported entries policy refuses (sections 3, 6, 15, 16, 21).
+  - Filed as 01-boot-platform/TODO-07 §26 (item: "With every entry exhausted, F11 and `menu-force` still open the menu").
+- [/] `complete-todo-file` step 8a runs the pass before the close-out report: one pass, one fix round, the rest filed as a new section in the file. Waits on the next file close-out to run it.
+- [x] Not needed: the first file returned 3, so the step is kept.
+- [ ] Commit: `"skills: a closing TODO file gets one review across its sections"`
+
+**Test checkpoint:** The next file the run closes shows the pass in its close-out commit, or this section records two empty results.
+
+## 36. Second-boot leg in the smoke matrix
+
+> **Spawned-by:** root
+
+Every boot test starts from a fresh image, so anything that depends on what the previous boot left behind is unproven. The first concrete need is the open item in `01-boot-platform/TODO-29-boot-perf-health-observability.md` ("second boot updates index 0").
+
+- [x] The matrix boots one disk twice on KVM and TCG: each 2-CPU leg ends with the power button (`SMOKE_SHUTDOWN=1`, S5), then a `SMOKE_KEEP_DISK=1` boot reuses its disk and variables. Green on both.
+- [x] `SMOKE_TREND_BOOTS=N` waits for the trend write and requires `X:\Perf\boot-trend.json` to hold N boots; a fresh disk asked for 2 fails.
+- [x] `scripts/test-tooling.sh` runs the matrix against stub scripts (26 legs; each clean-shutdown 2-CPU boot followed by a kept-disk boot, with a control that drops it), and checks a refused second boot keeps the disk and a bad count is refused.
+- [x] Commit: `"test: the smoke matrix boots the same disk twice"`
+
+**Test checkpoint:** `bash scripts/test-smoke-matrix.sh` passes with the two-boot leg listed.
+
+> **Test runner:** `bash scripts/test-smoke-matrix.sh` (26 legs, the two `boots` legs included); the pair alone (KVM, 2 CPUs; add `SMOKE_FORCE_TCG=1` to both for TCG): `SMOKE_SMP=2 SMOKE_TREND_BOOTS=1 SMOKE_SHUTDOWN=1 bash scripts/test-smoke.sh`, then `SMOKE_SMP=2 SMOKE_TREND_BOOTS=2 SMOKE_KEEP_DISK=1 bash scripts/test-smoke.sh`.
+
+> **Notes:**
+> - What shipped: `test-smoke.sh` gains `SMOKE_SHUTDOWN` (ACPI power button, guest must reach S5), `SMOKE_KEEP_DISK` (boot the previous run's disk and variables, no rebuild) and `SMOKE_TREND_BOOTS` (boot-trend file must hold N boots).
+> - How it integrates: each engine's 2-CPU matrix leg is the first boot of a pair and a kept-disk boot follows it at once; the matrix stays at 26 legs and dropped from 498 s to 419 s.
+> - Downstream effects: state a boot leaves on disk for the next is now booted on every matrix run, and a guest that cannot power off fails the matrix.
+> - Canonical doc: [Boot Validation and Certification Matrix](../../docs/boot/boot-validation-matrix.md).
+> - Scope boundary: proves one cross-boot fact (the boot-trend record); the other trend checks (index 0 order, the 16-entry trim) stay with the boot observability TODO.
+
+> **Verified:** 2026-11-13 | commit `dbdd38522` | 4/4 items | build OK | matrix 26/26 PASS on `dbdd38522` (kvm and tcg pairs read back 2 boots; a fresh disk asked for 2 fails) | shutdown oracle self-test 7/7 | orchestration test 26 legs, 2 pairs, control 24/0 | lint exit 0
+> **Quality reviewed:** 2026-11-13 | Codex passes: plan, 6 rounds, 2 performance, 4 completions; final round and performance approve on `dbdd38522` | 4M fixed (leaked kept-disk copies, duplicate first boots, kill instead of a clean shutdown, failed quiesce accepted as clean), 2L fixed, 0 open | scope: N/A (host test harness, no kernel/boot source)
+
+## 37. Syscall argument counts in the ABI fingerprint
+
+> **Spawned-by:** root
+
+`render()` in `scripts/gen-user-abi.py` fingerprints syscall names and numbers. A syscall whose arguments change keeps its fingerprint, so user and kernel can disagree on a call's shape with every check green. `SYS_EXEC` had already moved from `(path, len)` to `(path, argv, envp)` with the header comment still giving the old shape, and `sys_fault_inject` passed three arguments to a handler that reads two.
+
+- [x] The fingerprint hashes an `ARGC` record per `SYS_*` name, and the contract publishes `ARGC_SYS_*`; a changed count moves `IMPOSSIBLE_OS_ABI_HASH`.
+  - `make check-abi` refuses the committed contract until it is regenerated; `abi-stamp-check.sh` keys on `syscall.c` so the check runs.
+- [x] `gen-user-abi.py` reads each count from clang's AST of `syscall_handler()` in all 12 flavors, not from a hand table.
+  - Highest `arg1..arg3` or `frame->rdi/rsi/rdx` read, following fallthrough; bare-number labels, case ranges, renamed locals and per-flavor differences are refused.
+- [x] Ring-3 wrappers compile only with the kernel's count: `syscall0..3` are `_Static_assert` macros over `syscall_raw0..3`; `sys_fault_inject` now passes the two arguments the kernel reads.
+- [x] Unit tests: `scripts/test-tooling.sh` "gen-user-abi syscall argument counts", 46 checks (count, rename and renumber each move the fingerprint; reader fixtures; real tree; mutated handler; ring-3 compile).
+- [x] Commit: `"abi: the user ABI fingerprint covers syscall argument counts"`
+
+**Test checkpoint:** `make check-abi` passes, and fails when a handler reads another argument until the contract is regenerated.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (block "gen-user-abi syscall argument counts", 46 checks); `make check-abi` for the gate.
+
+> **Notes:**
+> - What shipped: `gen-user-abi.py` reads each INT 0x80 call's argument count from clang's AST of `syscall_handler()` in all 12 flavors, publishes `ARGC_SYS_*`, and hashes it; ring-3 `syscall0..3` refuse to compile with any other count.
+> - How it integrates: the build's ABI stamp keys on `src/kernel/sched/syscall.c`, so a handler that reads another argument fails `make kernel` until the contract is regenerated, and an old binary fails the crt0 handshake.
+> - Downstream effects: `sys_fault_inject` passes the two arguments the kernel reads; the `SYS_EXEC` and fault-inject header comments now give the real shapes.
+> - Canonical doc: [Development Tooling](../../docs/infrastructure/development-tooling.md#the-fingerprint-covers-each-syscalls-argument-count).
+> - Scope boundary: INT 0x80 only; a callee handed the whole frame (`task_fork`) is not followed; SSDT argument counts -> XREF: `02-kernel-core/TODO-12-native-api-ssdt.md` §34.
+
+> **Verified:** 2026-11-13 | commit `0dbf1a923` | 5/5 items | build OK | argc block 46/46 (each fix's fixture fails on the previous generator) | suite 38008 kernel + 17 user-mode PASS | make check-abi OK | lint exit 0
+> **Quality reviewed:** 2026-11-13 | Codex passes: 3 plans, 5 rounds, performance, completion; final round, performance and completion approve on `0dbf1a923` | 4M fixed (argument reads outside the cases, goto, register copies reading another register or argument), 1L fixed (shadowed argN name counted), 0 open | scope: userland-code-quality (ring-3 macros); generator is host tooling
+
+## 38. Release-flavor build at the section boundary
+
+> **Spawned-by:** root
+
+Sections are built and tested as the test flavor. A parameter used only under `KERNEL_TESTS` breaks the release flavor with `-Werror`; until `6e1f06e00` (2026-11-11) only CI's release job saw it, after the push. The pre-push static-analysis gate now compiles the changed sources as the release flavor. This section measures it and closes the one class it skipped, vendored sources.
+
+- [x] The section's one push release-compiles each changed kernel and loader source and refuses the push on an error.
+  - `scripts/static-analysis.sh` through `scripts/release-flavor-check.py`, shipped `6e1f06e00`; at the push, not each commit (`todo/answers.md` Q41).
+- [x] Changed sources only: 0.45 s for one source, 5.3 s for three including `bootx64.c` (measured 2026-11-13).
+- [x] Vendored sources (`src/libs/`, `src/kernel/acpica/`) get the release compile too, still without clang-tidy: ACPICA is release-only, so the test build never compiled a broken edit to it (review round 1).
+- [x] A changed or deleted header is release-compiled through every release unit that includes it, found with `-M` under the release flags; a unit whose listing fails (a deleted header) is compiled, so it fails closed (review rounds 2-3).
+- [x] Listing and compiles run in parallel within `STATIC_ANALYSIS_JOBS` (`--jobs`), never past it (review round 3).
+- [x] Unit tests: `scripts/test-tooling.sh` "gate refuses a source that compiles only with the test seams" and its invalid-instruction twin; a fixture clean under `KERNEL_TESTS` and an error without it is refused.
+- [x] Unit tests: gate fixtures (broken ACPICA source, broken and deleted ACPICA header, clean controls), a `--jobs 1` overlap test, the parser selftest.
+  - Every fixture fails on the previous gate.
+- [x] Commit: `"build: the release-flavor compile covers vendored sources and changed headers"`
+
+**Test checkpoint:** The fixture fails the step, and a full section build stays within its time.
+
+> **Test runner:** `bash scripts/test-tooling.sh` (static-analysis gate block); `bash scripts/static-analysis.sh <file>` for one source.
+
+> **Notes:**
+> - What shipped: the section push release-compiles changed kernel and loader sources, vendored sources (never clang-tidied) and every release unit that includes a changed or deleted header.
+> - How it integrates: `static-analysis-gate.sh` passes sources and headers to `static-analysis.sh`, whose `release_check` runs `release-flavor-check.py` within `STATIC_ANALYSIS_JOBS`.
+> - Downstream effects: a release-only break (ACPICA, a `KERNEL_TESTS`-hidden block, a deleted header) is refused at the push instead of reaching CI's release job.
+> - Canonical doc: [development tooling](../../docs/infrastructure/development-tooling.md).
+> - Scope boundary: proves the release compile; link-level release failures stay with CI `build.yml`.
+
+> **Verified:** 2026-11-13 | commit `b5f9564ae` | 8/8 items | gate block 26/26 (control on the round-2 tree fails the deletion fixture; on the committed tree all five new fixtures) | `--jobs` overlap test PASS, control overlaps | selftest 10/10 | lint exit 0
+> **Quality reviewed:** 2026-11-13 | Codex passes: 5 staged waves of plan, round, performance, completion, then round, performance and completion on committed `b5f9564ae`, all approving | 4M fixed (vendored sources skipped, header-only changes skipped, deleted headers unmatched, job limit ignored), 0 open | scope: N/A (host tooling, no kernel/boot source)
+
+## 39. Re-judge the closed parks under the never-park rule
+
+> **Spawned-by:** root
+
+About 445 `Deferred:` stamps carry no `awaiting-` token, so their sections read done and nothing reads them again. About 60 name hardware or an operator decision. Since 2026-11-11 a section is parked only on something outside the run, named on a `**Needs:**` line.
+
+- [x] `stale_parks.py` lists closed parks that wait on a person, a machine or the retired receipt-surface guard (`closed`, 42 at first run).
+  - Person words are the staged check's own; a guard park is listed even under a `**Needs:**` line.
+  - Sections are the triage oracle's own walk: a nested `- ## N.` opens one, an unnumbered closing heading ends one.
+- [x] Re-judged all 42: 21 reopened under Q42 (guard gone), 13 under Q43 (decided), 6 kept under `**Needs:** bare-metal`, 2 stale reasons corrected.
+  - An answered park now reopens a reviewed section too (`sequencer_triage.py`, kind `DA`), and the staged check accepts it, reading answers from the staged snapshot.
+  - FRED, LKGS and IBS are reopened around their silicon check (Q43 g): only the default-on run stays parked.
+- [x] The end-of-run gate refuses a closed park through `stranded_deferrals.py --gate`, which the frozen phase guard already runs.
+- [x] Unit tests: each kind refuses the gate, a Need clears a machine park, an answered park reopens a reviewed section and passes the staged check.
+  - Every one fails on the previous code.
+- [x] Commit: `"run: closed parks that name a person or a machine are re-judged"`
+
+**Test checkpoint:** `python3 scripts/overnight/stale_parks.py --check` reports none of the new class.
+
+> **Test runner:** `python3 scripts/overnight/stale_parks.py --selftest`; `python3 scripts/overnight/tests/test_stranded_gate.py`; `python3 -m pytest scripts/overnight/tests/test_answered_parks.py scripts/overnight/tests/test_park_needs_a_need.py`.
+
+> **Notes:**
+> - What shipped: `stale_parks.py` lists closed parks (person, machine, retired guard); all 42 were re-judged, 28 sections reopened under Q42 and Q43, six labelled `**Needs:** bare-metal`.
+> - How it integrates: `stranded_deferrals.py --gate` refuses a closed park at fixpoint; the oracle's `DA` kind reopens an answered park unless a `DR` stamp still blocks; the staged check reads answers from the staged snapshot.
+> - Downstream effects: a park that waits on a person or a machine with no `**Needs:**` line can no longer reach fixpoint unseen, and a reopened owner no longer counts as shipped for its dependants.
+> - Canonical doc: [TODO metadata](../../docs/infrastructure/todo-metadata.md).
+> - Scope boundary: judges `Deferred:` stamps inside numbered sections; preamble and closing-matter stamps park nothing and are skipped.
+
+> **Verified:** 2026-11-13 | commit `244c827ed` | 5/5 items | stale_parks selftest OK, `--check` closed 0 | test_stranded_gate OK | pytest 12/12 | every new test fails on the previous code (controls run)
+> **Quality reviewed:** 2026-11-13 | Codex passes: staged waves of plan, round, performance and completion over four commits, then round, performance and completion on committed `244c827ed`, all approving | 16 fixed (answers read from disk, exemption on every park shape, Needs by physical heading, receipt-surface spelling, silicon parks hidden whole, LKGS semantics twice, DA ignored by the stranded audit, AMX wording twice, TCG AMX claim, DA over DR, reopened owner counted shipped, operator policy and fetch words, unowned stamps, advisory probes in `--gate`), 0 open | scope: N/A (host tooling, no kernel/boot source)
+
+## 40. Pytest-style control-plane tests run in the suite
+
+> **Spawned-by:** root
+
+`scripts/overnight/tests/run-all.sh` ran each file as `python3 <file>`. Files written for pytest, with no `__main__` block or with fixture tests it never calls, defined their tests and exited 0: `test_review_pin.py` and others ran nothing in the gate.
+
+- [x] `run-all.sh` sends the tests plain python3 never calls to pytest and fails without pytest (`a48cf547a`, section 33's completion pass); eight files take that route.
+  - Each such file's ok line now carries pytest's count, e.g. `test_review_pin.py (pytest: 65 passed)`.
+- [x] pytest is a bootstrap dependency: `setup.sh --verify` names it, `setup-deps.sh` installs it, and `build.yml`, `release.yml` and `visual-regression.yml` install `python3-pytest` (`f0dc4c9ac`).
+- [x] The eight files pass once they run: the suite is 91/91.
+- [x] Unit tests: `test_run_all_runs_every_test.py` fails the suite on a failing fixture test and without pytest, and checks the count on the ok line; the count test fails on the previous runner.
+- [x] Commit: `"run: the control-plane suite runs its pytest files"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` reports each pytest-routed file's test count.
+
+> **Test runner:** `bash scripts/overnight/tests/run-all.sh` (91 files, eight with a pytest count); `python3 scripts/overnight/tests/test_run_all_runs_every_test.py`.
+
+> **Notes:**
+> - What shipped: `run-all.sh` runs the tests plain python3 never calls under pytest, fails without pytest, and prints each such file's pytest count; pytest is a bootstrap and CI dependency.
+> - How it integrates: `run_one --pytest` is set only on the pytest route; the routing and dependency work landed in `a48cf547a` and `f0dc4c9ac` during section 33's completion pass.
+> - Downstream effects: a pytest-routed file that ran no test, or fewer than expected, is visible in the commit and push gate's output instead of reading `ok`.
+> - Canonical doc: [development tooling](../../docs/infrastructure/development-tooling.md#local-ci-hooks).
+> - Scope boundary: the control-plane suite only; other suites keep their own runners.
+
+> **Verified:** 2026-11-13 | commit `0731efdbf` | 5/5 items | run-all.sh 91/91 with eight pytest counts (`test_review_pin.py` 65) | test_run_all_runs_every_test.py OK; the count test fails on the previous runner | lint exit 0
+> **Quality reviewed:** 2026-11-13 | Codex passes: plan and round on the staged diff, then round, performance and completion on committed `0731efdbf`, all approving | 0 findings | scope: N/A (host tooling, no kernel/boot source)
+
+## 41. CI jobs run in the pinned image
+
+> **Spawned-by:** root
+
+Every CI job installs its toolchain with apt on each run. On 2026-11-11 nine Build runs in a row failed in the install step because the runner could not resolve the Ubuntu mirror; no project code had run. `CI_CONTAINER=1` already builds in a pinned image locally.
+
+- [x] Every checkout job of `build.yml`, `release.yml`, `visual-regression.yml` and `todo-graph.yml` runs in `ghcr.io/rizonesoft/impossible-os-ci` by digest, as uid 1001, with no install step.
+  - The image (`scripts/ci/image/Dockerfile`) installs `scripts/ci/toolchain-packages.txt` once through `scripts/ci/toolchain.sh` and the bounded `scripts/ci/apt-install.sh`; the list holds the tools the hosted runner used to supply (zip, gh, nodejs, jq).
+  - The release job sets `BUILD_NO_CCACHE=1`, so a release still compiles from source.
+- [x] `.github/workflows/ci-image.yml` publishes the image when its inputs change; moving the toolchain is publish, then a digest commit (`todo/answers.md` Q44).
+- [x] `ci-image.yml` refuses an image whose QEMU is not `scripts/ci-qemu-version.txt` (10.2.1).
+- [x] `scripts/ci-container.sh` runs the same digest as uid 1001; `scripts/ci_container_setup.py` is retired.
+- [x] The release-flavor proof passes in the image: `scripts/lib/release-seam-inventory.py` and `test-only-ref-audit.py` read bear's database correctly (`make print-kernel-c-srcs`).
+- [x] Unit tests: `scripts/ci/check-pinned-image.py` (tooling pack, selftest) refuses an install step, a checkout job with no image, a tag, two digests and a non-bash default; it failed on the old workflows.
+  - `scripts/overnight/tests/test_ci_toolchain_install.py` and `test_ci_container.py` hold the image build and the tier; `scripts/lib/tests/test_release_compile_db.py` holds the release database.
+- [x] Commit: `"ci: the build jobs run in the pinned image and need no package mirror"`
+
+**Test checkpoint:** A Build run on `main` is green with no package-install step in its log.
+
+> **Test runner:** `python3 scripts/ci/check-pinned-image.py --selftest`; `python3 -m pytest -q scripts/overnight/tests/test_ci_toolchain_install.py scripts/overnight/tests/test_ci_container.py`; `python3 scripts/lib/tests/test_release_compile_db.py`; `CI_CONTAINER=1 bash scripts/ci-container.sh --tooling` for the image itself.
+
+> **Notes:**
+> - What shipped: one image (`scripts/ci/image/Dockerfile`, package list in `scripts/ci/toolchain-packages.txt`) holds the CI toolchain; every checkout job runs it by digest as uid 1001 and installs nothing, so a package-mirror outage cannot fail a job.
+> - How it integrates: `ci-image.yml` builds, checks QEMU (`scripts/ci/check-qemu-version.py`) and `setup.sh --verify`, then publishes; moving the toolchain is publish, then a digest commit (`todo/answers.md` Q44). `scripts/ci-container.sh` runs the same digest locally.
+> - Downstream effects: the release-flavor proof had been broken since March by bear's analysis entry and the ACPICA excludes; it now reads the database as written and passes in the image.
+> - Canonical doc: [development tooling](../../docs/infrastructure/development-tooling.md#local-ci-hooks), "The CI image".
+> - Scope boundary: the graph jobs pull the full image too; a small image for them is section 42.
+
+> **Verified:** 2026-11-13 | commit `db2bf1d62` | 7/7 items | check-pinned-image selftest OK and refuses the old workflows | test_ci_toolchain_install 7/7, the QEMU case fails on the substring rule | test_release_compile_db 4/4, fails on the old seam gate | candidate image: CI tier as uid 1001 (lint, tooling 1392/1392, clean build, 37982 kernel + 17 user-mode PASS) and release.yml rehearsal (proof PASS) | control-plane suite 91/91
+> **Quality reviewed:** 2026-11-13 | Codex passes: round (2 rounds) on the staged diff, performance and completion on `9ece40d6c`, then round, performance and reconciliation on `db2bf1d62`, all approving | 3 findings: install-scanner bypass and QEMU substring compare fixed; graph jobs pulling the full image filed as section 42 | scope: N/A (CI and host tooling, no kernel/boot source)
+
+## 42. The graph jobs run in a small pinned image
+
+> **Spawned-by:** §41 (review)
+> **User impact:** every push that touches `todo/` pulls the 4.5 GB build image twice for jobs that need only git, gh and Python; the `validate` job has a five-minute timeout, so a slow pull can turn a clean push red.
+
+The two `todo-graph.yml` jobs moved into the CI image in section 41. Before that they installed only the coreutils swap and PyYAML, so they need none of LLVM, QEMU or the visual-test stack.
+
+- [ ] Publish a small image from `ci-image.yml` and pin it in both graph jobs. Done when their cold container start is measured before and after.
+  - It holds only what they need: GNU coreutils, git, gh, python3-yaml, python3-jsonschema, jq.
+- [ ] `scripts/ci/check-pinned-image.py` accepts exactly the two published images, each for its own jobs. Done when its selftest refuses the graph image in `build.yml`.
+- [ ] Commit: `"ci: the graph jobs run in a small pinned image"`
+
+**Test checkpoint:** a `todo-graph.yml` run on `main` is green in the small image and its container start is faster than the build image's.
+
+---
+
+## 43. The control-plane commit gate tests the staged commit
+
+> **Spawned-by:** root
+> **User impact:** a commit that touches the control-plane manifest is judged by the working tree, not by what it records: an unstaged edit to a runner test refuses a correct commit, and an unstaged repair lets a broken one land.
+
+`.githooks/pre-commit` runs `scripts/overnight/tests/run-all.sh` in the primary tree whenever a staged path matches `control-plane-match.sh`. Lint and the other gates read the commit's own index through `GIT_INDEX_FILE`; the suite alone reads disk. Met on 2026-11-13, when unstaged tests for the next push refused a commit that was correct on its own.
+
+- [x] Run the suite over the staged tree (a `git checkout-index` copy of the index, with the real repository for the git-oracle tests). Done when a fixture commit with a broken staged file and a fixed unstaged copy is refused, and the reverse passes.
+- [x] A gate that is interrupted, signalled alone or runs past `STAGED_TREE_TIMEOUT` stops every process the suite started, its own sessions included, and removes the tree (round and performance passes)
+- [x] The staged-tree helper and the git isolation it sources are in the control-plane manifest, so a change to them alone runs their tests (completion pass)
+- [x] Commit: `"hooks: the control-plane gate tests the staged commit"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` passes, and the two fixture commits above get the opposite verdicts they get today.
+
+> **Test runner:** N/A (host tooling) | validation: `python3 scripts/overnight/tests/test_staged_tree.py`, `bash scripts/overnight/tests/run-all.sh`
+
+> **Notes:**
+> - What shipped: `.githooks/lib/staged-tree.sh` exports the commit's index to a scratch tree and runs the control-plane suite there; `run-all.sh` sets `CLAUDE_PROJECT_DIR` to the tree it runs in.
+> - The helper runs in the hook process with EXIT, INT and TERM traps; export and suite are supervised stages under one `STAGED_TREE_TIMEOUT` deadline (1200 s), stopped by process group and by the `STAGED_TREE_RUN` ancestry marker, TERM then KILL after `STAGED_TREE_GRACE`.
+> - Kept out of the manifest by decision: `.githooks/pre-commit` itself, whose wiring `test_hook_git_env.py` asserts; listing it would run the 4-minute suite on every lint edit.
+> - Scope boundary: a process that rewrites its own environment escapes the marker; a nested supervisor KILLed after the outer grace may leave its own scratch tree.
+
+> **Verified:** 2026-11-17 at fecf320de: control-plane suite 94 passed, 0 failed, run by the commit's own gate over its staged tree; `test_staged_tree.py` passes (broken-staged refused, broken-disk lands, path-limited indexes, interrupt, hook-only signal, deadline, set -e cleanup, stalled export, nested stage, manifest); each property's control fails with its fix removed.
+> **Quality reviewed:** 2026-11-17 | Codex 12x (plan, round 5x, performance 4x, completion, reconciliation) | 0H+8M+0L fixed, 0 open | scope: N/A (host tooling, no kernel surface)
+
+## 44. A second reviewer reads kernel, boot, security and ABI sections
+
+> **Spawned-by:** root
+> **User impact:** the costliest defects here passed every review by one model (the loader that ignored its relocations, the exec race that survived 297 commits). A second model with different blind spots reads the sections where a miss is most expensive, without reopening the first reviewer's loop.
+
+> **Withdrawn 2026-11-15:** unpinned on 2026-11-14 and its machinery removed by [section 46](#46-the-second-reviewers-switched-off-machinery-is-removed); the stamps below record what shipped.
+
+Operator decisions 2026-11-14: Gemini 4 Carbon reads a section after Astra's wave is clean; it is wired now and measured on real sections; it applies to sections that change `src/kernel/`, `include/kernel/`, `src/boot/`, or a security or ABI surface; at most three rounds (find, confirm the repair, one more if the repair is wrong); Gemini confirms repairs and Astra reads a repair again only when it is large; an unavailable Gemini is retried, marked and never blocks.
+
+- [x] `[second]` in `.conclave/reviewers.toml`, validated by `scripts/review_pin.py`: the reviewer (`cli = "agy"`, its model), `paths`, `round_cap = 3`, `retries = 3`, `small_fix_lines = 50`, `limit_seconds = 1500`
+  - The paths cover both sides of the ABI: `src/kernel/`, `include/kernel/`, `src/boot/`, `include/boot/`, `user/include/`, `user/lib/`
+  - `review_pin.py --second-applies --paths-file F` exits 0 for a kernel path and 1 for a `scripts/` path; a second reviewer equal to the routed one is refused; a pin without `[second]` loads as before
+- [x] `scripts/second_review_dispatch.py` runs a `[review-kind: second]` pass in a throwaway clone of HEAD, within the pin's time limit and an output limit, its process group killed at either, with `retries` attempts
+  - The clone must still be the candidate afterwards (a reviewer that repaired its copy has reviewed something else); a review needs one `HIGHEST:` line; the receipt carries `route`, `head`, `base`, `rc`, `highest` and `unavailable`
+  - It reads the whole section: the base is the plan pass's commit, read from the manifest, and a `REVIEW_BASE` naming another commit is refused
+  - One pass a section at a time (a lock from the cap check to the receipt); a stopped dispatcher kills the reviewer and removes its copy
+  - The reviewer's output goes to a file, never into memory; a pass that ran out of time, by the dispatcher's clock or the CLI's own, is not retried
+  - A receipt is never appended onto a manifest line that was cut short
+  - Exit 0 checked, 2 refused, 3 incomplete, 4 unavailable on every attempt; a section outside the paths dispatches nothing
+- [x] The stamp gate (`.claude/hooks/section_commit_gate.py`, `_second_issues`) holds a section under `[second] paths` to the second pass
+  - Its newest `second` receipt must cover the candidate and end below a blocking level; an `unavailable` one is accepted only when the section's own `> **Quality reviewed:**` line says `second: unavailable`
+  - A `second` receipt whose base is not the plan pass's commit was shown less than the section and is refused
+  - Astra's round, performance and last pass may predate HEAD when a newer clean `second` receipt covers HEAD and at most `small_fix_lines` lines a pass reads changed since
+  - After `round_cap` passes the level is waived (what is open is filed); a repair after the last one is read by Astra's passes on the repaired candidate
+  - A section outside the paths is judged exactly as before, and `second` receipts never count toward `pass_cap`
+  - Each comparison of two commits is run once an invocation, and all of them share a six-second budget, so the stamp check answers inside the hook's ten seconds
+  - The gate and the dispatcher count spent passes the same way, over the whole manifest, so a damaged line cannot make one refuse what the other asks for; once the cap is spent the gate reads past such a line
+- [x] `scripts/overnight/second-review-log.py record|stats|unavailable` keeps every finding of the second reviewer with its verdict
+  - `fixed`, `rejected` with the code evidence, or `filed` with the tracked item; the totals are worked out from them
+  - `stats` says when ten sections are in; `unavailable` lists the stamps marked for a later read
+- [x] How to run it: `.claude/skills/three-pass-review.md` ("The second reviewer"), `CLAUDE.md` (Model Roles), `docs/infrastructure/ai-system.md`; the dispatcher and `review_pin.py` are in `scripts/overnight/control-plane-manifest.txt`
+- [x] Commit: `"review: a second reviewer reads kernel, boot, security and ABI sections"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` passes with the new fixtures; a live `second` pass on one shipped kernel section returns a checked receipt; `python3 scripts/review_pin.py --check` passes.
+
+> **Test runner:** N/A (host tooling) | validation: `python3 -m pytest -q scripts/overnight/tests/test_second_dispatch.py scripts/overnight/tests/test_three_pass_gate.py scripts/overnight/tests/test_review_pin.py scripts/overnight/tests/test_second_review_log.py` (139 cases), `bash scripts/overnight/tests/run-all.sh`; live pass: the user-mode test framework's opt-in section, candidate `0b268dec2`, one attempt, about 14 minutes, a checked receipt at `HIGHEST: P1` (`.claude/overnight/reviews/20261114-204702-2985430-second-direct.out`)
+
+> **Notes:**
+> - What shipped: Gemini 4 Carbon, through the `agy` CLI already signed in on the host, reads a section after Astra's wave is clean when it changed `src/kernel/`, `include/kernel/`, `src/boot/`, `include/boot/` or `user/include/`.
+> - How it integrates: the dispatcher writes a `second` receipt to the reviews manifest the stamp gate already reads; the gate asks for it only inside the paths, and a clean one lets a small repair stand without Astra's wave again.
+> - Plan review changed the design: the reviewer's copy is checked unchanged after each attempt, and a repair after the third pass is finished by Astra's passes instead of deadlocking.
+> - Downstream effects: a kernel or boot section costs up to 25 minutes more per second pass (the first live pass over a real section's range did not finish in nine); an outage or a pass out of time costs a mark on the stamp, never a stop.
+> - Canonical doc: [`three-pass-review.md`](../../.claude/skills/three-pass-review.md#the-second-reviewer).
+> - Scope boundary: an Astra outage is section 45. Unpinned the same day (operator decision 2026-11-14: about 14 minutes a pass, and not working as wanted): the pin names no second reviewer, so the mechanism is switched off and every section is reviewed by Astra alone.
+
+> **Verified:** 2026-11-14 | commit `8a7d014ed` | 6/6 items | 139 tests OK (dispatcher, gate, pin, log) | `scripts/overnight/tests/run-all.sh` 93 passed, 0 failed | `review_pin.py --check` OK | lint 0 errors | live second pass returned a checked receipt in about 14 minutes
+> **Quality reviewed:** 2026-11-14 | Codex 17x (plan, round 6x, performance 5x, completion, reconciliation 4x) | 0H+15M+0L fixed, 0 open | scope: N/A (host tooling, no kernel surface; outside the second reviewer's paths)
+
+## 45. A reviewer outage leaves a review owed and the run continues
+
+> **Spawned-by:** root
+> **User impact:** the run is unattended first. Today an unavailable reviewer stalls the section it was on, and with it the run; an outage must cost a delay in stamping, never a stopped run, and never an unreviewed stamp or push.
+
+Operator decision 2026-11-14: when Astra is unavailable the section is committed locally and marked "review owed", the run moves to the next section, owed reviews are done first when Astra answers, and nothing unreviewed is pushed.
+
+What exists today: `scripts/overnight/codex-outage-check.py` already says when the reviewer's backend is down (two failed legs in twenty minutes; the broker then exits 75). What is missing is what happens next. Every section starts with a plan pass, so during an outage the next section can only be built unreviewed; and the phase guard's rollover refuses unpushed commits, then reverts the section after two refusals. So an outage either stalls the run or throws work away.
+
+- [x] `scripts/overnight/review_owed.py add|list|gate|clear|probe` keeps the sections whose review is owed, in `.claude/state/review-owed.json`
+  - `add --todo T --section N` is called before the section's first edit and is refused unless `probe` reports an outage; it records the commit the section starts from (its plan pass's when it has one, else HEAD), and asking again keeps the first base
+  - `clear` is refused until the committed TODO (HEAD) carries both stamps, so a stamp whose commit was refused clears nothing; `gate` names what is open; `probe` is the existing outage check (exit 75 while the reviewer is down)
+- [x] An owed section's range is its recorded base, not its late plan pass's commit: `review_pin.section_base` is the one helper, read by `section_status`, the second reviewer's dispatcher and the stamp gate
+  - `scripts/codex-dispatch.sh` holds every pass after the plan to that base (taken when none is given, refused when another is), tells the reviewer the range and writes it on the receipt; the stamp gate refuses a pass that was shown less
+- [x] `sequencer_triage.py --next` does not return a built, owed section while `probe` reports an outage, passes over a file that owes only such reviews, and returns the oldest owed section first, across files, once the reviewer answers
+  - The packet marks an owed section `review_owed` and a recovered one `review_first`; `scripts/overnight/advance-work.py` never names the first, even as its fallback, and names the second ahead of everything else
+  - The reviewer is probed by one process with a two-second wait, inside the Stop hook's five; no answer in time changes nothing
+- [x] The phase guard's rollover accepts unpushed commits while a review is owed, so an owed section is never counted as a failed rollover and reverted (`.claude/hooks/run_phase_guard.py`, a frozen file: edited attended)
+  - `add` marks the dispatch record that failed with the outage (`outage_debt` in `last-codex-review.json`), so the rollover tells that debt from a review waiting to be read, whichever commit path the section's code takes; a later dispatch writes a fresh, unmarked record, and `add` again marks it when that retry fails with the outage too
+- [x] `.githooks/pre-push` refuses a push while any section is owed, naming it, before every costly gate; a record that cannot be read refuses too
+- [x] The steps are in `.claude/skills/overnight-sequencer/SKILL.md` (the outage rule) and `.claude/skills/three-pass-review.md` ("When the reviewer is down")
+- [x] Commit: `"run: a reviewer outage leaves a review owed and the run continues"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` passes with the new fixtures: with the reviewer down a section is recorded, built, not picked again, its unpushed commit is not a failed rollover and a push is refused; with it back the oldest owed section is returned first across files, and after its stamps and `clear` nothing is owed.
+
+> **Test runner:** N/A (host tooling) | validation: `python3 -m pytest -q scripts/overnight/tests/test_review_owed.py` (17 cases), `scripts/overnight/tests/test_three_pass_gate.py` (the recorded base), `bash scripts/overnight/tests/run-all.sh`
+
+> **Notes:**
+> - What shipped: a debt record written before an unreviewed build, and four places that honour it: the next-section picker, the rollover check, the push gate and the review range.
+> - How it integrates: the outage itself is still decided by `scripts/overnight/codex-outage-check.py`; nothing new decides what an outage is.
+> - Plan review changed the design: the record is written before the build because the outage evidence lasts 20 minutes, and recovered debts are picked first across files, ahead of the cursor file and the plan.
+> - Downstream effects: during an outage the run keeps building locally and pushes nothing; the first push after it carries every section built meanwhile.
+> - Canonical doc: [`overnight-sequencer`](../../.claude/skills/overnight-sequencer/SKILL.md), the outage rule.
+> - Scope boundary: an expired login (Codex, Claude or `gh`) is not an outage by this check and still stalls; it stays in `todo/RUN-ISSUES.md`.
+
+> **Verified:** 2026-11-15 | commit `bcb092101` | 7/7 items | 158 tests OK (owed record, gate, pin, dispatchers) | `scripts/overnight/tests/run-all.sh` 94 passed, 0 failed | `review_pin.py --check` OK | lint 0 errors | `review_owed.py gate` exits 0 on the real tree
+> **Quality reviewed:** 2026-11-15 | Codex 17x (plan, round 6x, performance 5x, completion, reconciliation 4x) | 5H+6M+0L fixed, 0 open | scope: N/A (host tooling, no kernel surface)
+
+## 46. The second reviewer's switched-off machinery is removed
+
+> **Spawned-by:** root
+> **User impact:** none at run time: the pin names no second reviewer, so every piece of it is dead code that the stamp gate still parses and every reader of the review docs still has to skip.
+
+Operator direction 2026-11-15: the second reviewer (Gemini 4 Carbon through `agy`, wired by section 44 and unpinned on 2026-11-14) is removed outright rather than kept switched off. Kept: `review_pin.section_base` (section 45's owed-review base reads it) and the dated plan `docs/plans/2026-11-11-three-pass-review.md`, which records what was decided at the time.
+
+- [x] Delete `scripts/second_review_dispatch.py` and its row in `scripts/overnight/control-plane-manifest.txt`
+- [x] Delete `scripts/overnight/second-review-log.py` and its log file
+- [x] Delete `scripts/overnight/tests/test_second_dispatch.py` and `test_second_review_log.py`
+- [x] Remove the `[second]` table support from `scripts/review_pin.py` (`--second`, `--second-applies`, `SECOND_KIND`) and its cases in `test_review_pin.py`
+- [x] Remove `_second_issues` and the `second` receipt rules from `.claude/hooks/section_commit_gate.py`, the `second` kind from `review_convergence.py`, and their cases in `test_three_pass_gate.py`
+- [x] Remove the second-reviewer paragraphs from `CLAUDE.md` (Model Roles), `.claude/skills/three-pass-review.md`, `docs/infrastructure/ai-system.md` and the comment in `.conclave/reviewers.toml`
+- [x] Section 44 keeps its stamps and gains a note that it was withdrawn on 2026-11-15, pointing here
+- [x] Commit: `"review: the second reviewer's machinery is removed"`
+
+**Test checkpoint:** `bash scripts/overnight/tests/run-all.sh` passes; `python3 scripts/review_pin.py --check` passes; `git grep -nE "second_review|second-review|_second_issues|--second"` outside `todo/` and `docs/plans/` finds nothing.
+
+> **Test runner:** N/A (host tooling) | validation: `python3 -m pytest -q scripts/overnight/tests/test_review_pin.py scripts/overnight/tests/test_three_pass_gate.py` (89 cases), `bash scripts/overnight/tests/run-all.sh`
+
+> **Notes:**
+> - What shipped: the second reviewer's dispatcher, log tool, tests, pin table, gate rules and doc paragraphs are gone; a pin that still carries `[second]` is refused.
+> - Plan review changed the design: the removed `_second_issues` was the only check refusing a stamp when the pin failed to load, so `_pin_issue` keeps that refusal on its own.
+> - Kept: `review_pin.section_base` (read by `review_owed.py`) and the three-pass plan document, which records the history.
+> - Scope boundary: section 44 keeps its stamps with a withdrawn note; nothing else in the roadmap referenced the mechanism.
+
+> **Verified:** 2026-11-15 at 72883c876: control-plane suite 93 passed, 0 failed; `review_pin.py --check` ok; the second-reviewer grep outside todo/ and docs/plans/ is empty; the pin-load control fails with the check removed.
+> **Quality reviewed:** 2026-11-15 | Codex 5x (plan 1 P2 fixed; working-tree round, round, performance, completion clean)
+
+
+## 47. The Bash safety guards read commands with a shell grammar
+
+> **Spawned-by:** section 32 (review)
+> **User impact:** a destructive `git` or `gh` verb written inside a process substitution, after a heredoc, or behind a named fd still passes the attended-repair and runner guards during a live run.
+
+Section 32 made the guards read the command behind reserved words, case arms, subshells and redirections with token rules over shlex output. Its eighth completion pass listed shapes that need the shell grammar itself, all reproduced against bash; most predate section 32. They are built here as a parser decision, not as more token rules.
+
+- [ ] Choose the guards' parser: a measured comparison of the commit gate's `_BashLexer`, a vendored grammar and extended token rules on the recorded-command corpus, with the choice and its reversal cost in `todo/answers.md`
+- [ ] A separator inside a process substitution (`git > >(tee x | cat) reset --hard`) stays inside its target
+- [ ] A command after a heredoc body or a process substitution (`cat <<EOF` ... `EOF` then `git reset --hard`) is segmented and judged; heredoc text never reaches shell tokenization
+- [ ] The body of a command or process substitution (`cat > >(git reset --hard)`, `cat >"$(git reset --hard)"`) is judged as a command
+- [ ] A named descriptor (`{fd}>/dev/null`), an empty quoted target (`<<<""`) and a `$(...)` or arithmetic target are removed as redirections
+- [ ] A quoted separator target (`git > "|" reset --hard`) stays one word through segmentation
+- [ ] Every shape above has a refusal case for both guards, a `gh` case and a harmless twin in `test_guard_compound.py`
+- [ ] Commit: `"hooks: the Bash safety guards read commands with a shell grammar"`
+
+**Test checkpoint:** `test_guard_compound.py` refuses every shape listed above in both guards and allows its harmless twin; `run-all.sh` passes.
+
+-> XREF: section 32 (item: "The Bash safety guards judge the command behind shell grammar and redirections")
+
+
+## Format Quick Reference
+
+| Concern                      | Where it lives                                                                                    | Owner                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Claude Code MCP servers      | [`.mcp.json`](../../.mcp.json)                                                                    | §1 (this TODO) -- mirrors to Codex              |
+| Codex CLI MCP servers        | `~/.codex/config.toml` `[mcp_servers.*]`                                                          | §1 -- mirrors from Claude side                  |
+| Codex model + effort default | `~/.codex/config.toml` top-level                                                                  | User -- centralized control; §2 non-override    |
+| Hooks                        | [`.claude/settings.json`](../../.claude/settings.json) + [`.claude/hooks/`](../../.claude/hooks/) | §7 manifest; per-section adds                   |
+| State files                  | `.claude/state/*.json` + `*.jsonl` (gitignored)                                                   | §3 / §5 / §10 / §11; shape in `state/README.md` |
+| Skill step evidence map      | [`.claude/hooks/skill_step_map.py`](../../.claude/hooks/skill_step_map.py)                        | §10 -- per-skill required-steps signatures      |
+| Tool call history            | `.claude/state/tool-history.jsonl` (gitignored)                                                   | §11 -- PostToolUse `*`; §10/§11 consumers       |
+| Lint surface                 | [`scripts/lint.sh`](../../scripts/lint.sh)                                                        | Existing checks 1-5; §12 adds 6/7/8             |
+| Reviewer contract            | [`ai-system.md`](../../docs/infrastructure/ai-system.md) External-Reviewer Contract               | TODO-02 §4 doctrine; this TODO §3 mechanism     |
+| Skill triggers               | [`CLAUDE.md`](../../CLAUDE.md) Mandatory Skill Triggers                                           | TODO-02 §3 doctrine; this TODO §8 adds rows     |
+| MCP usage                    | [`docs/infrastructure/mcp-usage.md`](../../docs/infrastructure/mcp-usage.md)                      | §6 (NEW)                                        |
+| Drift detection              | `scripts/audit-ai-system.sh`                                                                      | §9 (NEW)                                        |
+
+---
+
+## OS Comparison
+
+| ⭐  | Feature                                 | 🪟 Win11    | 🐧 Linux       | 🚀 Impossible OS                                        |
+| --- | --------------------------------------- | ----------- | -------------- | ------------------------------------------------------- |
+| 💎  | Cross-tool MCP server set               | ❌ N/A      | ❌ N/A         | ✅ §1 (Claude+Codex shared)                             |
+| 💎  | Hook + skill manifest                   | ❌ N/A      | ❌ N/A         | ✅ §7 (MANIFEST + audit)                                |
+| ⭐  | Reviewer-contract hard gate at edit     | ❌ N/A      | ❌ N/A         | ✅ §3 (BLOCK on receive)                                |
+| ⭐  | Section-commit build-evidence gate      | ❌ N/A      | ❌ N/A         | ✅ §4 (~60 bypasses blocked)                            |
+| ⭐  | Multi-dispatch review enforcement       | ❌ N/A      | ❌ N/A         | ✅ §5 (3x state file + gate)                            |
+| ⭐  | Cross-tool drift detection              | ❌ N/A      | ❌ N/A         | ✅ §9 (7 checks audit)                                  |
+| 💎  | Doctrine + skill catalog audit          | ❌ Internal | ⚠️ Per project | ✅ §8 (suppression policy)                              |
+| 💎  | MCP usage discipline doctrine           | ❌ N/A      | ❌ N/A         | ✅ §6 (CLAUDE.md pointer)                               |
+| ⭐  | Skill step-state telemetry              | ❌ N/A      | ❌ N/A         | ✅ §10 (observer + block)                               |
+| ⭐  | Hook event surface coverage             | ❌ N/A      | ❌ N/A         | ✅ §11 (5 events wired)                                 |
+| ⭐  | AI-slop content lints                   | ❌ N/A      | ⚠️ Linter only | ✅ §12 (Check 6+7 live; 8 attempted+dropped)            |
+| 💎  | Doctrine sync + reciprocal XREFs        | ❌ N/A      | ❌ N/A         | ✅ §13 (lockstep with code)                             |
+| 💎  | Sole external reviewer surface          | ❌ N/A      | ❌ N/A         | ✅ §14 (Copilot retired; Codex only)                    |
+| ⭐  | Design-review hook scope precision      | ❌ N/A      | ❌ N/A         | ✅ §15 (review-kind + commit-clears)                    |
+| ⭐  | Compaction-resilient skill state        | ❌ N/A      | ❌ N/A         | ✅ §16 (PreCompact orphan-marking)                      |
+| ⭐  | Review pre-Codex enforcement            | ❌ N/A      | ❌ N/A         | ✅ §17 (phase1 gate + re-adv trigger)                   |
+| ⭐  | Stamp-region + OS-table lints           | ❌ N/A      | ❌ N/A         | ✅ §18 (Check 10 + Check 11)                            |
+| 💎  | Codex re-review prompt-scope helper     | ❌ N/A      | ❌ N/A         | ✅ §19 (committed-content embed)                        |
+| ⭐  | Implement-pipeline commit gates         | ❌ N/A      | ❌ N/A         | ✅ §20 (steps 5/8/13/16)                                |
+| ⭐  | Heuristic WARN -> ERROR promotion       | ❌ N/A      | ❌ N/A         | ✅ §21 (7 WARN hooks + miss-log + ratio)                |
+| ⭐  | Review-pipeline right-sizing            | ❌ N/A      | ❌ N/A         | ✅ §22 (RISK_TIER + bootstrap + spiral)                 |
+| ⭐  | Unified SKIP-env opt-out scanner        | ❌ N/A      | ❌ N/A         | ✅ §23 (`_skip_env.py` helper; 7 gates migrated)        |
+| ⭐  | Codex review state-write reliability    | ❌ N/A      | ❌ N/A         | ✅ §24 ((ok,err) contract; JSONL diagnostic)            |
+| ⭐  | Step-observer regex coverage            | ❌ N/A      | ❌ N/A         | ✅ §25 (7 canonical kinds; 14 sub-tests)                |
+| 💎  | Opt-out wrapper formalize/retire        | ❌ N/A      | ❌ N/A         | ✅ §26 (`commit-with-skip.sh` retired by §23)           |
+| ⭐  | Phase-1 evidence-gate FP tuning         | ❌ N/A      | ❌ N/A         | ✅ §27 (step-4 miss-log + per-section dedup)            |
+| 💎  | Codex prompt argument escaping          | ❌ N/A      | ❌ N/A         | ✅ §28 (`codex-dispatch.sh` wrapper + lint 12)          |
+| ⭐  | Standardized PreToolUse prefix-list     | ❌ N/A      | ❌ N/A         | ✅ §29 (`_review_pipeline_passthrough.py`)              |
+| ⭐  | Shell-aware Codex dispatch parser       | ❌ N/A      | ❌ N/A         | ✅ §30 (`_codex_dispatch.py` shared helper)             |
+| 💎  | Post-commit hook concurrency: serialize | ❌ N/A      | ❌ N/A         | ✅ §31 (flock-based serializer; ends stomp-stamp races) |
+| 💎  | Second-boot leg in the smoke matrix     | ❌ N/A      | ❌ N/A         | ✅ §36 (kept-disk boot after a clean ACPI shutdown)     |
+| 💎  | Syscall argument counts in ABI hash     | ❌ N/A      | ❌ N/A         | ✅ §37 (`ARGC_SYS_*` read from the handler AST)         |
+| 💎  | Release compile at the section push     | ❌ N/A      | ❌ N/A         | ✅ §38 (vendored sources and header includers too)      |
+
+> **After §1-§5:** Claude and Codex share the same MCP server set, the same Codex invocation policy, the same hard gates around reviews and section commits. Drift between the two automation sides is detectable.
+> **After §6-§9:** The whole automation surface is auditable in one script. Hook system is documented; MCP usage is doctrine; superpowers plugin behavior is reconciled with Impossible OS rules.
+> **After §10-§12:** Skill step-state telemetry observes (rather than trusts) what each pipeline did; the unused two-thirds of the hook-event surface is wired in (SessionStart / UserPromptSubmit / Stop / SubagentStop / PreCompact); AI-slop content lints catch the three patterns build+tests structurally cannot.
+> **After §13-§14:** Doctrine docs match running code; reciprocal XREFs land; Copilot CLI subordinate-reviewer wrapper retired wholesale (Codex GPT-5.5 sole external reviewer).
+> **After §15-§16:** Design-review hook recognizes the full review-kind set + clears on successful section-ship commits; PreCompact orphan-marking ends the catch-22 where stale skill-progress entries blocked all post-compaction commits and review skill invocations.
+> **After §17-§20:** Every fully-deterministic gap in the review and implement pipelines hits a hook BLOCK or lint ERROR before the user has to spot it. §17 catches Phase-1 evidence-map skips and step 13.5 re-adversarial skips on faultable-region fixes. §18 lint catches stamp-region drift (missing Notes / Test runner / Verified / Quality reviewed) and OS Comparison rows that didn't flip to ✅ when their IO row flipped to `[x]`. §19 wraps Codex re-review dispatches so re-reviews against clean trees see the committed file content instead of returning "approve / no findings". §20 catches the four impl-side gaps: domain quality-gate not walked, src/ change without matching test_*.c, IO `[x]` flip without adversarial dispatch, boot-path edit without fresh smoke-test PASS log.
+> **After §21:** Heuristic gaps in `implement-todo-section` (read-TODO before src/ edit, XREF-walk, ≥3 explore queries, test-coverage dispatch on test-touching commits, fix-loop edit-after-Codex, validate-reads-before-commit, loose-ends scan before commit) emit WARN with miss-log telemetry and graduate to ERROR after observed false-positive ratio crosses the per-step threshold documented in `ai-system.md` "Hook Promotion Pipeline".
+> **After §22:** Review-pipeline rigor matches task risk (RISK_TIER doctrine), new gates do not self-block on the commit that ships them (bootstrap-mode), tier-aware triage prevents over-adoption of low-priority Codex findings, state-file write reliability is diagnosed and tested end-to-end, and long-running skill invocations prompt for a spiral check at 2x time budget. Closes the failure mode where a 25-minute trivial task burned 1.5 hours via kernel-tier review pipeline overhead (TODO-08 §17 implementation session, 2026-04-28).
+
+---
+
+## Unit Tests
+
+> Tests for this TODO are tooling-side, not kernel-side. They live under `scripts/test-tooling.sh` (existing) plus the new `scripts/audit-ai-system.sh`. No `TEST_CAT_*` registration; no `src/kernel/test/test_*.c`.
+
+- [ ] `scripts/test-tooling.sh` sub-tests (added across §1-§9):
+  - `mcp_drift` -- §1 cross-config validator (Claude `.mcp.json` vs Codex `~/.codex/config.toml`)
+  - `codex_flag_block` -- §2 hook exits 2 on `--model` / `--effort`
+  - `receiving_state_write` -- §3 PostToolUse hook writes state file on Codex review trigger
+  - `receiving_pre_block` -- §3 PreToolUse hook blocks Edit on `received: false`
+  - `receiving_pre_allow` -- §3 PreToolUse hook allows Edit on `received: true`
+  - `section_commit_gate_missing_build` -- §4 gate exits 2 with no build evidence
+  - `section_commit_gate_missing_codex` -- §4 gate exits 2 with no Codex state file
+  - `section_commit_gate_pass` -- §4 gate exits 0 with all evidence
+  - `section_commit_gate_skip` -- §4 gate honors `SKIP_REVIEW_HOOK=1` + reason; logs to skip-log
+  - `four_dispatch_partial` -- §5 gate exits 2 with 3 of 4 review state entries
+  - `four_dispatch_full` -- §5 gate exits 0 with all 4
+  - `skill_step_noncontig` -- §10 gate exits 2 on `steps_observed=[1,2,3,5]` (gap at 4)
+  - `skill_step_full` -- §10 gate exits 0 on `steps_observed=[1..18]`
+  - `session_start_writes` -- §11 SessionStart hook produces session.json with valid keys
+  - `user_prompt_doctrine` -- §11 UserPromptSubmit injects systemMessage on synthetic "skip review" prompt
+  - `stop_audit_detects` -- §11 Stop hook flags "I'll run codex-adversarial" promise + no matching tool call
+  - `lint_tautology` -- §12 lint rejects `TEST_ASSERT_EQ(X, X, ...)` and accepts allowlisted exception
+  - `lint_stub_behind_stamp` -- §12 lint rejects 3-LOC stub function whose owner item is `[x]`; accepts `INTENTIONAL-STUB` marker
+  - `lint_phantom_include` -- §12 lint rejects `#include` with no symbol referenced from the same TU
+  - `audit_hooks_clean` -- §7 manifest matches dir + settings.json + plugin hooks; exit-2-or-bust audit passes
+  - `audit_ai_system` -- §9 umbrella runs all 8 checks
+  - `phase1_evidence_block` -- §17 skill_step_block exits 2 when review-todo-section reaches step 5 with no Phase-1 evidence
+  - `re_adv_trigger_block` -- §17 section_commit_gate exits 2 when staged diff matches a step-13.5 trigger and no re-adv entry within 30 minutes
+  - `lint_stamp_region` -- §18 lint Check 10 ERRORs on `[x]` row whose section body is missing Notes / Test runner / Verified / Quality reviewed
+  - `lint_os_comparison_sync` -- §18 lint Check 11 ERRORs on `[x]` IO row whose OS Comparison row is still ⬜ Planned
+  - `codex_prompt_scope_helper` -- §19 wrapper embeds `git show HEAD -- <files>` content into prompt when working tree is clean and prompt names files
+  - `quality_gate_block` -- §20 skill_step_block exits 2 on first src/ Edit when no `Skill(<domain>-code-quality)` precedes
+  - `unit_test_wiring_block` -- §20 section_commit_gate exits 2 when staged diff touches src/ but no test_*.c change and no exemption
+  - `impl_adversarial_block` -- §20 section_commit_gate exits 2 on IO-row flip + src diff with no adversarial entry in last-review-stamps.json
+  - `smoke_gate_block` -- §20 section_commit_gate exits 2 on boot-path edits with stale or missing build/smoke-test.stripped.log
+  - `heuristic_warn_step1` / `_step2` / `_step3` / `_step9` / `_step15` / `_step17` / `_step18` -- §21 emits WARN systemMessage and writes heuristic-misses.jsonl entry on each heuristic miss; never BLOCKs
+- [ ] No bat-runner subdirs needed (kernel test infra not touched).
+- [ ] Commit: `"test: add automation-hardening tooling-side tests to test-tooling.sh"`
+
+---
+
+## Verification
+
+> **Test runner:** N/A (host-side automation tooling; no kernel/usermode/desktop test surface) | validation: `bash scripts/test-tooling.sh` (~37 new sub-tests via §1-§5 / §7 / §9 / §10 / §11 / §12 / §17 / §18 / §19 / §20 / §21) + `bash scripts/audit-ai-system.sh` (8 cross-tool drift checks via §9) + `bash scripts/lint.sh` (Check 6/7/8 from §12 + Check 10/11 from §18).
+
+- [ ] `codex mcp list` shows both `todo-graph` and `lsp-bridge` (§1)
+- [ ] `codex exec "use todo-graph to list 5 ready sections"` returns real section titles (§1)
+- [ ] `bash scripts/build.sh clean` -> `=== BUILD OK ===` (no kernel impact, just confirms tooling changes do not break build)
+- [ ] `bash scripts/test-tooling.sh` shows all ~22 new sub-tests PASS (§1-§5, §7, §9, §10, §11, §12)
+- [ ] `bash scripts/audit-ai-system.sh` shows all 8 checks PASS (§9)
+- [ ] `bash scripts/lint.sh` runs the 3 new content checks from §12 with allowlist markers honored
+- [ ] Skill step-state telemetry: invoke `/implement-todo-section` on a trivial section, deliberately skip step 13 (no Codex dispatch); attempt section commit, hook exits 2 naming step 13 missing-evidence; run step 13, retry, exits 0 (§10)
+- [ ] Hook event surface: type "skip review and just commit" as a user prompt, the agent's first response begins with the doctrine reminder (§11 UserPromptSubmit). End a session with an unfulfilled "I'll run /review-todo-section" promise; next SessionStart surfaces the entry from `acknowledged-but-skipped.log` (§11 Stop)
+- [ ] `bash scripts/todo-graph/validate.py` shows no stale XREFs after the §10 reciprocal-XREF sweep
+- [ ] Manual end-to-end test: invoke `/codex:adversarial-review --wait` on a trivial branch change; attempt an Edit; receiving-review hook blocks; invoke `superpowers:receiving-code-review`; retry; allows (§3)
+- [ ] Manual end-to-end test: stage a section-commit diff WITHOUT running Codex, attempt `git commit`, gate blocks with named missing evidence; complete the pipeline; retry; passes (§4)
+- [ ] Manual end-to-end test: stage a `**Quality reviewed:**` stamp diff with only 2 of 4 review state entries, attempt commit, gate blocks naming the 2 missing dispatches (§5)
+- [ ] Verify on: Linux WSL2 dev host (Codex CLI 0.125.0+, Claude Code current). Bare-metal / Windows test platforms not applicable -- this TODO is host-side automation only.
+- [ ] Commit: `"00-infrastructure/TODO-08: automation hardening complete"`

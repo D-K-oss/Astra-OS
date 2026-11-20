@@ -1,0 +1,596 @@
+/* ============================================================================
+ * fat32_core.c -- String helpers, sector cache, sector I/O, FAT operations
+ *
+ * Contains the low-level building blocks used by all other FAT32 modules:
+ * string utilities, LRU sector cache, block device I/O wrappers, FAT entry
+ * manipulation, cluster allocation/free, and FSInfo sector management.
+ *
+ * All functions take a fat32_volume* for per-volume state access.
+ * ============================================================================ */
+
+#include "fat32_internal.h"
+#include "libc/string.h"
+
+/* The string helpers, name decoders and BPB checks live in fat32_parse.c: every decision
+ * made from on-disk bytes, in one file the host fuzzer builds. */
+
+int fat32_validate_bpb(struct fat32_volume *vol)
+{
+    return fat32_bpb_check(&vol->bpb, vol->sector_buf);
+}
+
+uint32_t fat32_last_cluster(const struct fat32_volume *vol)
+{
+    uint64_t by_data = (uint64_t)((vol->bpb.total_sectors - vol->bpb.first_data_sector) /
+                                  vol->bpb.sectors_per_cluster) + 1u;
+    uint64_t by_fat = (uint64_t)vol->bpb.fat_size_sectors * FAT32_ENTRIES_PER_SECTOR - 1u;
+    uint64_t last = (by_data < by_fat) ? by_data : by_fat;
+
+    return (last > FAT32_MAX_DATA_CLUSTER) ? FAT32_MAX_DATA_CLUSTER : (uint32_t)last;
+}
+
+/* ---- Dirty volume marker (FAT[1] bit 27) ---- */
+
+#define FAT32_CLEAN_SHUTDOWN_BIT  0x08000000  /* bit 27 of FAT[1] */
+
+void fat32_read_dirty_marker(struct fat32_volume *vol)
+{
+    uint32_t fat1_entry = fat32_get_fat_entry(vol, 1);
+
+    /* If bit 27 is CLEAR, the volume was not cleanly unmounted */
+    if ((fat1_entry & FAT32_CLEAN_SHUTDOWN_BIT) == 0) {
+        vol->volume_dirty = 1;
+        klog(LOG_WARN, "fat32", "Dirty volume -- not cleanly unmounted");
+    } else {
+        vol->volume_dirty = 0;
+    }
+}
+
+void fat32_set_dirty_marker(struct fat32_volume *vol)
+{
+    uint32_t fat1_entry = fat32_get_fat_entry(vol, 1);
+
+    /* Clear bit 27 to mark volume as dirty (in-use) */
+    fat1_entry &= ~FAT32_CLEAN_SHUTDOWN_BIT;
+
+    {
+        uint32_t fat_offset = 1 * 4;
+        uint32_t fat_sector = vol->bpb.first_fat_sector + (fat_offset / 512);
+        uint32_t entry_offset = fat_offset % 512;
+        uint32_t fi;
+
+        for (fi = 0; fi < vol->bpb.num_fats; fi++) {
+            uint32_t sector = fat_sector + fi * vol->bpb.fat_size_sectors;
+            if (fat32_read_sector(vol, sector, vol->sector_buf) != 0)
+                return;
+            *(uint32_t *)&vol->sector_buf[entry_offset] = fat1_entry;
+            if (fat32_write_sector(vol, sector, vol->sector_buf) != 0)
+                return;
+        }
+    }
+    vol->volume_dirty = 1;
+}
+
+void fat32_set_clean_marker(struct fat32_volume *vol)
+{
+    uint32_t fat1_entry = fat32_get_fat_entry(vol, 1);
+
+    /* Set bit 27 to mark volume as cleanly unmounted */
+    fat1_entry |= FAT32_CLEAN_SHUTDOWN_BIT;
+    fat32_set_fat_entry(vol, 1, fat1_entry & 0x0FFFFFFF);
+
+    /* Note: fat32_set_fat_entry masks to 28 bits, so we need to write
+     * the full 32-bit value directly to preserve the high bits. */
+    {
+        uint32_t fat_offset = 1 * 4;  /* cluster 1 */
+        uint32_t fat_sector = vol->bpb.first_fat_sector + (fat_offset / 512);
+        uint32_t entry_offset = fat_offset % 512;
+        uint32_t fi;
+
+        for (fi = 0; fi < vol->bpb.num_fats; fi++) {
+            uint32_t sector = fat_sector + fi * vol->bpb.fat_size_sectors;
+
+            if (fat32_read_sector(vol, sector, vol->sector_buf) != 0)
+                return;
+
+            *(uint32_t *)&vol->sector_buf[entry_offset] = fat1_entry;
+
+            if (fat32_write_sector(vol, sector, vol->sector_buf) != 0)
+                return;
+        }
+    }
+}
+
+/* ---- Dual-FAT compare and repair ---- */
+
+/* Compare FAT1 with its mirror. With `fix`, a mismatched FAT2 sector is
+ * rewritten from FAT1; without it nothing is written. Returns -1 when a sector
+ * could not be read (the comparison is incomplete), otherwise the number of
+ * mismatched sectors still wrong afterwards: every mismatch without `fix`, or
+ * each repair write that failed. */
+int fat32_compare_repair_fats(struct fat32_volume *vol, int fix)
+{
+    uint32_t fat_size = vol->bpb.fat_size_sectors;
+    uint32_t fat1_base = vol->bpb.first_fat_sector;
+    uint32_t fat2_base = fat1_base + fat_size;
+    uint32_t mismatch_count = 0;
+    uint32_t unrepaired = 0;
+    int unreadable = 0;
+    uint32_t s;
+    uint8_t buf1[512];
+    uint8_t buf2[512];
+
+    if (vol->bpb.num_fats < 2)
+        return 0;
+
+    for (s = 0; s < fat_size; s++) {
+        uint32_t i;
+        int differ = 0;
+
+        if (blkdev_read(vol->dev, fat1_base + s, 1, buf1) != 0 ||
+            blkdev_read(vol->dev, fat2_base + s, 1, buf2) != 0) {
+            klog(LOG_WARN, "fat32", "FAT compare: sector %u unreadable", (uint64_t)s);
+            unreadable = 1;
+            continue;
+        }
+
+        for (i = 0; i < 512; i++) {
+            if (buf1[i] != buf2[i]) {
+                differ = 1;
+                break;
+            }
+        }
+
+        if (differ) {
+            mismatch_count++;
+            if (!fix) {
+                klog(LOG_WARN, "fat32", "FAT mismatch at sector %u (not repaired)", (uint64_t)s);
+                unrepaired++;
+                continue;
+            }
+            klog(LOG_WARN, "fat32",
+                 "FAT mismatch at sector %u -- repairing FAT2",
+                 (uint64_t)s);
+            if (blkdev_write(vol->dev, fat2_base + s, 1, buf1) != 0) {
+                klog(LOG_WARN, "fat32",
+                     "FAT2 repair write failed at sector %u",
+                     (uint64_t)s);
+                unrepaired++;
+            } else {
+                __atomic_store_n(&vol->dirty_since_sync, 1,
+                                 __ATOMIC_RELEASE);
+            }
+        }
+    }
+
+    if (mismatch_count > 0) {
+        klog(LOG_WARN, "fat32",
+             "FAT compare: %u mismatched sectors, %u still wrong",
+             (uint64_t)mismatch_count, (uint64_t)unrepaired);
+    }
+    if (unreadable)
+        return -1;
+    return (int)unrepaired;
+}
+
+/* ---- Sector cache (LRU with dirty tracking) ---- */
+
+static scache_entry_t *scache_lookup(struct fat32_volume *vol, uint32_t sector)
+{
+    int i;
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        if (vol->cache[i].valid && vol->cache[i].sector == sector) {
+            vol->cache[i].last_access = ++vol->cache_access;
+            return &vol->cache[i];
+        }
+    }
+    return (scache_entry_t *)0;
+}
+
+static scache_entry_t *scache_evict(struct fat32_volume *vol)
+{
+    int i;
+    int lru_idx = 0;
+    uint32_t lru_val = 0xFFFFFFFF;
+
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        if (!vol->cache[i].valid)
+            return &vol->cache[i];
+    }
+
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        if (vol->cache[i].last_access < lru_val) {
+            lru_val = vol->cache[i].last_access;
+            lru_idx = i;
+        }
+    }
+
+    if (vol->cache[lru_idx].dirty) {
+        blkdev_write(vol->dev, vol->cache[lru_idx].sector, 1,
+                     vol->cache[lru_idx].data);
+        vol->cache[lru_idx].dirty = 0;
+        __atomic_store_n(&vol->dirty_since_sync, 1, __ATOMIC_RELEASE);
+    }
+
+    vol->cache[lru_idx].valid = 0;
+    return &vol->cache[lru_idx];
+}
+
+int scache_flush(struct fat32_volume *vol)
+{
+    int i;
+    int rc = 0;
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        if (vol->cache[i].valid && vol->cache[i].dirty) {
+            if (blkdev_write(vol->dev, vol->cache[i].sector, 1,
+                             vol->cache[i].data) != 0) {
+                /* Keep the slot dirty so a later flush can retry; the
+                 * caller's durability decision needs the failure. */
+                rc = -1;
+                continue;
+            }
+            vol->cache[i].dirty = 0;
+            __atomic_store_n(&vol->dirty_since_sync, 1, __ATOMIC_RELEASE);
+        }
+    }
+    return rc;
+}
+
+void scache_invalidate(struct fat32_volume *vol)
+{
+    int i;
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        if (vol->cache[i].valid && vol->cache[i].dirty) {
+            blkdev_write(vol->dev, vol->cache[i].sector, 1,
+                         vol->cache[i].data);
+        }
+        vol->cache[i].valid = 0;
+        vol->cache[i].dirty = 0;
+    }
+    vol->cache_access = 0;
+}
+
+/* ---- Block device I/O (cached) ---- */
+
+int fat32_read_sector(struct fat32_volume *vol, uint32_t sector, void *buf)
+{
+    scache_entry_t *e = scache_lookup(vol, sector);
+    uint8_t *dst = (uint8_t *)buf;
+    int i;
+
+    if (e) {
+        for (i = 0; i < 512; i++)
+            dst[i] = e->data[i];
+        return 0;
+    }
+
+    e = scache_evict(vol);
+    if (blkdev_read(vol->dev, sector, 1, e->data) != 0)
+        return -1;
+
+    e->sector      = sector;
+    e->valid       = 1;
+    e->dirty       = 0;
+    e->last_access = ++vol->cache_access;
+
+    for (i = 0; i < 512; i++)
+        dst[i] = e->data[i];
+
+    return 0;
+}
+
+int fat32_read_sectors_multi(struct fat32_volume *vol, uint32_t sector,
+                              uint32_t count, void *buf)
+{
+    int i;
+
+    if (blkdev_read(vol->dev, sector, count, buf) != 0)
+        return -1;
+
+    /* Cache coherence: the sector cache may hold NEWER (dirty) copies of
+     * sectors in this range (fat32_write_sector path). Overlay them, or
+     * the caller merges data into stale disk content. */
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        scache_entry_t *e = &vol->cache[i];
+        if (e->valid && e->sector >= sector &&
+            e->sector < sector + count) {
+            uint8_t *dst = (uint8_t *)buf + ((e->sector - sector) * 512u);
+            memcpy(dst, (const void *)e->data, 512);
+        }
+    }
+    return 0;
+}
+
+int fat32_write_sector(struct fat32_volume *vol, uint32_t sector,
+                        const void *buf)
+{
+    scache_entry_t *e = scache_lookup(vol, sector);
+    const uint8_t *src = (const uint8_t *)buf;
+    int i;
+
+    if (!e) {
+        e = scache_evict(vol);
+        e->sector = sector;
+        e->valid  = 1;
+    }
+
+    for (i = 0; i < 512; i++)
+        e->data[i] = src[i];
+
+    e->dirty       = 1;
+    e->last_access = ++vol->cache_access;
+
+    return 0;
+}
+
+int fat32_write_sectors_multi(struct fat32_volume *vol, uint32_t sector,
+                               uint32_t count, const void *buf)
+{
+    int i;
+
+    if (blkdev_write(vol->dev, sector, count, buf) != 0)
+        return -1;
+
+    /* Cache coherence: stale DIRTY entries for these sectors (e.g. the
+     * fat32_zero_cluster zeros of a fresh cluster) would later flush
+     * OVER this direct write (2026-06-12 incident: freshly created files
+     * read back as all-zeros depending on cache pressure). Sync
+     * overlapping entries to the written content and mark clean. */
+    for (i = 0; i < SCACHE_SLOTS; i++) {
+        scache_entry_t *e = &vol->cache[i];
+        if (e->valid && e->sector >= sector &&
+            e->sector < sector + count) {
+            const uint8_t *src =
+                (const uint8_t *)buf + ((e->sector - sector) * 512u);
+            memcpy((void *)e->data, src, 512);
+            e->dirty = 0;
+        }
+    }
+    __atomic_store_n(&vol->dirty_since_sync, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* ---- FAT entry manipulation ---- */
+
+/* Read one FAT1 entry. Returns 0 and stores the 28-bit value in *out, or -1
+ * when its sector could not be read. Callers that decide what is reachable
+ * (fsck) must use this: a failed read is not the end of a chain. */
+int fat32_read_fat_entry(struct fat32_volume *vol, uint32_t cluster, uint32_t *out)
+{
+    uint32_t fat_offset = cluster * 4;
+    uint32_t fat_sector = vol->bpb.first_fat_sector + (fat_offset / 512);
+    uint32_t entry_offset = fat_offset % 512;
+
+    if (fat32_read_sector(vol, fat_sector, vol->sector_buf) != 0)
+        return -1;
+    *out = *(uint32_t *)&vol->sector_buf[entry_offset] & 0x0FFFFFFF;
+    return 0;
+}
+
+/* Unchecked form: a failed read reads as end of chain, which stops a reader
+ * safely but must never feed a decision to free clusters. */
+uint32_t fat32_get_fat_entry(struct fat32_volume *vol, uint32_t cluster)
+{
+    uint32_t val;
+
+    if (fat32_read_fat_entry(vol, cluster, &val) != 0)
+        return FAT32_EOC;
+    return val;
+}
+
+int fat32_set_fat_entry(struct fat32_volume *vol, uint32_t cluster,
+                         uint32_t value)
+{
+    uint32_t fat_offset = cluster * 4;
+    uint32_t entry_offset = fat_offset % 512;
+    uint32_t fat_relative_sector = fat_offset / 512;
+    uint32_t existing;
+    uint32_t fi;
+
+    for (fi = 0; fi < vol->bpb.num_fats; fi++) {
+        uint32_t fat_sector = vol->bpb.first_fat_sector
+                            + fi * vol->bpb.fat_size_sectors
+                            + fat_relative_sector;
+
+        if (fat32_read_sector(vol, fat_sector, vol->sector_buf) != 0)
+            return -1;
+
+        existing = *(uint32_t *)&vol->sector_buf[entry_offset];
+        existing = (existing & 0xF0000000) | (value & 0x0FFFFFFF);
+        *(uint32_t *)&vol->sector_buf[entry_offset] = existing;
+
+        if (fat32_write_sector(vol, fat_sector, vol->sector_buf) != 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+/* Read the FAT entry for `cluster`, distinguishing a real value from an
+ * I/O failure: returns 0 and writes *out on success, -1 on FAT read
+ * error. fat32_get_fat_entry returns FAT32_EOC on read failure, which a
+ * tri-state chain walk MUST NOT confuse with a genuine end-of-chain --
+ * doing so would report "absent" on a degraded FAT read and let a
+ * duplicate dirent through. */
+int fat32_next_cluster_checked(struct fat32_volume *vol, uint32_t cluster,
+                               uint32_t *out)
+{
+    uint32_t fat_offset = cluster * 4;
+    uint32_t fat_sector = vol->bpb.first_fat_sector + (fat_offset / 512);
+    uint32_t entry_offset = fat_offset % 512;
+
+    if (fat32_read_sector(vol, fat_sector, vol->sector_buf) != 0)
+        return -1;
+    *out = (*(uint32_t *)&vol->sector_buf[entry_offset]) & 0x0FFFFFFF;
+    return 0;
+}
+
+uint32_t fat32_next_cluster(struct fat32_volume *vol, uint32_t cluster)
+{
+    uint32_t fat_offset = cluster * 4;
+    uint32_t fat_sector = vol->bpb.first_fat_sector + (fat_offset / 512);
+    uint32_t entry_offset = fat_offset % 512;
+    uint32_t next;
+
+    if (fat32_read_sector(vol, fat_sector, vol->sector_buf) != 0)
+        return FAT32_EOC;
+
+    next = *(uint32_t *)&vol->sector_buf[entry_offset];
+    next &= 0x0FFFFFFF;
+
+    return next;
+}
+
+uint32_t cluster_to_sector(struct fat32_volume *vol, uint32_t cluster)
+{
+    return vol->bpb.first_data_sector
+         + (cluster - 2) * vol->bpb.sectors_per_cluster;
+}
+
+/* ---- FSInfo sector I/O ---- */
+
+void fat32_fsinfo_flush(struct fat32_volume *vol)
+{
+    uint8_t buf[512];
+
+    if (!vol->fsinfo_valid || !vol->fsinfo_dirty)
+        return;
+
+    if (fat32_read_sector(vol, vol->fsinfo_sector, buf) != 0)
+        return;
+
+    if (*(uint32_t *)&buf[0] != FSINFO_LEAD_SIG)
+        return;
+
+    *(uint32_t *)&buf[488] = vol->fsinfo_free_count;
+    *(uint32_t *)&buf[492] = vol->fsinfo_next_free;
+
+    fat32_write_sector(vol, vol->fsinfo_sector, buf);
+
+    if (vol->fsinfo_sector + 6 < vol->bpb.reserved_sectors) {
+        if (fat32_read_sector(vol, vol->fsinfo_sector + 6, buf) == 0) {
+            if (*(uint32_t *)&buf[0] == FSINFO_LEAD_SIG) {
+                *(uint32_t *)&buf[488] = vol->fsinfo_free_count;
+                *(uint32_t *)&buf[492] = vol->fsinfo_next_free;
+                fat32_write_sector(vol, vol->fsinfo_sector + 6, buf);
+            }
+        }
+    }
+
+    vol->fsinfo_dirty = 0;
+}
+
+/* ---- Full FAT scan for free cluster count ---- */
+
+uint32_t fat32_count_free_clusters(struct fat32_volume *vol)
+{
+    uint32_t total_data_clusters;
+    uint32_t max_cluster;
+    uint32_t cluster;
+    uint32_t free_count = 0;
+
+    total_data_clusters = (vol->bpb.total_sectors - vol->bpb.first_data_sector)
+                        / vol->bpb.sectors_per_cluster;
+    max_cluster = total_data_clusters + 2;
+
+    for (cluster = 2; cluster < max_cluster; cluster++) {
+        if (fat32_get_fat_entry(vol, cluster) == FAT32_FREE)
+            free_count++;
+    }
+
+    return free_count;
+}
+
+/* ---- Free cluster allocation ---- */
+
+uint32_t fat32_alloc_cluster(struct fat32_volume *vol)
+{
+    uint32_t total_data_clusters;
+    uint32_t max_cluster;
+    uint32_t start;
+    uint32_t cluster;
+    int pass;
+
+    total_data_clusters = (vol->bpb.total_sectors - vol->bpb.first_data_sector)
+                        / vol->bpb.sectors_per_cluster;
+    max_cluster = total_data_clusters + 2;
+
+    start = (vol->fsinfo_valid && vol->fsinfo_next_free >= 2
+             && vol->fsinfo_next_free < max_cluster)
+          ? vol->fsinfo_next_free : 2;
+
+    for (pass = 0; pass < 2; pass++) {
+        uint32_t begin = (pass == 0) ? start : 2;
+        uint32_t end   = (pass == 0) ? max_cluster : start;
+
+        for (cluster = begin; cluster < end; cluster++) {
+            if (fat32_get_fat_entry(vol, cluster) == FAT32_FREE) {
+                if (fat32_set_fat_entry(vol, cluster, 0x0FFFFFFF) != 0)
+                    return 0;
+
+                vol->fsinfo_next_free = cluster + 1;
+                if (vol->fsinfo_next_free >= max_cluster)
+                    vol->fsinfo_next_free = 2;
+                if (vol->fsinfo_free_count != FSINFO_UNKNOWN
+                    && vol->fsinfo_free_count > 0)
+                    vol->fsinfo_free_count--;
+                vol->fsinfo_dirty = 1;
+
+                return cluster;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void fat32_free_chain(struct fat32_volume *vol, uint32_t cluster)
+{
+    while (cluster >= 2 && cluster < FAT32_EOC && cluster != FAT32_FREE) {
+        uint32_t next = fat32_get_fat_entry(vol, cluster);
+        fat32_set_fat_entry(vol, cluster, FAT32_FREE);
+
+        if (vol->fsinfo_free_count != FSINFO_UNKNOWN)
+            vol->fsinfo_free_count++;
+        if (cluster < vol->fsinfo_next_free)
+            vol->fsinfo_next_free = cluster;
+        vol->fsinfo_dirty = 1;
+
+        cluster = next;
+    }
+}
+
+int fat32_zero_cluster(struct fat32_volume *vol, uint32_t cluster)
+{
+    uint32_t sector = cluster_to_sector(vol, cluster);
+    uint8_t zero[512];
+    uint32_t si;
+    uint32_t k;
+
+    for (k = 0; k < 512; k++)
+        zero[k] = 0;
+
+    for (si = 0; si < vol->bpb.sectors_per_cluster; si++) {
+        if (fat32_write_sector(vol, sector + si, zero) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+int fat32_flush_disk(struct fat32_volume *vol)
+{
+    int rc = 0;
+    fat32_fsinfo_flush(vol);
+    /* NOTE: deliberately NO fat32_set_clean_marker here. This runs on
+     * every vfs_flush of a mounted, still-mutable volume; marking the
+     * FAT clean mid-session would let a later crash skip dirty-volume
+     * repair. Clean-marking belongs to fat32_mark_clean (unmount /
+     * shutdown), after the last write. */
+    if (scache_flush(vol) != 0)
+        rc = -1;
+    /* NOTE: no blkdev_sync here -- this runs under vol->lock (spinlock)
+     * and device flush can sleep (VirtIO event_wait). The durability
+     * boundary that includes the device cache is fat32_vfs_flush, which
+     * syncs AFTER dropping the lock. */
+    return rc;
+}

@@ -1,0 +1,1263 @@
+/* ============================================================================
+ * ahci_core.c -- AHCI driver core: state, MMIO, port management, ISR, init
+ * ============================================================================ */
+
+#include "kernel/drivers/ahci_internal.h"
+#include "registry.h"
+#include "kernel/drivers/pci.h"
+#include "kernel/drivers/ioapic.h"
+#include "kernel/drivers/lapic.h"
+#include "kernel/irq.h"
+#include "kernel/mm/vmm.h"
+#include "kernel/boot_init.h"
+#include "kernel/boot_probe.h"
+#include "kernel/sched/event.h"
+
+/* Max PCI capabilities to walk before declaring the chain malformed. PCI
+ * config space is device/firmware-supplied; a cyclic/self-pointing next ptr
+ * would otherwise hang the boot-time cap walk forever. Matches Linux's
+ * PCI_FIND_CAP_TTL (48). */
+#define AHCI_PCI_CAP_TTL 48
+
+/* ---- Driver state ---- */
+volatile uint8_t *abar;
+struct ahci_port  ports[AHCI_MAX_PORTS];
+int               num_drives;
+int               num_atapi;
+int               initialized;
+int               num_ports_total;
+int               atapi_map[AHCI_MAX_PORTS];
+
+/* ---- Interrupt state ---- */
+static uint8_t    ahci_pci_bus;
+static uint8_t    ahci_pci_slot;
+static uint8_t    ahci_pci_func;
+static uint8_t    ahci_irq_vector;
+int               use_events;
+int               ahci_clo_supported;
+int               ahci_ncq_capable;
+uint8_t           ahci_max_cmd_slots;
+
+/* ---- MMIO helpers (identity-mapped) ---- */
+static inline uint32_t ahci_read32(volatile uint8_t *base, uint32_t off)
+{
+    return *(volatile uint32_t *)(base + off);
+}
+
+static inline void ahci_write32(volatile uint8_t *base, uint32_t off,
+                                 uint32_t val)
+{
+    *(volatile uint32_t *)(base + off) = val;
+}
+
+/* ---- memset helper ---- */
+void ahci_memset(void *dst, uint8_t val, uint64_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    while (n--)
+        *d++ = val;
+}
+
+/* ---- Port register access ---- */
+static inline volatile uint8_t *port_regs(int port_num)
+{
+    return abar + AHCI_PORT_BASE + (uint32_t)port_num * AHCI_PORT_SIZE;
+}
+
+uint32_t port_read(volatile uint8_t *pregs, uint32_t off)
+{
+    return ahci_read32(pregs, off);
+}
+
+void port_write(volatile uint8_t *pregs, uint32_t off, uint32_t val)
+{
+    ahci_write32(pregs, off, val);
+}
+
+/* ---- Stop command engine ----
+ * Returns 1 when the HBA confirms both engines stopped (PxCMD.CR and FR
+ * clear), 0 when either is still running after its bounded wait: a caller
+ * that hands request buffers back on the strength of the stop must check it. */
+int port_stop_cmd(volatile uint8_t *pregs)
+{
+    uint32_t cmd = port_read(pregs, AHCI_PxCMD);
+    uint32_t timeout;
+
+    /* Clear ST (stop command list processing) */
+    cmd &= ~AHCI_PxCMD_ST;
+    port_write(pregs, AHCI_PxCMD, cmd);
+
+    /* Wait for CR to clear */
+    timeout = 500000;
+    while (timeout--) {
+        if (!(port_read(pregs, AHCI_PxCMD) & AHCI_PxCMD_CR))
+            break;
+    }
+
+    /* Clear FRE (stop FIS receive) */
+    cmd = port_read(pregs, AHCI_PxCMD);
+    cmd &= ~AHCI_PxCMD_FRE;
+    port_write(pregs, AHCI_PxCMD, cmd);
+
+    /* Wait for FR to clear */
+    timeout = 500000;
+    while (timeout--) {
+        if (!(port_read(pregs, AHCI_PxCMD) & AHCI_PxCMD_FR))
+            break;
+    }
+    return (port_read(pregs, AHCI_PxCMD) & (AHCI_PxCMD_CR | AHCI_PxCMD_FR)) == 0;
+}
+
+/* Panic only: reset the whole HBA (GHC.HR), which returns every port's data
+ * transfer and queuing state machine to idle (AHCI 1.3.1 section 3.1.2). The
+ * last way to stop DMA when a port's engine will not stop; drastic, so never
+ * used while the system runs, since nothing re-initialises the ports after. */
+#define AHCI_HBA_RESET_READS  1000000u
+
+/* Bumped before every (panic-only, never undone) HBA reset. A legacy command
+ * issued once it is non-zero is refused, and one in flight across a bump
+ * fails, because the reset clears PxCI and that would read as done. */
+static volatile uint32_t s_hba_reset_gen;
+
+int ahci_reset_voids_cmd(uint32_t gen_at_issue, uint32_t gen_now)
+{
+    /* An issuer that sampled the bumped generation may still write PxCI
+     * before HR lands, so a non-zero sample is refused outright rather than
+     * trusted to be compared later. */
+    return gen_at_issue != 0 || gen_now != gen_at_issue;
+}
+
+void ahci_port_close_for_reset(struct ahci_port *p)
+{
+    uint64_t flags;
+    int locked = ahci_tag_lock(p, &flags);
+
+    /* Under the port's completion lock, so no ISR or poller is between
+     * sampling the registers and publishing. A refused lock is a holder that
+     * cannot proceed (parked by the panic), and the store still lands. */
+    __atomic_store_n(&p->ncq_closed, 1, __ATOMIC_RELEASE);
+    if (locked)
+        ahci_tag_unlock(p, flags);
+}
+
+int ahci_hba_reset_for_panic(void)
+{
+    uint32_t n;
+    int i;
+
+    /* An HBA reset clears every port's PxSACT/PxCI/PxIS, which to an ISR or a
+     * poller on any port reads as "every command finished". Close them all
+     * first, so none can publish success for a request the reset aborted;
+     * their waiters then fail through recovery. */
+    for (i = 0; i < AHCI_MAX_PORTS; i++)
+        if (ports[i].regs)
+            ahci_port_close_for_reset(&ports[i]);
+    __atomic_add_fetch(&s_hba_reset_gen, 1, __ATOMIC_SEQ_CST);   /* before HR: see port_issue_cmd */
+    ahci_write32(abar, AHCI_GHC, ahci_read32(abar, AHCI_GHC) | AHCI_GHC_HR);
+    for (n = 0; n < AHCI_HBA_RESET_READS; n++)
+        if (!(ahci_read32(abar, AHCI_GHC) & AHCI_GHC_HR))
+            return 1;
+    return 0;
+}
+
+/* ---- Start command engine ---- */
+void port_start_cmd(volatile uint8_t *pregs)
+{
+    uint32_t cmd;
+    uint32_t timeout = 500000;
+
+    while ((port_read(pregs, AHCI_PxCMD) & AHCI_PxCMD_CR) && timeout--)
+        ;
+
+    cmd = port_read(pregs, AHCI_PxCMD);
+    cmd |= AHCI_PxCMD_FRE;
+    port_write(pregs, AHCI_PxCMD, cmd);
+
+    cmd |= AHCI_PxCMD_ST;
+    port_write(pregs, AHCI_PxCMD, cmd);
+}
+
+/* ---- Find a free command slot ---- */
+int port_find_slot(volatile uint8_t *pregs)
+{
+    uint32_t slots = port_read(pregs, AHCI_PxSACT) |
+                     port_read(pregs, AHCI_PxCI);
+    int i;
+    for (i = 0; i < 32; i++) {
+        if (!(slots & (1U << i)))
+            return i;
+    }
+    return -1;
+}
+
+/* ---- Initialize a single port ---- */
+/* Mask and acknowledge a port's interrupts and stop its command and FIS
+ * engines. Returns 1 when the HBA confirms both stopped (PxCMD.CR and FR
+ * clear), 0 when it does not. */
+static int port_quiesce(volatile uint8_t *pregs)
+{
+    int stopped;
+
+    port_write(pregs, AHCI_PxIE, 0);
+    stopped = port_stop_cmd(pregs);
+    port_write(pregs, AHCI_PxIS, 0xFFFFFFFF);
+    return stopped;
+}
+
+void ahci_port_drop_buffers(struct ahci_port *p, int may_free)
+{
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        if (may_free && p->cmdtbl_raw[i])
+            kfree(p->cmdtbl_raw[i]);
+        p->cmdtbl_raw[i] = NULL;
+        p->cmdtbl[i] = NULL;
+    }
+    if (may_free && p->fis_raw)
+        kfree(p->fis_raw);
+    if (may_free && p->cmdlist_raw)
+        kfree(p->cmdlist_raw);
+    p->fis_raw = NULL;
+    p->fis_base = NULL;
+    p->cmdlist_raw = NULL;
+    p->cmdlist = NULL;
+}
+
+void ahci_port_release(struct ahci_port *p)
+{
+    int stopped = 1;
+
+    p->active = 0;
+    if (p->regs)
+        stopped = port_quiesce(p->regs);
+    if (!stopped)
+        klog(LOG_WARN, "ahci",
+             "Port %u: engines did not stop; DMA buffers left with the device",
+             (uint64_t)p->port_num);
+    /* The decision uses THIS port's engine state only, and the slot is cleared
+     * either way, so a later port that reuses the slot can never free buffers
+     * a still-running engine owns. */
+    ahci_port_drop_buffers(p, stopped);
+}
+
+static int port_init(struct ahci_port *p, int port_num)
+{
+    volatile uint8_t *pregs = port_regs(port_num);
+    uint32_t ssts;
+    uint8_t *clb_mem;
+    uint8_t *fb_mem;
+    int i;
+
+    p->port_num = (uint8_t)port_num;
+    p->active = 0;
+    p->regs = pregs;
+
+    /* Check if device is present and PHY communication established */
+    ssts = port_read(pregs, AHCI_PxSSTS);
+    if ((ssts & AHCI_SSTS_DET_MASK) != AHCI_SSTS_DET_OK)
+        return -1;
+    if ((ssts & AHCI_SSTS_IPM_MASK) != AHCI_SSTS_IPM_ACTIVE)
+        return -1;
+
+    /* Read port signature (PxSIG).
+     * After reset, ATA/ATAPI devices place a signature into the task file
+     * registers: SC=0x01, LBALo=0x01, LBAMid, LBAHi.
+     *   ATA:   LBAMid=0x00, LBAHi=0x00 → PxSIG=0x00000101
+     *   ATAPI: LBAMid=0x14, LBAHi=0xEB → PxSIG=0xEB140101
+     *   SEMB:  LBAMid=0x3C, LBAHi=0xC3 → PxSIG=0xC33C0101
+     *   PM:    LBAMid=0x69, LBAHi=0x96 → PxSIG=0x96690101
+     * Never use the Status register alone -- it fails on modern hardware. */
+    p->sig = port_read(pregs, AHCI_PxSIG);
+
+    switch (p->sig) {
+    case AHCI_SIG_ATA:
+        p->device_type = AHCI_DEV_ATA;
+        p->is_atapi = 0;
+        p->sector_size = 512;
+        break;
+
+    case AHCI_SIG_ATAPI:
+        p->device_type = AHCI_DEV_ATAPI;
+        p->is_atapi = 1;
+        p->sector_size = 2048;
+        klog(LOG_INFO, "ahci",
+             "Port %u: ATAPI device detected (signature 0x14/0xEB)",
+             (uint64_t)port_num);
+        break;
+
+    case AHCI_SIG_SEMB:
+        p->device_type = AHCI_DEV_SEMB;
+        klog(LOG_DEBUG, "ahci",
+             "Port %u: SEMB (enclosure management bridge) -- skipped",
+             (uint64_t)port_num);
+        return -1;
+
+    case AHCI_SIG_PM:
+        p->device_type = AHCI_DEV_PM;
+        klog(LOG_DEBUG, "ahci",
+             "Port %u: port multiplier detected -- not yet supported",
+             (uint64_t)port_num);
+        return -1;
+
+    default:
+        /* No device (0xFFFFFFFF / 0x00000000) or unknown signature */
+        p->device_type = AHCI_DEV_NULL;
+        if (p->sig != 0xFFFFFFFF && p->sig != 0x00000000) {
+            klog(LOG_DEBUG, "ahci",
+                 "Port %u: unknown signature 0x%x -- skipped",
+                 (uint64_t)port_num, (uint64_t)p->sig);
+        }
+        return -1;
+    }
+
+    /* Stop command engine before reconfiguring */
+    port_stop_cmd(pregs);
+
+    /* Allocate command list (1 KiB, 1024-byte aligned) */
+    clb_mem = (uint8_t *)kmalloc(1024 + 1024);
+    if (!clb_mem) return -1;
+    p->cmdlist_raw = clb_mem;
+    clb_mem = (uint8_t *)(((uintptr_t)clb_mem + 1023) & ~(uintptr_t)1023);
+    ahci_memset(clb_mem, 0, 1024);
+    p->cmdlist = (struct ahci_cmd_header *)clb_mem;
+
+    /* Set CLB register */
+    port_write(pregs, AHCI_PxCLB, (uint32_t)(uintptr_t)clb_mem);
+    port_write(pregs, AHCI_PxCLBU, 0);
+
+    /* Allocate FIS receive buffer (256 bytes, 256-byte aligned) */
+    fb_mem = (uint8_t *)kmalloc(256 + 256);
+    if (!fb_mem) { ahci_port_release(p); return -1; }
+    p->fis_raw = fb_mem;
+    fb_mem = (uint8_t *)(((uintptr_t)fb_mem + 255) & ~(uintptr_t)255);
+    ahci_memset(fb_mem, 0, 256);
+    p->fis_base = fb_mem;
+
+    /* Set FB register */
+    port_write(pregs, AHCI_PxFB, (uint32_t)(uintptr_t)fb_mem);
+    port_write(pregs, AHCI_PxFBU, 0);
+
+    /* Allocate command tables (one per command slot, 128-byte aligned) */
+    for (i = 0; i < 32; i++) {
+        uint32_t tbl_size = (uint32_t)sizeof(struct ahci_cmd_tbl);
+        uint8_t *tbl_mem = (uint8_t *)kmalloc(tbl_size + 128);
+        if (!tbl_mem) { ahci_port_release(p); return -1; }
+        p->cmdtbl_raw[i] = tbl_mem;
+        tbl_mem = (uint8_t *)(((uintptr_t)tbl_mem + 127) & ~(uintptr_t)127);
+        ahci_memset(tbl_mem, 0, tbl_size);
+        p->cmdtbl[i] = (struct ahci_cmd_tbl *)tbl_mem;
+
+        p->cmdlist[i].ctba  = (uint32_t)(uintptr_t)tbl_mem;
+        p->cmdlist[i].ctbau = 0;
+    }
+
+    /* Clear error register */
+    port_write(pregs, AHCI_PxSERR, 0xFFFFFFFF);
+
+    /* Clear interrupt status */
+    port_write(pregs, AHCI_PxIS, 0xFFFFFFFF);
+
+    /* Enable per-port interrupts */
+    port_write(pregs, AHCI_PxIE,
+               AHCI_PxIS_DHRS | AHCI_PxIS_PSS | AHCI_PxIS_DSS |
+               AHCI_PxIS_SDBS | AHCI_PxIS_TFES |
+               AHCI_PxIS_HBFS | AHCI_PxIS_HBDS | AHCI_PxIS_IFS |
+               AHCI_PxIS_INFS | AHCI_PxIS_OFS |
+               AHCI_PxIS_PCS  | AHCI_PxIS_PRCS);  /* Hot-plug events */
+
+    /* Initialize per-port completion event */
+    event_init(&p->completion, "ahci_port", EVENT_AUTO_RESET, 0);
+
+    /* Start command engine */
+    port_start_cmd(pregs);
+
+    p->active = 1;
+    return 0;
+}
+
+/* ---- AHCI interrupt service routine ----
+ * Returns IRQ_HANDLED when the controller raised this interrupt
+ * (AHCI_IS nonzero), IRQ_NONE otherwise -- the INTx line can be shared
+ * with other PCI devices. */
+static int ahci_irq_body(uint8_t vector, void *ctx)
+{
+    uint32_t is;
+    int i;
+
+    (void)vector;
+    (void)ctx;
+
+    is = ahci_read32(abar, AHCI_IS);
+    if (!is)
+        return IRQ_NONE;
+
+    for (i = 0; i < num_ports_total; i++) {
+        if (!ports[i].active)
+            continue;
+        if (!(is & (1U << ports[i].port_num)))
+            continue;
+
+        uint32_t pxis, serr = 0, held = 0, done = 0;
+        struct ahci_tag_done odone[32];
+
+        /* ONE critical section from the status read to the claim, shared with
+         * the synchronous poller and the issuer (ahci_tag_lock): acking PxIS
+         * before the failure is recorded, sampling PxSACT before a claim a
+         * reissue of the same tag can slip between, or reading a callback slot
+         * after a waiter could have reissued the tag would each let a command
+         * complete with the wrong result. Callbacks and logging run after.
+         *
+         * While recovery owns the port its engine is being stopped, so the
+         * cleared PxSACT/PxCI mean nothing: claim nothing. A fatal error
+         * does not prove its commands stopped moving data, so their tags are
+         * HELD (claimed, failed, unpublished) for recovery to publish once
+         * the engine stop is confirmed; recovery is queued below. */
+        {
+            uint64_t flags;
+            int recovering;
+
+            /* Only an NMI-nested path on this CPU can find the lock its own
+             * CPU holds, and the ISR is never one; touch nothing if so. */
+            if (!ahci_tag_lock(&ports[i], &flags))
+                continue;
+            /* A closed port (removed, or shut for an HBA reset) claims
+             * nothing: its registers no longer describe its requests, and
+             * whoever closed it fails them. */
+            recovering = __atomic_load_n(&ports[i].ncq_recovering, __ATOMIC_ACQUIRE) ||
+                         __atomic_load_n(&ports[i].ncq_closed, __ATOMIC_ACQUIRE);
+            pxis = port_read(ports[i].regs, AHCI_PxIS);
+            port_write(ports[i].regs, AHCI_PxIS, pxis);
+            if (pxis & AHCI_PxIS_FATAL) {
+                serr = port_read(ports[i].regs, AHCI_PxSERR);
+                port_write(ports[i].regs, AHCI_PxSERR, serr);
+                if (ports[i].ncq_supported && !recovering) {
+                    int t;
+
+                    held = ahci_tags_claim(&ports[i], 0xFFFFFFFFu);
+                    for (t = 0; t < 32; t++)
+                        if (held & (1U << t))
+                            ports[i].tag_status[t] = -1;
+                    ports[i].tags_held |= held;
+                }
+            }
+            if ((pxis & AHCI_PxIS_SDBS) && ports[i].ncq_supported && !recovering) {
+                uint32_t busy = port_read(ports[i].regs, AHCI_PxSACT) |
+                                port_read(ports[i].regs, AHCI_PxCI);
+
+                done = ahci_tags_claim(&ports[i], ~busy);
+            }
+            ahci_tags_detach(&ports[i], done, 0, odone);
+            /* Published LAST: a waiter that sees completed may free the tag. */
+            ahci_tags_complete(&ports[i], done);
+            ahci_tag_unlock(&ports[i], flags);
+        }
+        if (held)
+            ahci_ncq_queue_recovery(&ports[i]);
+
+        /* ---- Error classification ---- */
+        if (pxis & AHCI_PxIS_FATAL) {
+            ports[i].errors.fatal_errors++;
+            if (serr & AHCI_PxSERR_ERR_M)
+                ports[i].errors.crc_errors++;
+            klog(LOG_WARN, "ahci",
+                   "Port %u: fatal error PxIS=0x%x PxSERR=0x%x",
+                   (uint64_t)ports[i].port_num,
+                   (uint64_t)pxis, (uint64_t)serr);
+        }
+
+        if (pxis & AHCI_PxIS_NONFATAL) {
+            ports[i].errors.nonfatal_errors++;
+            klog(LOG_DEBUG, "ahci",
+                   "Port %u: non-fatal error PxIS=0x%x",
+                   (uint64_t)ports[i].port_num, (uint64_t)pxis);
+        }
+
+        /* Async completions captured under the lock above. */
+        ahci_tags_run(i, odone);
+
+        event_set(&ports[i].completion);
+
+        /* ---- Hot-plug detection (PCS / PRCS) ---- */
+        if ((pxis & (AHCI_PxIS_PCS | AHCI_PxIS_PRCS)) &&
+            !__atomic_load_n(&ports[i].ncq_recovering, __ATOMIC_ACQUIRE)) {
+            /* Not during recovery: its own COMRESET drops the link on purpose,
+             * and ncq_abort_port closes the port itself if no device returns. */
+            ahci_hotplug_check(i);
+        }
+    }
+
+    ahci_write32(abar, AHCI_IS, is);
+    return IRQ_HANDLED;
+}
+
+/* irq_handler_t shim for the MSI path (vector exclusively ours) */
+static void ahci_irq_handler(uint8_t vector, void *ctx)
+{
+    (void)ahci_irq_body(vector, ctx);
+}
+
+/* ---- CLO + COMRESET recovery for stuck BSY/DRQ ---- */
+/* The register half of stuck-device recovery: Command List Override when the
+ * HBA has it, then a COMRESET, then wait for the link and for BSY to clear.
+ * Expects the command engine already stopped and does not restart it, takes
+ * no lock and logs nothing, so a caller that owns the port can run it in the
+ * middle of its own recovery. Returns 0 with a device on the link, -1 when
+ * none came back. */
+int port_comreset_regs(volatile uint8_t *pregs)
+{
+    uint32_t cmd, wait;
+    int linked = 0;
+
+    if (ahci_clo_supported) {
+        cmd = port_read(pregs, AHCI_PxCMD);
+        cmd |= (1U << 3);
+        port_write(pregs, AHCI_PxCMD, cmd);
+
+        wait = 100000;
+        while ((port_read(pregs, AHCI_PxCMD) & (1U << 3)) && wait--)
+            ;
+    }
+
+    {
+        uint32_t sctl = port_read(pregs, AHCI_PxSCTL);
+        sctl = (sctl & ~0xFU) | 0x1;
+        port_write(pregs, AHCI_PxSCTL, sctl);
+    }
+
+    {
+        volatile uint32_t delay = 100000;
+        while (delay--)
+            ;
+    }
+
+    {
+        uint32_t sctl = port_read(pregs, AHCI_PxSCTL);
+        sctl &= ~0xFU;
+        port_write(pregs, AHCI_PxSCTL, sctl);
+    }
+
+    /* Decided by what the link reports, not by the loop counter: the
+     * post-decrement leaves `wait` at UINT32_MAX when the bound runs out, so a
+     * `wait == 0` test never saw a missing device. */
+    for (wait = 0; wait < 1000000u; wait++) {
+        if ((port_read(pregs, AHCI_PxSSTS) & AHCI_SSTS_DET_MASK) == AHCI_SSTS_DET_OK) {
+            linked = 1;
+            break;
+        }
+    }
+    if (!linked)
+        return -1;
+
+    port_write(pregs, AHCI_PxSERR, 0xFFFFFFFF);
+    port_write(pregs, AHCI_PxIS, 0xFFFFFFFF);
+
+    for (wait = 0; wait < 1000000u; wait++)
+        if (!(port_read(pregs, AHCI_PxTFD) & AHCI_PxTFD_BSY))
+            break;
+    return 0;
+}
+
+int port_clo_reset(struct ahci_port *p)
+{
+    volatile uint8_t *pregs = p->regs;
+
+    klog(LOG_WARN, "ahci", "Port %u: CLO recovery -- BSY/DRQ stuck, link reset",
+           (uint64_t)p->port_num);
+
+    port_stop_cmd(pregs);
+    if (port_comreset_regs(pregs) != 0) {
+        klog(LOG_WARN, "ahci", "Port %u: device not present after COMRESET",
+               (uint64_t)p->port_num);
+        return -1;
+    }
+
+    port_start_cmd(pregs);
+
+    klog(LOG_INFO, "ahci", "Port %u: CLO recovery complete",
+           (uint64_t)p->port_num);
+    p->errors.link_resets++;
+    return 0;
+}
+
+/* ---- Issue a command and wait for completion (with retry) ---- */
+int port_issue_cmd(struct ahci_port *p, int slot)
+{
+    volatile uint8_t *pregs = p->regs;
+    uint32_t tfd;
+    int retries = 3;
+    int result;
+    uint32_t reset_gen;
+
+retry:
+    result = 0;
+    reset_gen = __atomic_load_n(&s_hba_reset_gen, __ATOMIC_SEQ_CST);
+    if (ahci_reset_voids_cmd(reset_gen, reset_gen)) {
+        p->errors.cmd_failures++;
+        return -1;   /* the controller was reset under a panic: no new commands */
+    }
+
+    port_write(pregs, AHCI_PxCI, 1U << slot);
+
+    /* Under a panic, poll: event_wait_timeout's deadline reads uptime_ns(),
+     * which stops once timer interrupts do, and the event lock may be held by
+     * a parked CPU. The polling branch is bounded by iteration count. */
+    if (use_events && !panic_in_progress()) {
+        int signalled;
+
+        /* Clear any stale event signal from a previous command.
+         * Without this, a leftover signal causes event_wait_timeout()
+         * to return immediately for the WRONG command, then the NEXT
+         * command blocks forever waiting for an event that already fired.
+         * This race manifests as intermittent hangs on VirtualBox. */
+        if (event_is_set(&p->completion))
+            event_wait(&p->completion);  /* consume stale signal */
+
+        /* Brief busy-poll: if the command completes before we block,
+         * the IRQ fires but nobody is waiting → signal gets set.
+         * Check CI directly first to avoid unnecessary blocking. */
+        {
+            uint32_t quick = AHCI_QUICK_POLL_READS;
+            while (quick--) {
+                uint32_t ci = port_read(pregs, AHCI_PxCI);
+                if (!(ci & (1U << slot)))
+                    goto done;  /* completed without needing to block */
+            }
+        }
+
+        signalled = event_wait_timeout(&p->completion, 5000);
+        if (!signalled) {
+            /* Event-based I/O timed out -- MSI likely not working
+             * (common on VirtualBox).  Fall back to polling permanently
+             * and retry this command in polling mode. */
+            klog(LOG_WARN, "ahci",
+                   "Port %u: event timeout -- falling back to polling mode",
+                   (uint64_t)p->port_num);
+            use_events = 0;
+
+            /* Check if the command actually completed despite no IRQ */
+            {
+                uint32_t ci = port_read(pregs, AHCI_PxCI);
+                if (!(ci & (1U << slot))) {
+                    /* Command completed, IRQ just wasn't delivered */
+                    tfd = port_read(pregs, AHCI_PxTFD);
+                    if (tfd & AHCI_PxTFD_ERR)
+                        result = -1;
+                    goto done;
+                }
+            }
+
+            /* Command still pending -- poll for completion */
+            {
+                int pr = ahci_poll_slot(pregs, slot, AHCI_POLL_SLOT_READS);
+
+                if (pr == AHCI_POLL_TIMEOUT)
+                    klog(LOG_DEBUG, "ahci",
+                           "Port %u: command timeout (poll after event fallback)",
+                           (uint64_t)p->port_num);
+                if (pr != AHCI_POLL_DONE)
+                    result = -1;
+                port_write(pregs, AHCI_PxIS, port_read(pregs, AHCI_PxIS));
+            }
+        }
+    } else {
+        int pr = ahci_poll_slot(pregs, slot, AHCI_POLL_SLOT_READS);
+
+        if (pr == AHCI_POLL_ERR)
+            klog(LOG_DEBUG, "ahci", "Port %u: TFD error 0x%x",
+                   (uint64_t)p->port_num, (uint64_t)port_read(pregs, AHCI_PxTFD));
+        else if (pr == AHCI_POLL_TIMEOUT)
+            klog(LOG_DEBUG, "ahci", "Port %u: command timeout (poll)",
+                   (uint64_t)p->port_num);
+        if (pr != AHCI_POLL_DONE)
+            result = -1;
+
+        port_write(pregs, AHCI_PxIS, port_read(pregs, AHCI_PxIS));
+    }
+
+done:
+    tfd = port_read(pregs, AHCI_PxTFD);
+    if (tfd & AHCI_PxTFD_ERR)
+        result = -1;
+    /* An HBA reset during the command cleared PxCI: that is not completion. */
+    if (ahci_reset_voids_cmd(reset_gen, __atomic_load_n(&s_hba_reset_gen, __ATOMIC_SEQ_CST)))
+        result = -1;
+
+    if (port_issue_should_retry(result, retries, port_read(pregs, AHCI_PxTFD),
+                                panic_in_progress())) {
+        if (port_clo_reset(p) == 0) {
+            retries--;
+            klog(LOG_DEBUG, "ahci",
+                   "Port %u: retrying command (%d retries left)",
+                   (uint64_t)p->port_num, (uint64_t)retries);
+            goto retry;
+        }
+    }
+
+    /* Under a panic, a command that never completed may still be moving data
+     * into or out of the caller's buffer (a crash-dump page): stop the engine
+     * before the caller reuses it, and end the panic if nothing stops it.
+     * Outside a panic the legacy path's ownership is the port's own work
+     * (the block-storage hardening roadmap: per-port submission ownership). */
+    if (result != 0 && panic_in_progress() &&
+        (port_read(pregs, AHCI_PxCI) & (1U << slot)) &&
+        !port_stop_cmd(pregs) && !ahci_hba_reset_for_panic())
+        panic_abandon_storage("AHCI command timed out and DMA did not stop");
+
+    if (result != 0)
+        p->errors.cmd_failures++;
+
+    return result;
+}
+
+int port_issue_should_retry(int result, int retries, uint32_t tfd, int in_panic)
+{
+    /* Never under a panic: the CLO/COMRESET recovery stops the engine
+     * without confirming it, and clearing ST can clear PxCI on its own, which
+     * would hide an outstanding command from the DMA-stop check that follows
+     * and hand a crash-dump buffer back while the device may still own it. */
+    if (in_panic || result == 0 || retries <= 0)
+        return 0;
+    return (tfd & (AHCI_PxTFD_BSY | AHCI_PxTFD_DRQ)) != 0;
+}
+
+int ahci_poll_slot(volatile uint8_t *pregs, int slot, uint32_t budget)
+{
+    uint32_t n;
+
+    /* Completion is OBSERVED, never inferred from the counter: an exhausted
+     * `while (n--)` leaves n at UINT32_MAX, which is how a stalled command
+     * once read as success. */
+    for (n = 0; n < budget; n++) {
+        if (!(port_read(pregs, AHCI_PxCI) & (1U << slot)))
+            return AHCI_POLL_DONE;
+        if (port_read(pregs, AHCI_PxTFD) & AHCI_PxTFD_ERR)
+            return AHCI_POLL_ERR;
+    }
+    return AHCI_POLL_TIMEOUT;
+}
+
+/* ---- Initialization ---- */
+
+/* Devices the last ahci_init() saw with a PHY link (attempted) and those it
+ * brought up as a SATA disk or ATAPI device (usable). Written only by the CPU
+ * running ahci_init, read by that CPU right after it returns. */
+static uint32_t s_ahci_attempted;
+static uint32_t s_ahci_usable;
+
+int ahci_link_is_storage_attempt(uint32_t ssts, uint32_t sig)
+{
+    if ((ssts & AHCI_SSTS_DET_MASK) != AHCI_SSTS_DET_OK)
+        return 0;
+    /* An enclosure management bridge is a backplane controller, not a
+     * drive: port_init skips it by design, so it is no failed attempt. */
+    return sig != AHCI_SIG_SEMB;
+}
+
+int atapi_capacity_rc_usable(int rc)
+{
+    switch (rc) {
+    case 0:
+    case ATAPI_ERR_NOMEDIUM:     /* empty tray: a healthy drive */
+    case ATAPI_ERR_BECOMING:     /* spinning up */
+    case ATAPI_ERR_MEDIACHANGE:  /* disc swapped since the last command */
+        return 1;
+    default:                     /* I/O, sense, transport or command failure */
+        return 0;
+    }
+}
+
+void ahci_probe_counts(uint32_t *attempted, uint32_t *usable)
+{
+    if (attempted) *attempted = s_ahci_attempted;
+    if (usable)    *usable    = s_ahci_usable;
+}
+
+int ahci_init(void)
+{
+    uint8_t bus, slot, func;
+    int found = 0;
+    uint32_t bar5, pi, ghc, cap, ver;
+    uint64_t abar_addr;
+    int port_num, drive_idx;
+    uint32_t detected = 0;   /* implemented ports whose PHY link is up */
+    uint32_t atapi_usable = 0; /* ATAPI devices whose capacity probe was healthy */
+
+    s_ahci_attempted = 0u;
+    s_ahci_usable    = 0u;
+
+    for (bus = 0; bus < 8 && !found; bus++) {
+        for (slot = 0; slot < 32 && !found; slot++) {
+            for (func = 0; func < 8 && !found; func++) {
+                uint16_t vid = pci_read16(bus, slot, func, 0x00);
+                if (vid == 0xFFFF)
+                    continue;
+
+                uint8_t cls = pci_read8(bus, slot, func, PCI_CLASS);
+                uint8_t sub = pci_read8(bus, slot, func, PCI_SUBCLASS);
+
+                if (cls == AHCI_PCI_CLASS && sub == AHCI_PCI_SUBCLASS) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        if (found) break;
+    }
+
+    if (!found) {
+        klog(LOG_WARN, "ahci", "AHCI: no controller found");
+        return BOOT_PROBE_ABSENT;
+    }
+
+    klog(LOG_DEBUG, "ahci", "Found controller at PCI %u:%u.%u",
+           (uint64_t)bus, (uint64_t)slot, (uint64_t)func);
+
+    ahci_pci_bus  = bus;
+    ahci_pci_slot = slot;
+    ahci_pci_func = func;
+
+    /* Enable bus mastering + MMIO, keep INTx DISABLED during enumeration.
+     * All enumeration I/O is polling-based; interrupts are set up later
+     * in ahci_setup_interrupts() after LAPIC is initialized. */
+    {
+        uint16_t cmd = pci_read16(bus, slot, func, PCI_COMMAND);
+        cmd |= PCI_CMD_BUS_MASTER | PCI_CMD_MEM_SPACE | PCI_CMD_INT_DISABLE;
+        pci_write16(bus, slot, func, PCI_COMMAND, cmd);
+    }
+
+    /* Disable any BIOS-configured MSI.  The UEFI BIOS may have set up MSI
+     * with its own vector (commonly 0x81).  If we don't disable it, the
+     * controller fires stale MSI during IDENTIFY/enumeration, flooding
+     * the IDT with unhandled interrupts at the wrong vector. */
+    {
+        uint16_t pci_sts = pci_read16(bus, slot, func, PCI_STATUS);
+        if (pci_sts & (1U << 4)) {  /* Capabilities list present */
+            uint8_t cap_ptr = pci_read8(bus, slot, func, 0x34) & 0xFC;
+            int cap_ttl = AHCI_PCI_CAP_TTL;
+            while (cap_ptr >= 0x40 && cap_ttl-- > 0) {
+                uint8_t cid = pci_read8(bus, slot, func, cap_ptr);
+                if (cid == 0x05) {  /* MSI */
+                    uint16_t msi_ctrl = pci_read16(bus, slot, func,
+                                                   cap_ptr + 2);
+                    if (msi_ctrl & (1U << 0)) {  /* MSI enabled? */
+                        msi_ctrl &= ~(1U << 0);  /* Disable MSI */
+                        pci_write16(bus, slot, func, cap_ptr + 2, msi_ctrl);
+                    }
+                } else if (cid == 0x11) {  /* MSI-X */
+                    uint16_t msix_ctrl = pci_read16(bus, slot, func,
+                                                    cap_ptr + 2);
+                    if (msix_ctrl & (1U << 15)) {  /* MSI-X enabled? */
+                        msix_ctrl &= ~(1U << 15);  /* Disable MSI-X */
+                        pci_write16(bus, slot, func, cap_ptr + 2,
+                                    msix_ctrl);
+                    }
+                }
+                cap_ptr = pci_read8(bus, slot, func, cap_ptr + 1) & 0xFC;
+            }
+        }
+    }
+
+    bar5 = pci_read32(bus, slot, func, PCI_BAR5);
+    abar_addr = (uint64_t)(bar5 & 0xFFFFF000);
+
+    if (abar_addr == 0) {
+        /* The controller IS on the bus; firmware simply left BAR5 unassigned.
+         * That is a broken platform, not an absent device. */
+        klog(LOG_DEBUG, "ahci", "BAR5 is zero -- no ABAR");
+        return BOOT_PROBE_FAILED;
+    }
+
+    /* Map ABAR as UC via the dedicated MMIO mapper. The boot identity map
+     * already covers BAR5's physical range as WB; accessing AHCI registers
+     * through WB pages causes stale reads / MCE on real hardware (same hazard
+     * as HPET, §1). vmm_map_mmio_uc() maps at a fresh kernel VA that is never
+     * identity-mapped, so the UC attributes always take effect (unlike the old
+     * ahci_map_mmio(), which skipped already-identity-mapped pages -> WB). */
+    abar = (volatile uint8_t *)vmm_map_mmio_uc(abar_addr, 0x2000);
+    if (!abar) {
+        klog(LOG_WARN, "ahci", "ABAR UC map failed (phys 0x%x) -- no AHCI",
+             abar_addr);
+        return BOOT_PROBE_FAILED;
+    }
+
+    klog(LOG_DEBUG, "ahci", "ABAR phys 0x%x UC-mapped at %p",
+         abar_addr, (uint64_t)(uintptr_t)abar);
+
+    /* ---- BIOS/OS Handoff (BOHC) ---- */
+    {
+        uint32_t cap2 = ahci_read32(abar, AHCI_CAP2);
+        if (cap2 & AHCI_CAP2_BOH) {
+            uint32_t bohc = ahci_read32(abar, AHCI_BOHC);
+
+            bohc |= AHCI_BOHC_OOS;
+            ahci_write32(abar, AHCI_BOHC, bohc);
+
+            {
+                uint32_t wait = 25000;
+                while (wait--) {
+                    bohc = ahci_read32(abar, AHCI_BOHC);
+                    if (!(bohc & AHCI_BOHC_BOS))
+                        break;
+                }
+
+                if (bohc & AHCI_BOHC_BOS) {
+                    bohc |= (1U << 3);
+                    ahci_write32(abar, AHCI_BOHC, bohc);
+                    klog(LOG_WARN, "ahci",
+                           "BOHC: BIOS did not release, forced ownership");
+                }
+            }
+
+            {
+                uint32_t wait = 2000000;
+                bohc = ahci_read32(abar, AHCI_BOHC);
+                while ((bohc & AHCI_BOHC_BB) && wait--) {
+                    bohc = ahci_read32(abar, AHCI_BOHC);
+                }
+            }
+
+            klog(LOG_INFO, "ahci", "BIOS/OS handoff complete");
+        } else {
+            klog(LOG_DEBUG, "ahci", "BOHC not supported -- skipping handoff");
+        }
+    }
+
+    ver = ahci_read32(abar, AHCI_VS);
+    klog(LOG_DEBUG, "ahci", "Version %u.%u",
+           (uint64_t)((ver >> 16) & 0xFFFF),
+           (uint64_t)(ver & 0xFFFF));
+
+    ghc = ahci_read32(abar, AHCI_GHC);
+    ghc |= AHCI_GHC_AE;
+    ahci_write32(abar, AHCI_GHC, ghc);
+
+    cap = ahci_read32(abar, AHCI_CAP);
+    ahci_clo_supported = (cap & AHCI_CAP_SCLO) ? 1 : 0;
+    ahci_ncq_capable   = (cap & AHCI_CAP_SNCQ) ? 1 : 0;
+    ahci_max_cmd_slots = (uint8_t)(((cap & AHCI_CAP_NCS_MASK)
+                                    >> AHCI_CAP_NCS_SHIFT) + 1);
+    {
+        uint32_t max_ports = (cap & AHCI_CAP_NP_MASK) + 1;
+        klog(LOG_DEBUG, "ahci", "Ports: %u, Slots: %u, CLO: %s, NCQ: %s",
+               (uint64_t)max_ports, (uint64_t)ahci_max_cmd_slots,
+               ahci_clo_supported ? "yes" : "no",
+               ahci_ncq_capable ? "yes" : "no");
+    }
+
+    pi = ahci_read32(abar, AHCI_PI);
+    klog(LOG_DEBUG, "ahci", "Ports implemented: 0x%x", (uint64_t)pi);
+
+    ahci_write32(abar, AHCI_IS, ahci_read32(abar, AHCI_IS));
+
+    num_drives = 0;
+    num_atapi  = 0;
+    for (port_num = 0; port_num < 32; port_num++) {
+        if (!(pi & (1U << port_num)))
+            continue;
+
+        drive_idx = num_drives + num_atapi;
+        if (drive_idx >= AHCI_MAX_PORTS)
+            break;
+
+        /* Detection is the PHY link (SSTS.DET), read BEFORE port_init: a
+         * port_init that fails after the link came up (allocation, an
+         * unsupported signature) is a present device that did not work. */
+        if (ahci_link_is_storage_attempt(
+                port_read(port_regs(port_num), AHCI_PxSSTS),
+                port_read(port_regs(port_num), AHCI_PxSIG)))
+            detected++;
+
+        if (port_init(&ports[drive_idx], port_num) == 0) {
+            if (ports[drive_idx].is_atapi) {
+                if (atapi_do_identify(&ports[drive_idx]) == 0) {
+                    int cap_rc = atapi_read_capacity(&ports[drive_idx]);
+
+                    if (cap_rc != 0)
+                        ports[drive_idx].sectors = 0;
+                    /* Enumerated either way (media can arrive later), but a
+                     * drive whose capacity probe failed on hardware or
+                     * transport is not usable, so it cannot hide a failure
+                     * behind LOADED or soften a sibling's FAILED. */
+                    if (atapi_capacity_rc_usable(cap_rc))
+                        atapi_usable++;
+                    else
+                        klog(LOG_ERROR, "ahci",
+                             "Port %u: ATAPI capacity probe failed (rc=%d)",
+                             (uint64_t)port_num, (uint64_t)cap_rc);
+
+                    klog(LOG_INFO, "ahci", "AHCI port %u: ATAPI \"%s\" (%u sectors, %u B/sect)",
+                           (uint64_t)port_num,
+                           ports[drive_idx].model,
+                           ports[drive_idx].sectors,
+                           (uint64_t)ports[drive_idx].sector_size);
+
+                    atapi_map[num_atapi] = drive_idx;
+                    num_atapi++;
+                } else {
+                    klog(LOG_DEBUG, "ahci", "Port %u: ATAPI IDENTIFY failed",
+                           (uint64_t)port_num);
+                    ahci_port_release(&ports[drive_idx]);
+                }
+            } else {
+                int id_rc = ahci_do_identify(&ports[drive_idx]);
+
+                if (id_rc != 0) {
+                    klog(LOG_DEBUG, "ahci", "Port %u: IDENTIFY failed",
+                           (uint64_t)port_num);
+                    ahci_port_release(&ports[drive_idx]);
+                } else if (ports[drive_idx].sectors == 0) {
+                    /* IDENTIFY completed but advertises nothing addressable:
+                     * present and unusable, so it stays attempted-only and is
+                     * not published as a block device. */
+                    klog(LOG_ERROR, "ahci", "Port %u: IDENTIFY reports zero capacity",
+                           (uint64_t)port_num);
+                    ahci_port_release(&ports[drive_idx]);
+                } else {
+                    uint64_t size_mb = ports[drive_idx].sectors / 2048;
+                    klog(LOG_DEBUG, "ahci", "AHCI port %u: \"%s\" (%u MiB, %u sectors)",
+                           (uint64_t)port_num,
+                           ports[drive_idx].model,
+                           size_mb,
+                           ports[drive_idx].sectors);
+                    num_drives++;
+                }
+            }
+        }
+    }
+
+    /* attempted can never be below usable: a port that came up counts as a
+     * device that answered even if its DET read raced the link. */
+    s_ahci_usable    = (uint32_t)num_drives + atapi_usable;
+    s_ahci_attempted = detected > s_ahci_usable ? detected : s_ahci_usable;
+
+    if (num_drives == 0 && num_atapi == 0) {
+        /* A port that brought up a link and then failed IDENTIFY is a device
+         * that is present and unusable: FAILED. Only a controller with no
+         * device on any port is ABSENT -- an empty SATA port is the normal
+         * state of most machines and must not read as degraded. */
+        if (detected) {
+            klog(LOG_ERROR, "ahci", "AHCI: %u device(s) detected, none usable",
+                 (uint64_t)detected);
+            return BOOT_PROBE_FAILED;
+        }
+        klog(LOG_WARN, "ahci", "AHCI: no devices detected");
+        return BOOT_PROBE_ABSENT;
+    }
+
+    num_ports_total = num_drives + num_atapi;
+
+    /* NOTE: Interrupt setup (MSI/INTx) is deferred to ahci_setup_interrupts()
+     * which must be called AFTER irq_init() runs.  If we register handlers
+     * here, irq_init() will zero the irq_table and destroy them. */
+
+    initialized = 1;
+    klog(LOG_DEBUG, "ahci", "AHCI: %u SATA drive(s), %u ATAPI device(s)",
+           (uint64_t)num_drives, (uint64_t)num_atapi);
+
+    return 0;
+}
+
+/* ---- Deferred interrupt setup (called after irq_init) ---- */
+void ahci_setup_interrupts(void)
+{
+    uint32_t ghc;
+    int irq_ok = 0;
+    uint32_t lvt_saved = 0;
+    int need_mask = 0;
+
+    if (!initialized || !abar)
+        return;
+
+    /* abar is the UC kernel VA returned by vmm_map_mmio_uc() in ahci_init()
+     * (page-aligned by construction, lives in the MMIO VA window above the
+     * identity map). The physical-BAR validation happened before mapping; here
+     * a NULL abar just means the map failed and AHCI runs polled. */
+    if (!abar) {
+        klog(LOG_WARN, "ahci", "AHCI: ABAR not mapped, using polling");
+        return;
+    }
+
+    /* Mask LAPIC timer during MSI setup to prevent races between
+     * MSI address/data PCI config writes and LAPIC timer interrupts */
+    if (lapic_available() && kernel_subsystem_ready(SUBSYS_TIMER)) {
+        lvt_saved = lapic_read(LAPIC_REG_LVT_TIMER);
+        lapic_write(LAPIC_REG_LVT_TIMER, lvt_saved | LVT_MASKED);
+        need_mask = 1;
+    }
+
+    /* --- Try MSI first ---
+     * Walk PCI Capabilities List searching for MSI (Cap ID 0x05).
+     * PCI Status bit 4 indicates capabilities list is present.
+     * First capability pointer is at config offset 0x34.
+     * Each capability: byte 0 = Cap ID, byte 1 = next pointer. */
+    {
+        uint16_t pci_status = pci_read16(ahci_pci_bus, ahci_pci_slot,
+                                          ahci_pci_func, PCI_STATUS);
+        if (pci_status & (1U << 4)) {
+            /* Capabilities list present */
+            uint8_t cap_off = pci_read8(ahci_pci_bus, ahci_pci_slot,
+                                         ahci_pci_func, 0x34) & 0xFC;
+            int cap_ttl = AHCI_PCI_CAP_TTL;
+
+            while (cap_off >= 0x40 && cap_ttl-- > 0) {
+                uint8_t cap_id = pci_read8(ahci_pci_bus, ahci_pci_slot,
+                                           ahci_pci_func, cap_off);
+
+                if (cap_id == 0x05) {
+                    /* Found MSI capability */
+                    uint16_t msi_ctrl;
+                    uint8_t  msi_addr_off;
+                    uint8_t  msi_data_off;
+
+                    msi_ctrl = pci_read16(ahci_pci_bus, ahci_pci_slot,
+                                          ahci_pci_func, cap_off + 2);
+
+                    ahci_irq_vector = irq_alloc_vector();
+                    if (ahci_irq_vector) {
+                        irq_register(ahci_irq_vector, ahci_irq_handler,
+                                     NULL, "ahci");
+
+                        /* Message Address: physical-destination mode, target
+                         * the BSP's ACTUAL LAPIC ID in bits [19:12]. Do NOT
+                         * hardcode ID 0 -- the BSP APIC ID is not guaranteed
+                         * to be 0 on real SMP hardware, and a wrong dest sends
+                         * AHCI completions to the wrong CPU or nowhere. */
+                        msi_addr_off = cap_off + 4;
+                        pci_write32(ahci_pci_bus, ahci_pci_slot,
+                                    ahci_pci_func, msi_addr_off,
+                                    0xFEE00000U | ((uint32_t)lapic_id() << 12));
+
+                        /* Check 64-bit capable (bit 7 of MSI Control) */
+                        if (msi_ctrl & (1U << 7)) {
+                            /* 64-bit: upper address = 0 */
+                            pci_write32(ahci_pci_bus, ahci_pci_slot,
+                                        ahci_pci_func, msi_addr_off + 4,
+                                        0);
+                            msi_data_off = cap_off + 12;
+                        } else {
+                            msi_data_off = cap_off + 8;
+                        }
+
+                        /* Message Data: vector number, edge trigger,
+                         * fixed delivery mode */
+                        pci_write16(ahci_pci_bus, ahci_pci_slot,
+                                    ahci_pci_func, msi_data_off,
+                                    (uint16_t)ahci_irq_vector);
+
+                        /* Enable MSI: set bit 0 of MSI Control,
+                         * keep Multiple Message Enable at 0 (1 vector) */
+                        msi_ctrl &= ~(0x7U << 4);  /* MME = 0 (1 msg) */
+                        msi_ctrl |= (1U << 0);     /* MSI Enable */
+                        pci_write16(ahci_pci_bus, ahci_pci_slot,
+                                    ahci_pci_func, cap_off + 2,
+                                    msi_ctrl);
+
+                        /* Verify device still present after MSI enable */
+                        {
+                            uint16_t verify = pci_read16(ahci_pci_bus,
+                                                          ahci_pci_slot,
+                                                          ahci_pci_func,
+                                                          0x00);
+                            if (verify == 0xFFFF) {
+                                klog(LOG_WARN, "ahci",
+                                     "AHCI: device gone after MSI enable");
+                                irq_free_vector(ahci_irq_vector);
+                                ahci_irq_vector = 0;
+                                break;
+                            }
+                        }
+
+                        /* Disable legacy INTx -- MSI takes over */
+                        {
+                            uint16_t cmd = pci_read16(ahci_pci_bus,
+                                                      ahci_pci_slot,
+                                                      ahci_pci_func,
+                                                      PCI_COMMAND);
+                            cmd |= PCI_CMD_INT_DISABLE;
+                            pci_write16(ahci_pci_bus, ahci_pci_slot,
+                                        ahci_pci_func, PCI_COMMAND, cmd);
+                        }
+
+                        /* Enable global AHCI interrupts */
+                        ghc = ahci_read32(abar, AHCI_GHC);
+                        ghc |= AHCI_GHC_IE;
+                        ahci_write32(abar, AHCI_GHC, ghc);
+
+                        /* NOTE: use_events stays 0 here.  Event-based I/O
+                         * requires the scheduler (yield/INT 0x81 handler).
+                         * Call ahci_enable_events() after task_init(). */
+                        irq_ok = 1;
+                        klog(LOG_INFO, "ahci",
+                               "AHCI: MSI vector 0x%x (%s-bit)",
+                               (uint64_t)ahci_irq_vector,
+                               (msi_ctrl & (1U << 7)) ? "64" : "32");
+                    }
+                    break;
+                }
+
+                /* Next capability */
+                cap_off = pci_read8(ahci_pci_bus, ahci_pci_slot,
+                                    ahci_pci_func, cap_off + 1) & 0xFC;
+            }
+        }
+    }
+
+    /* --- Fallback to legacy INTx via IOAPIC --- */
+    if (!irq_ok) {
+        uint8_t pci_irq_line = pci_read8(ahci_pci_bus, ahci_pci_slot,
+                                          ahci_pci_func, 0x3C);
+
+        if (pci_irq_line != 0 && pci_irq_line != 0xFF &&
+            ioapic_available()) {
+            /* PCI INTx is level-triggered active-low (0x0F) and the line
+             * may be shared with other devices: register through the
+             * shared-chain GSI API with claim semantics. */
+            ahci_irq_vector = irq_request_gsi_ex(pci_irq_line,
+                                                 ahci_irq_body, NULL,
+                                                 "ahci", 0x0F, 1);
+            if (ahci_irq_vector) {
+                ghc = ahci_read32(abar, AHCI_GHC);
+                ghc |= AHCI_GHC_IE;
+                ahci_write32(abar, AHCI_GHC, ghc);
+
+                /* NOTE: use_events stays 0 -- same as MSI path */
+                irq_ok = 1;
+                klog(LOG_INFO, "ahci",
+                       "AHCI: INTx IRQ %u -> vector 0x%x (legacy, shared)",
+                       (uint64_t)pci_irq_line,
+                       (uint64_t)ahci_irq_vector);
+            } else {
+                klog(LOG_WARN, "ahci",
+                       "AHCI: INTx IRQ %u not routable, using polling",
+                       (uint64_t)pci_irq_line);
+            }
+        } else {
+            klog(LOG_WARN, "ahci",
+                   "AHCI: no PCI IRQ line (0x%x), using polling",
+                   (uint64_t)pci_irq_line);
+        }
+    }
+
+    /* Unmask LAPIC timer */
+    if (need_mask)
+        lapic_write(LAPIC_REG_LVT_TIMER, lvt_saved);
+}
+
+/* ---- Enable event-based I/O (called after scheduler init) ---- */
+void ahci_enable_events(void)
+{
+    if (!initialized) {
+        klog(LOG_DEBUG, "ahci", "AHCI: not initialized, events skipped");
+        return;
+    }
+    if (!ahci_irq_vector) {
+        klog(LOG_WARN, "ahci",
+               "AHCI: no IRQ vector -- event I/O unavailable, using polling");
+        return;
+    }
+    use_events = 1;
+    klog(LOG_DEBUG, "ahci", "AHCI: event-based I/O enabled (vec=0x%x)",
+           (uint64_t)ahci_irq_vector);
+}

@@ -1,0 +1,247 @@
+# ============================================================================
+# Impossible OS -- TODO Graph Validation
+#
+# Runs the todo-graph build + validator on every push / PR that touches
+# `todo/**/*.md`. Owned by the TODO metadata layer CI-gate section.
+#
+# Design: separate from build.yml so unrelated kernel-only PRs don't
+# trigger this pass, and a stale-XREF in a TODO doesn't block the OS
+# build. Paths filter at the workflow `on:` level (matches the spec's
+# "unrelated commits don't burn CI minutes" requirement).
+#
+# Exit code: validator's. The 7 primary checks run on every push; PRs
+# additionally run `--diff` against the PR base branch's cache so
+# reviewers see "this PR makes the graph worse" findings first.
+# ============================================================================
+
+name: TODO graph
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'todo/**/*.md'
+      - 'scripts/todo-graph/**'
+      - '.github/workflows/todo-graph.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'todo/**/*.md'
+      - 'scripts/todo-graph/**'
+      - '.github/workflows/todo-graph.yml'
+
+# NO WORKFLOW-LEVEL CONCURRENCY. It used to live here with
+# `cancel-in-progress: true`, which cancels the ENTIRE RUN -- and a job-level
+# concurrency group cannot exempt a job from its own run being cancelled. The
+# identity-gate job below was therefore cancellable in practice while claiming
+# not to be, which is precisely the hole it exists to close (Codex adversarial,
+# section 16). The cancellable group now sits on `validate` alone, which may be
+# superseded freely because it re-derives everything from the pushed tree.
+
+permissions:
+  contents: read
+  actions: read  # identity-gate reads this workflow's own last-green SHA
+  packages: read
+
+env:
+  # Node 20 runtime removed from runners 2026-09-16; opt in to Node 24 now.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: build + validate
+    runs-on: ubuntu-26.04
+    # The pinned CI image holds the whole toolchain (scripts/ci/image/Dockerfile);
+    # this job installs nothing, so a package-mirror outage cannot fail it.
+    container:
+      image: ghcr.io/rizonesoft/impossible-os-ci@sha256:d5d684cc6bc2740e127b72c56189f9a424c800041db489844d1939e39b019176
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --init: GitHub makes `tail -f /dev/null` PID 1, which never reaps an orphan.
+      options: --init --user 1001:1001
+    timeout-minutes: 5
+
+    # Cancellable: a newer run's verdict subsumes an older one's, because this
+    # job re-derives everything from the pushed tree rather than from a range.
+    concurrency:
+      group: todo-graph-validate-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so the PR base (--diff baseline) is reachable
+
+      # Primary gate: rebuild the cache and run the 10 graph-integrity
+      # checks. Fails if any check fails (stale XREF, dangling section,
+      # orphan IO row, dep cycle, missing bat, status mismatch,
+      # unreachable $schema, duplicate id, duplicate resolver key, or an
+      # in-file `](#anchor)` naming no heading in its own file).
+      # The authority is validate.py's own header, not this comment.
+      - name: Build + validate todo-graph
+        run: bash scripts/todo-graph/build-and-validate.sh --keep-cache
+
+      # PR-only: build the baseline cache from the PR base SHA and run
+      # --diff mode. Surfaces "this PR makes the graph worse" findings
+      # (added orphans, newly stale XREFs, status downgrades) separate
+      # from pre-existing drift.
+      - name: Diff vs PR base (pull_request only)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -e
+          BASE_REF="${{ github.event.pull_request.base.sha }}"
+          # NO `--depth` HERE. `git fetch --depth=1` SHALLOWS THE WHOLE
+          # REPOSITORY, including the full-history checkout above -- verified
+          # 2026-08-09 on git 2.43.0, where a full clone flips
+          # `rev-parse --is-shallow-repository` from false to true after one
+          # such fetch. build.py then refuses the baseline outright, because a
+          # shallow corpus cannot produce a trustworthy `created_at` (see the
+          # shallowness refusal in `corpus_history_id` /
+          # `collect_git_timestamps`). The base is normally already present from
+          # `fetch-depth: 0`, so this stays a cheap safety net.
+          git fetch --no-tags origin "$BASE_REF" || true
+          BASELINE_DIR="$(mktemp -d)"
+          git worktree add "$BASELINE_DIR" "$BASE_REF"
+          python3 scripts/todo-graph/build.py \
+              --quiet \
+              --root "$BASELINE_DIR/todo" \
+              --output "$BASELINE_DIR/baseline-cache.json" \
+              --repo-root "$BASELINE_DIR"
+          python3 scripts/todo-graph/validate.py \
+              --cache build/todo-cache.json \
+              --quiet \
+              --diff "$BASELINE_DIR/baseline-cache.json"
+          git worktree remove --force "$BASELINE_DIR"
+
+  # ==========================================================================
+  # Section 16: the identity gate. Runs corpus_resolution_snapshot.py as a
+  # GATE instead of as a thing a human remembers to invoke.
+  #
+  # SEPARATE CONCURRENCY GROUP, AND DELIBERATELY NOT CANCELLABLE. The validate
+  # job above may be superseded freely -- it re-derives everything from the
+  # pushed tree, so the newest run's verdict subsumes an older one's. This job
+  # may NOT: its verdict is about a RANGE, so cancelling it drops the only
+  # adjudication that range will ever get. Push P1 carrying a resolver
+  # regression, then P2 before P1 finishes: with cancel-in-progress, P1 dies
+  # and P2 compares P1..P2, sees the closure unchanged, early-exits, and no
+  # completed run ever examines P1. Cancellation is real in this repo --
+  # build.yml runs e49acdc2, ca61219d and faacf6eb were all cancelled by rapid
+  # pushes on 2026-08-06.
+  #
+  # The range starts from the last SHA this job actually PASSED, not from the
+  # push's before-SHA, so a run that was skipped, cancelled or never triggered
+  # is absorbed by the next one rather than lost.
+  #
+  # HONEST LIMIT: this repo pushes directly to main, so the gate DETECTS after
+  # the fact; it does not PREVENT. Prevention needs a pre-receive hook or a
+  # protected merge queue, both operator-reserved. Guaranteed adjudication is
+  # what this job buys.
+  # ==========================================================================
+  identity-gate:
+    name: resolver identity gate
+    runs-on: ubuntu-26.04
+    # The pinned CI image holds the whole toolchain (scripts/ci/image/Dockerfile);
+    # this job installs nothing, so a package-mirror outage cannot fail it.
+    container:
+      image: ghcr.io/rizonesoft/impossible-os-ci@sha256:d5d684cc6bc2740e127b72c56189f9a424c800041db489844d1939e39b019176
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --init: GitHub makes `tail -f /dev/null` PID 1, which never reaps an orphan.
+      options: --init --user 1001:1001
+    timeout-minutes: 20
+
+    concurrency:
+      group: todo-graph-identity-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the base may be several pushes back
+
+      # The last SHA this job reported success on. Absent (first ever run) is
+      # NOT an error: the gate falls back through the push before-SHA to
+      # HEAD~1, and only a total absence of any base is infrastructure.
+      - name: Resolve last gated SHA
+        id: lastgreen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # THE FILTERED RUNS LISTING IS NOT TRUSTWORTHY HERE, and this step
+          # used to be built on it. `gh run list --workflow=... --status success`
+          # is served from a search index that returned, from inside this
+          # runner, a set containing only ANCIENT successes -- twice, with a
+          # different ancient set each time (runs 32255498885 and the 13:15
+          # run on 2026-08-19, which picked bases 440 and 1095 commits back
+          # while a success three commits back existed). Sorting or
+          # topology-ranking that set cannot help: the recent entries are
+          # absent from it, not merely mis-ordered. The same query answers
+          # correctly from a workstation, so this is an environment-dependent
+          # index, not a wrong query -- which makes it exactly the thing a
+          # gate must not depend on.
+          #
+          # Ask an EXACT question instead. A per-commit `?head_sha=` lookup is
+          # a direct read rather than an index search, and it is the shape
+          # that was verified to answer correctly. Walk back along first-parent
+          # from HEAD and stop at the first commit whose most recent run of
+          # THIS workflow concluded success; that commit is the last gated SHA
+          # by construction.
+          #
+          # A commit with NO run is NOT a stopping point. Pushes land several
+          # commits at a time and only the tip is built, so an un-run commit
+          # was never adjudicated and the range must extend past it -- treating
+          # it as a base is the range collapse this step exists to prevent.
+          base=""
+          walked=0
+          for cand in $(git rev-list --first-parent -n 60 HEAD 2>/dev/null); do
+              [ "$cand" = "$(git rev-parse HEAD)" ] && continue
+              walked=$((walked + 1))
+              # A QUERY FAILURE IS NOT AN ABSENCE. Swallowing a transient
+              # API/auth/rate-limit error into "no run here" would silently
+              # walk PAST an adjudicated commit and gate a longer range on a
+              # guess; worse, a run of failures would walk off the window and
+              # report a rewritten history that did not happen.
+              if ! raw="$(gh api "repos/{owner}/{repo}/actions/workflows/todo-graph.yml/runs?head_sha=${cand}&per_page=20" 2>&1)"; then
+                  echo "::error::run lookup for $cand failed; refusing to guess a base"
+                  echo "$raw"
+                  exit 1
+              fi
+              if ! concl="$(printf '%s' "$raw" | jq -r '[.workflow_runs[] | select(.conclusion != null and .conclusion != "")] | .[0].conclusion // empty')"; then
+                  echo "::error::could not parse the run lookup for $cand"
+                  exit 1
+              fi
+              if [ "${concl:-}" = "success" ]; then
+                  base="$cand"
+                  break
+              fi
+          done
+          if [ -n "$base" ]; then
+              echo "sha=$base" >>"$GITHUB_OUTPUT"
+              echo "last gated SHA: $base ($walked commit(s) back)"
+          elif [ "$walked" -eq 0 ]; then
+              # HEAD is the first commit on this branch: there is genuinely no
+              # earlier commit to gate against. That is the ONLY case where
+              # deriving a base is legitimate.
+              echo "sha=" >>"$GITHUB_OUTPUT"
+              echo "no earlier commit; the gate will derive a base"
+          else
+              # Every one of the last 60 commits either never ran or did not
+              # pass. Falling back to a near base would let a regression older
+              # than that base become the next green baseline, so refuse.
+              echo "::error::no successful run of this workflow in the last $walked commit(s) -- the gate cannot establish its range. Fix the oldest failure first."
+              exit 1
+          fi
+      - name: Resolver identity gate
+        env:
+          IDENTITY_GATE_LAST_GATED_SHA: ${{ steps.lastgreen.outputs.sha }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: bash scripts/todo-graph/identity-gate.sh

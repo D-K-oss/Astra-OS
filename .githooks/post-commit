@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+# post-commit hook: regenerate COUNT.md with code and supporting text counts.
+# Runs silently after every commit. Amends the commit to include the update.
+# To disable temporarily: SKIP_COUNT=1 git commit ...
+# Manual refresh without amend: COUNT_ONLY=1 bash .githooks/post-commit
+
+# Which tree this commit landed in, for the Claude harness post-commit hooks
+# (.claude/hooks/section_commit_gate.py commit_landed_roots). The session id is
+# in the environment of the shell that ran the commit. One receipt is APPENDED
+# per commit, so two worktrees committed in one call are both kept. A manual
+# COUNT_ONLY refresh is not a commit and writes none. Written before anything
+# below can exit.
+if [ "${COUNT_ONLY:-}" != "1" ] && [[ "${CLAUDE_CODE_SESSION_ID:-}" =~ ^[A-Za-z0-9-]{8,64}$ ]]; then
+    _landed="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/claude-commit-landed"
+    if mkdir -p "$_landed" 2>/dev/null; then
+        printf '%s\t%s %s\n' "$(git rev-parse --show-toplevel)" "$(git rev-parse HEAD)" "$(date +%s%N)" \
+            >> "$_landed/$CLAUDE_CODE_SESSION_ID" 2>/dev/null
+    fi
+fi
+
+[ "${SKIP_COUNT:-}" = "1" ] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel)"
+COUNT_FILE="$ROOT/COUNT.md"
+
+# Vendored files to exclude from "our code" count
+VENDORED=(
+    "$ROOT/include/stb_image.h"
+    "$ROOT/include/stb_truetype.h"
+    "$ROOT/src/boot/uefi/efi.h"
+    # Microsoft's Fluent System Icons, imported wholesale: 73,416 lines of
+    # generated glyph-class CSS. COUNT.md already states that vendored code is
+    # excluded, but the list only covered three C headers, so this rode along
+    # inside "supporting text" -- 35% of that bucket, none of it written here.
+    # Found 2026-08-10 while deciding whether supporting text belongs in the
+    # headline figure: it does, and this does not.
+    "$ROOT/resources/icons/FluentSystemIcons-Filled.css"
+    "$ROOT/resources/icons/FluentSystemIcons-Regular.css"
+    "$ROOT/resources/icons/FluentSystemIcons-Resizable.css"
+    "$ROOT/resources/icons/FluentSystemIcons-Light.css"
+)
+
+# Whole vendored TREES, matched by path prefix. The exact-path list above could
+# only ever name individual files, so every library vendored after it was
+# written was counted as our own code: measured 2026-08-19, 379,699 lines of
+# .c/.h under these two roots (Mbed TLS 205,509, ACPICA 146,861, LZ4 10,611,
+# miniz 9,255, Monocypher 3,920, cJSON 3,543) sat inside the 822,050-line
+# "Kernel & OS Code" subtotal -- 46% of it -- under a COUNT.md line claiming
+# vendored code was excluded. `src/libs/PROVENANCE.md` is the authority on what
+# lives here; a new library dropped under either root is now excluded on
+# arrival rather than needing this hook edited.
+VENDORED_DIRS=(
+    "$ROOT/src/libs"
+    "$ROOT/src/kernel/acpica"
+    "$ROOT/tools/vendor"
+)
+
+# Files INSIDE a vendored tree that we authored, so they stay counted. These
+# are exactly the "Local additions (NOT upstream)" rows of PROVENANCE.md.
+VENDORED_KEEP=(
+    "$ROOT/src/libs/PROVENANCE.md"
+    "$ROOT/src/libs/lz4/lz4_merge.ld"
+    "$ROOT/src/kernel/acpica/include/platform/acimpossible.h"
+)
+
+# Count lines by extension in given directories, excluding vendored files
+count_lines() {
+    local ext="$1"
+    shift
+    local dirs=("$@")
+    local total=0
+    local files=0
+    while IFS= read -r f; do
+        is_vendored "$f" && continue
+        local n
+        n=$(wc -l < "$f")
+        total=$((total + n))
+        files=$((files + 1))
+    done < <(find "${dirs[@]}" -type f -name "*.$ext" 2>/dev/null)
+    echo "$files $total"
+}
+
+is_vendored() {
+    local f="$1"
+    local v
+    # Our own files inside a vendored tree win over the tree prefix.
+    for v in "${VENDORED_KEEP[@]}"; do
+        [ "$f" = "$v" ] && return 1
+    done
+    for v in "${VENDORED[@]}"; do
+        [ "$f" = "$v" ] && return 0
+    done
+    for v in "${VENDORED_DIRS[@]}"; do
+        case "$f" in "$v"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Does this file land in one of the counted buckets below? The excluded-lines
+# figure must describe what was actually REMOVED from the totals, so a vendored
+# LICENSE or .gitignore -- never counted in the first place -- must not inflate
+# it.
+is_counted_ext() {
+    case "$1" in
+        *.c|*.h|*.asm|*.sh|*.bat|*.ps1|*.ld|*.lds|*.py|*.js|*.inc|*Makefile) return 0 ;;
+        *.md|*.json|*.yml|*.yaml|*.html|*.css|*.cfg|*.conf) return 0 ;;
+    esac
+    return 1
+}
+
+# Count tracked files matched by git pathspecs, excluding vendored files.
+count_tracked_lines() {
+    local total=0
+    local files=0
+    local rel
+    local f
+    while IFS= read -r rel; do
+        [ -z "$rel" ] && continue
+        f="$ROOT/$rel"
+        [ -f "$f" ] || continue
+        is_vendored "$f" && continue
+        total=$((total + $(wc -l < "$f")))
+        files=$((files + 1))
+    done < <(git -C "$ROOT" ls-files -- "$@")
+    echo "$files $total"
+}
+
+# Kernel / OS source code
+read -r c_files c_lines <<< "$(count_lines c "$ROOT/src" "$ROOT/include")"
+read -r h_files h_lines <<< "$(count_lines h "$ROOT/src" "$ROOT/include")"
+read -r asm_files asm_lines <<< "$(count_lines asm "$ROOT/src")"
+
+# SDK tools
+read -r sdk_c_files sdk_c_lines <<< "$(count_lines c "$ROOT/sdk/src")"
+read -r sdk_h_files sdk_h_lines <<< "$(count_lines h "$ROOT/sdk/src")"
+sdk_files=$((sdk_c_files + sdk_h_files))
+sdk_lines=$((sdk_c_lines + sdk_h_lines))
+
+# Build system & scripts
+read -r sh_files sh_lines <<< "$(count_lines sh "$ROOT/scripts" "$ROOT/sdk/scripts")"
+read -r bat_files bat_lines <<< "$(count_lines bat "$ROOT/scripts")"
+read -r ps1_files ps1_lines <<< "$(count_lines ps1 "$ROOT/scripts")"
+read -r py_files py_lines <<< "$(count_tracked_lines '*.py')"
+read -r js_files js_lines <<< "$(count_tracked_lines '*.js')"
+read -r inc_files inc_lines <<< "$(count_tracked_lines '*.inc')"
+read -r mk_files mk_lines <<< "$(count_tracked_lines '*Makefile')"
+
+ld_files=0; ld_lines=0
+while IFS= read -r f; do
+    ld_files=$((ld_files + 1))
+    ld_lines=$((ld_lines + $(wc -l < "$f")))
+done < <(find "$ROOT/src" -type f \( -name "*.ld" -o -name "*.lds" \) 2>/dev/null)
+
+# Documentation and repo metadata
+read -r md_files md_lines <<< "$(count_tracked_lines '*.md')"
+read -r json_files json_lines <<< "$(count_tracked_lines '*.json')"
+read -r yaml_files yaml_lines <<< "$(count_tracked_lines '*.yml' '*.yaml')"
+read -r html_files html_lines <<< "$(count_tracked_lines '*.html')"
+read -r css_files css_lines <<< "$(count_tracked_lines '*.css')"
+read -r cfg_files cfg_lines <<< "$(count_tracked_lines '*.cfg' '*.conf')"
+
+# Totals
+code_files=$((c_files + h_files + asm_files))
+code_lines=$((c_lines + h_lines + asm_lines))
+
+infra_files=$((sh_files + bat_files + ps1_files + py_files + js_files + inc_files + mk_files + ld_files))
+infra_lines=$((sh_lines + bat_lines + ps1_lines + py_lines + js_lines + inc_lines + mk_lines + ld_lines))
+
+support_files=$((md_files + json_files + yaml_files + html_files + css_files + cfg_files))
+support_lines=$((md_lines + json_lines + yaml_lines + html_lines + css_lines + cfg_lines))
+
+core_total_files=$((code_files + sdk_files + infra_files))
+core_total_lines=$((code_lines + sdk_lines + infra_lines))
+counted_total_files=$((core_total_files + support_files))
+counted_total_lines=$((core_total_lines + support_lines))
+
+# `vendored_lines` is summed further down, after is_vendored is defined; the
+# whole-tree figure it feeds is assembled there.
+
+# Count vendored lines -- the same gate the counters used, over the same files,
+# so this figure is what was actually excluded rather than an independent guess.
+vendored_lines=0
+vendored_files=0
+while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    is_counted_ext "$f" || continue
+    is_vendored "$f" || continue
+    vendored_lines=$((vendored_lines + $(wc -l < "$f")))
+    vendored_files=$((vendored_files + 1))
+done < <(
+    printf '%s\n' "${VENDORED[@]}"
+    for v in "${VENDORED_DIRS[@]}"; do
+        find "$v" -type f 2>/dev/null
+    done
+)
+
+# THE COMPARISON BASIS. The ~28M Linux and ~50M Windows figures are WHOLE-TREE
+# counts and include everything those projects vendor -- Linux alone carries
+# ACPICA, zlib, zstd, lz4 and xz, the same class of code excluded above. Setting
+# our vendored-excluded total against their vendored-included totals compares
+# two different things and understates this tree on a basis nobody else uses,
+# so the Impossibility Index is computed here instead.
+whole_tree_files=$((counted_total_files + vendored_files))
+whole_tree_lines=$((counted_total_lines + vendored_lines))
+
+# Get commit info
+commit_hash=$(git rev-parse --short HEAD)
+commit_date=$(date '+%Y-%m-%d %H:%M')
+
+# ---- Impossibility Index ----
+# Industry standard: 10,000 LOC/developer/year for system programming (COCOMO II)
+# Linux kernel: 28M lines, 33 years, ~1,000 active devs at any time
+# Windows NT:   50M lines, 40 years, ~5,000 devs at peak
+INDUSTRY_LOC_PER_YEAR=10000
+FIRST_COMMIT_EPOCH=$(git log --reverse --format="%at" | head -1)
+NOW_EPOCH=$(date +%s)
+ELAPSED_DAYS=$(( (NOW_EPOCH - FIRST_COMMIT_EPOCH) / 86400 ))
+[ "$ELAPSED_DAYS" -lt 1 ] && ELAPSED_DAYS=1
+
+# equivalent team size = core_total_lines * 365 / (industry_rate * elapsed_days)
+#
+# CODE WRITTEN HERE, not the whole tree. The comparison table above is whole-tree
+# because that is what ~28M and ~50M are, but COCOMO II prices code being
+# DEVELOPED, and adopting a library is a decision plus an integration seam rather
+# than a development cost. The whole-tree figure would be roughly double and
+# would credit this project with effort spent elsewhere over decades.
+EQUIV_DEVS=$(( core_total_lines * 365 / (INDUSTRY_LOC_PER_YEAR * ELAPSED_DAYS) ))
+
+# Format elapsed time
+ELAPSED_MONTHS=$(( ELAPSED_DAYS / 30 ))
+ELAPSED_REM_DAYS=$(( ELAPSED_DAYS % 30 ))
+if [ "$ELAPSED_MONTHS" -gt 0 ]; then
+    if [ "$ELAPSED_REM_DAYS" -gt 0 ]; then
+        ELAPSED_STR="${ELAPSED_MONTHS} month(s), ${ELAPSED_REM_DAYS} day(s)"
+    else
+        ELAPSED_STR="${ELAPSED_MONTHS} month(s)"
+    fi
+else
+    ELAPSED_STR="${ELAPSED_DAYS} days"
+fi
+
+# Format numbers with commas: 144054 -> 144,054, 1006165 -> 1,006,165
+#
+# The previous expression anchored on \>$ (end of line), so after inserting the
+# first comma the next pass could no longer match: the comma before the final
+# group IS a word boundary, which defeats the leading \B. It therefore stopped
+# after ONE separator and was correct only up to six digits. That went unnoticed
+# until the line count crossed a million and COUNT.md started reporting
+# "1006,165". This form walks right to left and repeats, so every group is
+# separated regardless of magnitude.
+fmt() { echo "$1" | sed -e :a -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,\2/;ta'; }
+
+hyphens() {
+    local n="$1"
+    [ "$n" -lt 3 ] && n=3
+    printf '%*s' "$n" '' | tr ' ' '-'
+}
+
+right_sep() {
+    local n="$1"
+    [ "$n" -lt 3 ] && n=3
+    printf '%s:' "$(hyphens $((n - 1)))"
+}
+
+make_table3() {
+    local header1="$1"
+    local header2="$2"
+    local header3="$3"
+    shift 3
+    local rows=("$@")
+    local row c1 c2 c3
+    local w1=${#header1}
+    local w2=${#header2}
+    local w3=${#header3}
+
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r c1 c2 c3 <<< "$row"
+        [ ${#c1} -gt "$w1" ] && w1=${#c1}
+        [ ${#c2} -gt "$w2" ] && w2=${#c2}
+        [ ${#c3} -gt "$w3" ] && w3=${#c3}
+    done
+
+    {
+        printf '| %-*s | %*s | %*s |\n' "$w1" "$header1" "$w2" "$header2" "$w3" "$header3"
+        printf '| %s | %s | %s |\n' "$(hyphens "$w1")" "$(right_sep "$w2")" "$(right_sep "$w3")"
+        for row in "${rows[@]}"; do
+            IFS=$'\t' read -r c1 c2 c3 <<< "$row"
+            printf '| %-*s | %*s | %*s |\n' "$w1" "$c1" "$w2" "$c2" "$w3" "$c3"
+        done
+    }
+}
+
+make_table4() {
+    local header1="$1"
+    local header2="$2"
+    local header3="$3"
+    local header4="$4"
+    shift 4
+    local rows=("$@")
+    local row c1 c2 c3 c4
+    local w1=${#header1}
+    local w2=${#header2}
+    local w3=${#header3}
+    local w4=${#header4}
+
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r c1 c2 c3 c4 <<< "$row"
+        [ ${#c1} -gt "$w1" ] && w1=${#c1}
+        [ ${#c2} -gt "$w2" ] && w2=${#c2}
+        [ ${#c3} -gt "$w3" ] && w3=${#c3}
+        [ ${#c4} -gt "$w4" ] && w4=${#c4}
+    done
+
+    {
+        printf '| %-*s | %*s | %*s | %*s |\n' "$w1" "$header1" "$w2" "$header2" "$w3" "$header3" "$w4" "$header4"
+        printf '| %s | %s | %s | %s |\n' "$(hyphens "$w1")" "$(right_sep "$w2")" "$(right_sep "$w3")" "$(right_sep "$w4")"
+        for row in "${rows[@]}"; do
+            IFS=$'\t' read -r c1 c2 c3 c4 <<< "$row"
+            printf '| %-*s | %*s | %*s | %*s |\n' "$w1" "$c1" "$w2" "$c2" "$w3" "$c3" "$w4" "$c4"
+        done
+    }
+}
+
+kernel_table="$(make_table3 "" "Files" "Lines" \
+    $'**C sources** (`.c`)\t'"${c_files}"$'\t'"${c_lines}" \
+    $'**Headers** (`.h`)\t'"${h_files}"$'\t'"${h_lines}" \
+    $'**Assembly** (`.asm`)\t'"${asm_files}"$'\t'"${asm_lines}" \
+    $'**Subtotal**\t**'"${code_files}"$'**\t**'"${code_lines}"$'**')"
+
+sdk_table="$(make_table3 "" "Files" "Lines" \
+    $'**C sources** (`.c`)\t'"${sdk_c_files}"$'\t'"${sdk_c_lines}" \
+    $'**Headers** (`.h`)\t'"${sdk_h_files}"$'\t'"${sdk_h_lines}" \
+    $'**Subtotal**\t**'"${sdk_files}"$'**\t**'"${sdk_lines}"$'**')"
+
+infra_table="$(make_table3 "" "Files" "Lines" \
+    $'**Shell scripts** (`.sh`)\t'"${sh_files}"$'\t'"${sh_lines}" \
+    $'**Batch scripts** (`.bat`)\t'"${bat_files}"$'\t'"${bat_lines}" \
+    $'**PowerShell** (`.ps1`)\t'"${ps1_files}"$'\t'"${ps1_lines}" \
+    $'**Python** (`.py`)\t'"${py_files}"$'\t'"${py_lines}" \
+    $'**JavaScript** (`.js`)\t'"${js_files}"$'\t'"${js_lines}" \
+    $'**Include fragments** (`.inc`)\t'"${inc_files}"$'\t'"${inc_lines}" \
+    $'**Makefile**\t'"${mk_files}"$'\t'"${mk_lines}" \
+    $'**Linker scripts** (`.ld`/`.lds`)\t'"${ld_files}"$'\t'"${ld_lines}" \
+    $'**Subtotal**\t**'"${infra_files}"$'**\t**'"${infra_lines}"$'**')"
+
+support_table="$(make_table3 "" "Files" "Lines" \
+    $'**Markdown** (`.md`)\t'"${md_files}"$'\t'"${md_lines}" \
+    $'**JSON** (`.json`)\t'"${json_files}"$'\t'"${json_lines}" \
+    $'**YAML** (`.yml`/`.yaml`)\t'"${yaml_files}"$'\t'"${yaml_lines}" \
+    $'**HTML** (`.html`)\t'"${html_files}"$'\t'"${html_lines}" \
+    $'**CSS** (`.css`)\t'"${css_files}"$'\t'"${css_lines}" \
+    $'**Config** (`.cfg`/`.conf`)\t'"${cfg_files}"$'\t'"${cfg_lines}" \
+    $'**Subtotal**\t**'"${support_files}"$'**\t**'"${support_lines}"$'**')"
+
+grand_total_table="$(make_table3 "" "Files" "Lines" \
+    $'**Core code + tooling**\t**'"${core_total_files}"$'**\t**'"${core_total_lines}"$'**' \
+    $'**Supporting text + metadata**\t**'"${support_files}"$'**\t**'"${support_lines}"$'**' \
+    $'**Written here**\t**'"${counted_total_files}"$'**\t**'"${counted_total_lines}"$'**' \
+    $'**Vendored ([third-party](src/libs/PROVENANCE.md))**\t'"${vendored_files}"$'\t'"${vendored_lines}" \
+    $'**All lines in tree**\t**'"${whole_tree_files}"$'**\t**'"${whole_tree_lines}"$'**')"
+
+impossibility_table="$(make_table4 "" "Linux" "Windows" "Impossible OS" \
+    $'**All lines in tree**\t~28,000,000\t~50,000,000\t'"$(fmt "${whole_tree_lines}")" \
+    $'**Developers**\t~1,000 active\t~5,000 peak\t1' \
+    $'**Time span**\t33 years\t40 years\t'"${ELAPSED_STR}")"
+
+cat > "$COUNT_FILE" << EOF
+# 📊 Impossible OS — Line Count
+
+> *Because nothing says "production-ready operating system" quite like obsessively counting
+> your own lines of code after every single commit. We could be fixing bugs, implementing
+> NTFS, or achieving world peace — but no, here we are, running \`wc -l\` like it's a
+> competitive sport. At least when the kernel panics, you'll know exactly how many lines
+> of code were responsible.*
+>
+> *Auto-generated by \`post-commit\` hook. Do not edit — your changes will be obliterated
+> by a shell script with zero empathy.*
+
+---
+
+## Kernel & OS Code
+
+${kernel_table}
+
+## SDK Tools
+
+${sdk_table}
+
+## Build System & Scripts
+
+${infra_table}
+
+## Documentation & Project Metadata
+
+${support_table}
+
+## Grand Total
+
+${grand_total_table}
+
+> Binary assets such as fonts, images, certificates, EFI blobs, and cursor resources are not line-counted.
+
+---
+
+## The Impossibility Index
+
+> *According to every industry estimate ever published, what you're looking at shouldn't
+> exist. Linux took ~1,000 developers 33 years. Windows took ~5,000 developers 40 years.
+> Entire university courses teach that operating systems are a multi-decade, multi-hundred-
+> person endeavor. One developer apparently missed that lecture.*
+
+${impossibility_table}
+
+> At industry rates (10,000 LOC/developer/year -- COCOMO II), the $(fmt ${core_total_lines}) lines
+> written here imply **${EQUIV_DEVS} developers** working for **${ELAPSED_STR}**.
+>
+> *The "impossible" in Impossible OS was supposed to be the name, not the development method.*
+
+---
+
+*Last updated: ${commit_date} · commit \`${commit_hash}\`*
+EOF
+
+# Re-sync README.md's project regions (release date, repo URL, and the computed
+# stat_* counts such as TODO files and test totals) from the COMMIT JUST MADE
+# (--sync-head reads a HEAD snapshot, never the working tree), and only when the
+# working README equals HEAD's, so the amend below can never carry uncommitted
+# edits or facts derived from uncommitted files. Runs before the badge rewrite,
+# which is the only other writer. Failures are printed, never fatal to a commit.
+README_FILE="$ROOT/README.md"
+# README is rewritten and amended ONLY when its working copy equals the commit
+# just made; otherwise uncommitted README edits would be swept into the amend.
+README_CLEAN=0
+if [ -f "$README_FILE" ] && git -C "$ROOT" diff --quiet HEAD -- README.md 2>/dev/null; then
+    README_CLEAN=1
+fi
+# README_TARGET is the file the badge rewrite edits: the working README when it
+# is clean; otherwise a temp copy of HEAD's README (regions synced), committed
+# below through a TEMPORARY index so the user's working-tree and staged README
+# edits are never touched or swept into the amend (README_PLUMB=1).
+README_TARGET="$README_FILE"
+README_PLUMB=0
+# The one commit every README input and the amend below are derived from.
+BASE="$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
+if [ "$README_CLEAN" = "1" ]; then
+    python3 "$ROOT/scripts/site/build.py" --sync-head README.md >/dev/null || \
+        echo "post-commit: README project-region sync reported a problem (see above)" >&2
+elif [ -n "$BASE" ] && [ -f "$README_FILE" ] && git -C "$ROOT" diff --cached --quiet "$BASE" -- README.md 2>/dev/null; then
+    README_TARGET="$(mktemp)"
+    if python3 "$ROOT/scripts/site/build.py" --emit-head README.md --ref "$BASE" > "$README_TARGET"; then
+        README_PLUMB=1
+    else
+        echo "post-commit: README project-region sync reported a problem (see above)" >&2
+        rm -f "$README_TARGET"; README_TARGET="$README_FILE"
+    fi
+else
+    echo "post-commit: README.md has STAGED uncommitted edits; skipped its region sync and badge (commit or unstage README, then run: python3 scripts/site/build.py --sync README.md)" >&2
+fi
+
+# Rewrite the README lines-of-code badge from the live tree count, so the
+# README total is never hand-maintained or stale (it drifted to "84k+" while
+# the real count was 6x that). Marker-delimited + idempotent: the block between
+# COUNT-BADGE:START and COUNT-BADGE:END is regenerated in place.
+#
+# WHOLE TREE, matching the headline figure in COUNT.md. The badge carries no
+# label saying which basis it uses, so a reader takes it as THE number for this
+# repository; publishing a different one here than the document's own headline
+# is a discrepancy with no visible explanation. The written-here/vendored split
+# is one click away in the Grand Total table.
+if { [ "$README_CLEAN" = "1" ] || [ "$README_PLUMB" = "1" ]; } && grep -q 'COUNT-BADGE:START' "$README_TARGET"; then
+    # The EXACT total, comma-grouped (1,324,648), commas URL-encoded for shields.io.
+    loc_fmt=$(printf '%s' "$whole_tree_lines" | sed -e ':a' -e 's/\([0-9]\)\([0-9]\{3\}\)\($\|,\)/\1,\2\3/' -e 'ta')
+    badge_url="https://img.shields.io/badge/lines-${loc_fmt//,/%2C}-blueviolet"
+    awk -v url="$badge_url" '
+        /COUNT-BADGE:START/ { print; inblk=1; next }
+        /COUNT-BADGE:END/   { print "  <img src=\"" url "\" alt=\"Lines of Code\" />"; print; inblk=0; next }
+        inblk { next }
+        { print }
+    ' "$README_TARGET" > "$README_TARGET.tmp" && mv "$README_TARGET.tmp" "$README_TARGET"
+fi
+
+[ "${COUNT_ONLY:-}" = "1" ] && exit 0
+
+# Amend the commit to include the updated COUNT.md + README badge.
+#
+# `--only <paths>` IS LOAD-BEARING (2026-08-02). A bare `--amend` commits the
+# WHOLE INDEX, so this hook silently converted every path-limited commit in the
+# repo into a full-index commit -- defeating `git commit -- <paths>`, which is
+# the documented protection for working alongside a live unattended run.
+#
+# MEASURED TWICE, both times mistaken for something else: on 2026-07-31 an
+# attended commit that staged only its own four files still shipped the run's
+# staged section deferral, and on 2026-08-02 a path-limited 3-file commit
+# shipped 13 files including 527 lines of the run's in-flight
+# test_usermode_launcher.c under an unrelated message. Both were attributed to
+# "the index is shared"; the actual mechanism is this amend, and it is fixable
+# rather than inherent. It is also the real mechanism behind the 2026-07-28
+# live-gotcha about the RUN sweeping an operator's files.
+#
+# Use SKIP_COUNT to prevent infinite recursion.
+if [ "$README_PLUMB" = "1" ]; then
+    # Dirty working README: build the amended commit from ONE pinned base commit
+    # (tree, parents, message and author all read from $base), with the generated
+    # COUNT.md and the synced README blob in a throwaway index. update-ref only
+    # moves HEAD if it still equals $base, and the real index is touched only
+    # after that succeeds, so a concurrent commit or a lock failure loses nothing.
+    plumb_amend() {
+        local base="$BASE" tmpidx cb rb tree new msg an ae ad gitdir idx lock cur_r base_r par
+        local -a pargs=()
+        [ -n "$base" ] || return 1
+        cb="$(git -C "$ROOT" hash-object -w "$COUNT_FILE")" || return 1
+        rb="$(git -C "$ROOT" hash-object -w "$README_TARGET")" || return 1
+        tmpidx="$(mktemp)" || return 1; rm -f "$tmpidx"
+        { GIT_INDEX_FILE="$tmpidx" git -C "$ROOT" read-tree "$base" &&
+          GIT_INDEX_FILE="$tmpidx" git -C "$ROOT" update-index --add \
+              --cacheinfo "100644,$cb,COUNT.md" --cacheinfo "100644,$rb,README.md" &&
+          tree="$(GIT_INDEX_FILE="$tmpidx" git -C "$ROOT" write-tree)"; } || { rm -f "$tmpidx"; return 1; }
+        rm -f "$tmpidx"
+        # Parents come from the commit object itself (a shallow boundary makes
+        # rev-list report none); an empty list is allowed only for a true root.
+        while read -r par; do pargs+=(-p "$par"); done < <(git -C "$ROOT" cat-file commit "$base" | awk '/^$/{exit} /^parent /{print $2}')
+        if [ "${#pargs[@]}" -eq 0 ] && [ "$(git -C "$ROOT" rev-list --count "$base" 2>/dev/null)" != "1" ]; then
+            return 1
+        fi
+        msg="$(git -C "$ROOT" log -1 --format=%B "$base")" || return 1
+        an="$(git -C "$ROOT" log -1 --format=%an "$base")" || return 1
+        ae="$(git -C "$ROOT" log -1 --format=%ae "$base")" || return 1
+        ad="$(git -C "$ROOT" log -1 --format=%aD "$base")" || return 1
+        new="$(printf '%s\n' "$msg" | GIT_AUTHOR_NAME="$an" GIT_AUTHOR_EMAIL="$ae" GIT_AUTHOR_DATE="$ad" \
+            git -C "$ROOT" commit-tree "$tree" "${pargs[@]}")" || return 1
+        # Hold the real index lock for the whole transaction: validate, prepare the
+        # new index privately in the lock file, move HEAD with a compare-and-swap,
+        # and only then publish the index by renaming the lock into place. Any
+        # failure discards the lock file and leaves the live index untouched.
+        gitdir="$(git -C "$ROOT" rev-parse --absolute-git-dir)" || return 1
+        idx="$gitdir/index"; lock="$idx.lock"
+        ( set -o noclobber; : > "$lock" ) 2>/dev/null || return 1
+        # We own the lock from here. EXIT is the ONLY cleanup (INT/TERM just exit,
+        # which runs it), and LOCK_OWNED makes it remove the path at most once, so
+        # it can never delete a lock another git process acquired afterwards.
+        LOCK_OWNED="$lock"
+        # Both cleanup paths mask INT/TERM and clear ownership BEFORE unlinking,
+        # so no signal can make the path be removed twice.
+        trap 'trap "" INT TERM; _l="${LOCK_OWNED:-}"; LOCK_OWNED=; [ -n "$_l" ] && rm -f "$_l"' EXIT
+        trap 'exit 130' INT TERM
+        release_lock() { trap '' INT TERM; local _l="${LOCK_OWNED:-}"; LOCK_OWNED=; [ -n "$_l" ] && rm -f "$_l"; trap - EXIT INT TERM; }
+        if ! cp "$idx" "$lock"; then release_lock; return 1; fi
+        cur_r="$(GIT_INDEX_FILE="$lock" git -C "$ROOT" ls-files -s -- README.md | awk '{print $2}')"
+        base_r="$(git -C "$ROOT" rev-parse --verify -q "$base:README.md")"
+        if [ -z "$cur_r" ] || [ "$cur_r" != "$base_r" ] ||
+           ! GIT_INDEX_FILE="$lock" git -C "$ROOT" update-index --cacheinfo "100644,$cb,COUNT.md" --cacheinfo "100644,$rb,README.md"; then
+            release_lock; return 1
+        fi
+        # The HEAD swap and the index publish are one step: interrupts are ignored
+        # between them so HEAD and the index can never disagree.
+        trap '' INT TERM
+        if ! git -C "$ROOT" update-ref -m "post-commit: sync COUNT.md and README.md" HEAD "$new" "$base"; then
+            release_lock; return 1
+        fi
+        if mv -f "$lock" "$idx"; then
+            LOCK_OWNED=   # published: the path is no longer ours to remove
+            trap - EXIT INT TERM
+        else
+            echo "post-commit: HEAD amended but the index could not be published; run: git reset -q -- COUNT.md README.md" >&2
+            release_lock; return 1
+        fi
+    }
+    if ! plumb_amend; then
+        echo "post-commit: could not amend COUNT.md/README.md (HEAD moved or a git lock was held); nothing changed -- run: COUNT_ONLY=1 bash .githooks/post-commit" >&2
+    fi
+    rm -f "$README_TARGET"
+else
+    AMEND_PATHS=("$COUNT_FILE")
+    [ "$README_CLEAN" = "1" ] && AMEND_PATHS+=("$README_FILE")
+    # shellcheck source=.githooks/lib/pre-commit-mark.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/pre-commit-mark.sh"
+    allow_hook_amend  # this --no-verify amend is the one prepare-commit-msg allows
+    SKIP_COUNT=1 git commit --amend --only --no-edit --no-verify \
+      -- "${AMEND_PATHS[@]}" 2>/dev/null
+fi
+
+exit 0

@@ -1,0 +1,24 @@
+# Impossible OS — clangd configuration for kernel freestanding environment
+# This file ensures clangd understands our cross-compilation target
+# and does not inject host standard library headers.
+
+CompileFlags:
+  Add:
+    - "--target=x86_64-elf"
+    - "-nostdlib"
+    - "-nostdinc"
+    - "-ffreestanding"
+    - "-mno-red-zone"
+
+Index:
+  Background: Build
+
+Diagnostics:
+  # UnusedIncludes was flipped to Strict for the lint Check 8
+  # phantom-include wrapper. Reverted to None when Check 8 retired
+  # 2026-05-02: clangd's IncludeCleaner produces too many false
+  # positives in this freestanding kernel (macros expanding to
+  # libc-style helpers, errno value identifiers, forward-declaration
+  # providers). Editor noise is not worth the catch rate.
+  UnusedIncludes: None
+  MissingIncludes: None

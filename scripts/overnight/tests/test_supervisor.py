@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Auto-undo and health: the frozen part that recovers from everything else."""
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+import supervisor as sup  # noqa: E402
+
+T0 = 1_800_000_000
+
+
+def ROW(n, status):
+    return f"| s | {n} | Section {n} | none | [{status}] |\n"
+HOUR = 3600
+
+
+def _git(root, *a):
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                   check=True, capture_output=True)
+
+
+def _commit(root, path, text):
+    p = pathlib.Path(root) / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", f"edit {path}")
+
+
+def _fixture(d):
+    root = pathlib.Path(d)
+    _git(root, "init", "-q")
+    (root / ".gitignore").write_text(".claude/overnight/\n")
+    _commit(root, "README", "x\n")
+    alerts = []
+    sup.alert = lambda r, m: alerts.append(m)
+    sup.PUSH_TIMEOUT = 30
+    sup.check(root, False, T0)  # records the starting head
+    return root, alerts
+
+
+def test_a_machinery_commit_nothing_worked_with_is_reverted_when_idle():
+    with tempfile.TemporaryDirectory() as d:
+        root, alerts = _fixture(d)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        h = sup.check(root, True, T0 + 60)
+        assert h["machinery_commits_pending"] == 1 and not h["machinery_reverts"], h
+        h = sup.check(root, True, T0 + 3 * HOUR + 60)
+        assert len(h["machinery_reverts"]) == 1, h
+        assert not (root / ".claude/hooks/x.py").exists()
+        assert any("reverted" in a for a in alerts), alerts
+
+
+def test_refusal_a_working_session_never_has_the_tree_changed_underneath_it():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        sup.check(root, False, T0 + 60)
+        h = sup.check(root, False, T0 + 50 * HOUR)
+        assert not h["machinery_reverts"] and h["machinery_commits_pending"] == 1, h
+        assert (root / ".claude/hooks/x.py").exists()
+
+
+def test_refusal_a_change_the_run_worked_with_is_not_reverted():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, ".claude/hooks/x.py", "good\n")
+        sup.check(root, True, T0 + 60)
+        _commit(root, "src/a.c", "1\n")
+        h = sup.check(root, True, T0 + 5 * HOUR)
+        assert h["machinery_commits_pending"] == 0 and not h["machinery_reverts"], h
+        assert (root / ".claude/hooks/x.py").exists()
+
+
+def test_a_product_commit_vouches_only_for_what_came_before_it():
+    # Review, 2026-11-07: both within one heartbeat, the later hook edit was forgotten.
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, ".claude/hooks/early.py", "x\n")
+        _commit(root, "src/a.c", "1\n")
+        _commit(root, ".claude/hooks/late.py", "x\n")
+        h = sup.check(root, True, T0 + 60)
+        assert h["machinery_commits_pending"] == 1, h
+        h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        assert len(h["machinery_reverts"]) == 1, h
+        assert not (root / ".claude/hooks/late.py").exists()
+        assert (root / ".claude/hooks/early.py").exists()
+
+
+def test_a_commit_mixing_product_and_machinery_counts_as_produced():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        (root / ".claude/hooks").mkdir(parents=True)
+        (root / ".claude/hooks/m.py").write_text("x\n")
+        _commit(root, "src/a.c", "1\n")
+        h = sup.check(root, True, T0 + 60)
+        assert h["machinery_commits_pending"] == 0, h
+
+
+def test_a_fix_on_top_of_a_bad_commit_undoes_as_one_batch():
+    # Review, 2026-11-07: undoing only the fix would have restored the bug.
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        sup.check(root, True, T0 + 60)
+        _commit(root, ".claude/hooks/x.py", "fixed\n")
+        sup.check(root, True, T0 + 2 * HOUR)
+        h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        assert len(h["machinery_reverts"]) == 2 and h["machinery_commits_pending"] == 0, h
+        assert not (root / ".claude/hooks/x.py").exists()
+
+
+def test_a_failed_undo_alerts_keeps_its_commit_and_never_raises():
+    with tempfile.TemporaryDirectory() as d:
+        root, alerts = _fixture(d)
+        _commit(root, ".claude/hooks/x.py", "one\n")
+        sup.check(root, True, T0 + 60)
+        # A human edit landing outside the record makes the revert conflict.
+        (root / ".claude/hooks/x.py").write_text("two\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-qm", "edit")
+        state = root / ".claude/overnight/supervisor-state.json"
+        data = json.loads(state.read_text())
+        data["head"] = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                      capture_output=True, text=True).stdout.strip()
+        state.write_text(json.dumps(data))
+        h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        assert any("Could not undo" in a for a in alerts), alerts
+        assert not (root / ".git/REVERT_HEAD").exists()
+        assert h["machinery_commits_pending"] == 1, h
+
+
+def _with_upstream(root, d):
+    origin = pathlib.Path(d) / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    branch = subprocess.run(["git", "-C", str(root), "branch", "--show-current"],
+                            capture_output=True, text=True).stdout.strip()
+    _git(root, "remote", "add", "origin", str(origin))
+    _git(root, "push", "-q", "-u", "origin", branch)
+    return origin, branch
+
+
+def _remote_head(origin, branch):
+    return subprocess.run(["git", "-C", str(origin), "rev-parse", branch],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def test_a_push_timeout_keeps_the_record_of_what_was_undone():
+    # Review, 2026-11-07: losing it would make a later undo revert the recovery itself.
+    with tempfile.TemporaryDirectory() as d:
+        repo = pathlib.Path(d) / "r"
+        repo.mkdir()
+        root, alerts = _fixture(str(repo))
+        _with_upstream(root, d)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        sup.check(root, True, T0 + 60)
+        real = sup.git
+
+        def slow_push(r, *a, **k):
+            if "push" in a:
+                raise subprocess.TimeoutExpired("git", 1)
+            return real(r, *a, **k)
+
+        sup.git = slow_push
+        try:
+            h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        finally:
+            sup.git = real
+        assert len(h["machinery_reverts"]) == 1 and h["machinery_commits_pending"] == 0, h
+        assert any("push failed" in a for a in alerts), alerts
+        h = sup.check(root, True, T0 + 8 * HOUR)
+        assert h["machinery_commits_pending"] == 0 and len(h["machinery_reverts"]) == 1, h
+
+
+def test_refusal_the_hook_free_push_never_carries_a_product_commit():
+    # Review, 2026-11-07: a product commit a gate refused could have gone out with it.
+    with tempfile.TemporaryDirectory() as d:
+        repo = pathlib.Path(d) / "r"
+        repo.mkdir()
+        root, alerts = _fixture(str(repo))
+        origin, branch = _with_upstream(root, d)
+        tip = _remote_head(origin, branch)
+        _commit(root, "src/refused.c", "x\n")
+        sup.check(root, False, T0 + 30)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        sup.check(root, True, T0 + 60)
+        h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        assert len(h["machinery_reverts"]) == 1, h
+        assert _remote_head(origin, branch) == tip, "a refused product commit was published"
+        assert any("left for the normal push" in a for a in alerts), alerts
+
+
+def test_an_all_machinery_undo_is_pushed():
+    with tempfile.TemporaryDirectory() as d:
+        repo = pathlib.Path(d) / "r"
+        repo.mkdir()
+        root, alerts = _fixture(str(repo))
+        origin, branch = _with_upstream(root, d)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        sup.check(root, True, T0 + 60)
+        sup.check(root, True, T0 + 3 * HOUR + 120)
+        local = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+        assert _remote_head(origin, branch) == local
+        assert any("and pushed" in a for a in alerts), alerts
+
+
+def test_undo_is_one_commit_and_all_or_nothing():
+    # Review, 2026-11-07: a batch stopped halfway left recovery incomplete and unrecorded.
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, ".claude/hooks/a.py", "a\n")
+        _commit(root, ".claude/hooks/b.py", "b\n")
+        sup.check(root, True, T0 + 60)
+        before = subprocess.run(["git", "-C", str(root), "rev-list", "--count", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+        real = sup.git
+
+        def fail_second(r, *a, **k):
+            if a[:2] == ("revert", "--no-commit") and "HEAD" not in a and fail_second.calls == 1:
+                raise subprocess.TimeoutExpired("git", 1)
+            if a[:2] == ("revert", "--no-commit"):
+                fail_second.calls += 1
+            return real(r, *a, **k)
+
+        fail_second.calls = 0
+        sup.git = fail_second
+        try:
+            h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        finally:
+            sup.git = real
+        assert h["machinery_commits_pending"] == 2 and not h["machinery_reverts"], h
+        assert not subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
+                                  capture_output=True, text=True).stdout.strip()
+        h = sup.check(root, True, T0 + 3 * HOUR + 600)
+        assert len(h["machinery_reverts"]) == 2, h
+        after = subprocess.run(["git", "-C", str(root), "rev-list", "--count", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+        assert int(after) == int(before) + 1, (before, after)
+
+
+def test_undo_works_when_the_hooks_themselves_are_broken():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        hooks = root / ".git/hooks/pre-commit"
+        hooks.write_text("#!/bin/sh\nexit 1\n")
+        hooks.chmod(0o755)
+        (root / "m.txt").write_text("x\n")
+        _commit_no_hooks = ["-c", "core.hooksPath=/dev/null"]
+        p = root / ".claude/hooks/x.py"
+        p.parent.mkdir(parents=True)
+        p.write_text("bad\n")
+        (root / "m.txt").unlink()
+        _git(root, "add", "-A")
+        _git(root, *_commit_no_hooks, "commit", "-qm", "bad hook")
+        sup.check(root, True, T0 + 60)
+        h = sup.check(root, True, T0 + 3 * HOUR + 120)
+        assert len(h["machinery_reverts"]) == 1, h
+
+
+def test_a_dirty_tree_keeps_the_undo_for_later():
+    with tempfile.TemporaryDirectory() as d:
+        root, alerts = _fixture(d)
+        _commit(root, ".claude/hooks/x.py", "bad\n")
+        sup.check(root, True, T0 + 60)
+        (root / "dirty").write_text("x")
+        h = sup.check(root, True, T0 + 4 * HOUR)
+        assert h["machinery_commits_pending"] == 1 and not h["machinery_reverts"], h
+        assert any("dirty" in a for a in alerts), alerts
+        (root / "dirty").unlink()
+        h = sup.check(root, True, T0 + 5 * HOUR)
+        assert len(h["machinery_reverts"]) == 1, h
+
+
+def test_health_counts_one_section_once_and_flags_a_stall_and_clears_it():
+    with tempfile.TemporaryDirectory() as d:
+        root, alerts = _fixture(d)
+        _commit(root, "todo/T.md", ROW(1, " "))
+        sup.check(root, False, T0 + 30)
+        _commit(root, "todo/T.md", ROW(1, "x") + "> **Verified:** a\n> **Quality reviewed:** b\n")
+        h = sup.check(root, False, T0 + 60)
+        assert h["sections_shipped_today"] == 1, h
+        assert not h["repair_needed"]
+        h = sup.check(root, False, T0 + 7 * HOUR)
+        assert h["repair_needed"] is True and h["hours_since_ship"] > 6, h
+        assert any("Nothing has shipped" in a for a in alerts), alerts
+        assert json.loads((root / ".claude/overnight/run-health.json").read_text())["repair_needed"]
+        _commit(root, "todo/T.md", ROW(1, "x") + ROW(2, " "))
+        sup.check(root, False, T0 + 8 * HOUR - 60)
+        _commit(root, "todo/T.md", ROW(1, "x") + ROW(2, "x"))
+        h = sup.check(root, False, T0 + 8 * HOUR)
+        assert h["repair_needed"] is False, h
+
+
+def test_git_colour_settings_do_not_hide_a_ship():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _git(root, "config", "color.ui", "always")
+        _commit(root, "todo/T.md", ROW(1, "/"))
+        sup.check(root, False, T0 + 30)
+        _commit(root, "todo/T.md", ROW(1, "x"))
+        assert sup.check(root, False, T0 + 60)["sections_shipped_total"] == 1
+
+
+def test_refusal_correcting_a_stamp_is_not_a_ship():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, "todo/T.md", ROW(1, "x") + "> **Quality reviewed:** old\n")
+        sup.check(root, False, T0 + 60)
+        _commit(root, "todo/T.md", ROW(1, "x") + "> **Quality reviewed:** corrected\n")
+        assert sup.check(root, False, T0 + 120)["sections_shipped_total"] == 0
+
+
+def test_a_reopened_section_shipping_again_counts():
+    # 2026-11-08: TODO-04 s56 replaced its August stamps and a stamp count read zero.
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        _commit(root, "todo/T.md", ROW(1, "/") + "> **Quality reviewed:** august\n")
+        sup.check(root, False, T0 + 60)
+        _commit(root, "todo/T.md", ROW(1, "x") + "> **Quality reviewed:** november\n")
+        assert sup.check(root, False, T0 + 120)["sections_shipped_total"] == 1
+
+
+def test_health_reports_no_dollars():
+    with tempfile.TemporaryDirectory() as d:
+        root, _ = _fixture(d)
+        assert not [k for k in sup.check(root, False, T0 + 60) if "cost" in k]
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            fn()
+    print("OK")

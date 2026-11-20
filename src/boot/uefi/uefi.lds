@@ -1,0 +1,84 @@
+/* ============================================================================
+ * UEFI application linker script
+ *
+ * Produces a position-independent shared object that objcopy converts
+ * to PE/COFF (efi-app-x86_64). Entry point: efi_main.
+ * ============================================================================ */
+
+OUTPUT_FORMAT("elf64-x86-64")
+OUTPUT_ARCH(i386:x86-64)
+ENTRY(efi_main)
+
+SECTIONS
+{
+    . = 0;
+    __image_base = .;
+
+    .hash : { *(.hash) }
+    .gnu.hash : { *(.gnu.hash) }
+
+    . = ALIGN(4096);
+
+    .text : {
+        *(.text .text.*)
+    }
+
+    . = ALIGN(4096);
+
+    .rodata : {
+        *(.rodata .rodata.*)
+    }
+
+    . = ALIGN(4096);
+
+    .data : {
+        *(.got .got.plt)
+        *(.sdata .sdata.*)
+        *(.data .data.*)
+    }
+
+    . = ALIGN(4096);
+
+    .dynamic : {
+        *(.dynamic)
+    }
+
+    . = ALIGN(4096);
+
+    .rel : {
+        *(.rel .rel.*)
+    }
+
+    . = ALIGN(4096);
+
+    .rela : {
+        *(.rela .rela.*)
+    }
+
+    . = ALIGN(4096);
+
+    .dynsym : {
+        *(.dynsym)
+    }
+    .dynstr : {
+        *(.dynstr)
+    }
+
+    . = ALIGN(4096);
+
+    /* SBAT revocation metadata (incbin of sbat.csv via sbat.asm), carried
+     * into the PE by the ELF->PE objcopy (-j .sbat). Placed last + page-
+     * aligned so it does not push .reloc (which objcopy emits adjacent to
+     * the prior section) onto an unaligned PE RVA. */
+    .sbat : {
+        *(.sbat)
+    }
+
+    . = ALIGN(4096);
+
+    /DISCARD/ : {
+        *(.comment)
+        *(.note.GNU-stack)
+        *(.eh_frame)
+    }
+}

@@ -1,0 +1,84 @@
+---
+name: codex-adversarial-review-section
+description: Run adversarial code review for one implemented TODO section, fix findings, and re-review until no unresolved High/Critical issues remain, up to the pass cap in .conclave/reviewers.toml (55).
+---
+
+# Codex Adversarial Review -- Section Loop
+
+> **External-Reviewer Contract:** Codex is a subordinate reviewer, not authority. Every finding from this skill goes through `superpowers:receiving-code-review` (verify at file:line, Fix / Reject / Accept, never blind-implement). Canonical contract: [docs/infrastructure/ai-system.md#external-reviewer-contract-codex](../../../docs/infrastructure/ai-system.md#external-reviewer-contract-codex).
+
+## Prompt Shape
+
+Every dispatch from this skill MUST open its prompt with the marker `[review-kind: adversarial] <todo-path>` on the first non-blank line. The marker is what `.claude/hooks/skill_step_observer.py` and the section-commit four-dispatch gate use to attribute the dispatch. Un-marked dispatches waste a Codex round and block the next section-commit. Canonical reference for all 8 markers: [.claude/skills/codex-prompt-shape.md](../codex-prompt-shape.md).
+
+## Use This Skill When
+
+- You just finished implementing a TODO section and need adversarial review before committing.
+- The `/implement-todo-section` pipeline reaches Stage 6 (it invokes this skill).
+- The user asks "review this section" or "find bugs in §N."
+- You want to stress-test a bounded set of changed files for a single section's work.
+- Do NOT use for full-TODO review -- use `/codex-review-todo` instead.
+
+## Workflow
+
+1. Scope the review to one implemented section (`§N`) and its changed files/symbols.
+2. Extract ALL adversarial angles to challenge. The review MUST be full-spectrum, not limited to one category (e.g., security-only). Every dispatch must cover ALL of:
+   - **Concurrency/SMP safety** -- new shared mutable state, lock ordering, atomics, per-CPU data races
+   - **Race conditions** -- TOCTOU between check and use, concurrent access to shared data without locks, interrupt-context vs thread-context conflicts
+   - **Error-path handling and rollback** -- partial state on failure, resource leaks, cleanup, what happens when allocation fails mid-operation
+   - **Regressions** -- did the change break any existing functionality? Callers of modified functions, struct layout changes affecting other files, removed/renamed symbols
+   - **Wiring/registration correctness** -- SSDT/dispatch/hooks, format registration, magic matching, init ordering
+   - **Boundary and ABI assumptions** -- integer overflow, unaligned access, struct packing, type-pun UB, sign extension
+   - **Memory safety** -- buffer overflows, use-after-free, double-free, null pointer dereference, uninitialized reads, kernel vs user pointer confusion
+   - **Functional correctness** -- does the code do what the spec says? Entry points, return values, edge cases, off-by-one errors
+   - **Security** -- can crafted input (malicious binary, bad syscall args) corrupt kernel state, escalate privilege, or cause denial of service?
+   - **Code quality** -- dead code, unused variables, missing const, style, magic numbers without defines
+   - **Performance** -- unnecessary allocations, O(n^2) where O(n) suffices, byte-by-byte where bulk ops exist, hot-path bloat
+   - **Bare metal correctness** -- MMIO caching attributes, TLB flush scope (local vs IPI shootdown), CPUID-gated instructions, identity mapping assumptions
+   This was learned the hard way: a security-only review of §5 missed entry-point range validation (F-06) and dead code (F-08) which required a supplemental full-spectrum review.
+3. Dispatch adversarial review via the Codex plugin.
+   - Command:
+     ```bash
+     bash scripts/codex-dispatch.sh '[review-kind: adversarial] <todo-path> <focus prompt>'
+     ```
+   - Include the exact file paths and line ranges in the focus prompt.
+   - List ALL adversarial angles from step 2 in the prompt -- do not omit any.
+   - Request findings by severity: `Critical`, `High`, `Medium`, `Low`.
+   - Run in background for large reviews (> 3 files). Wait per the
+     double-poll ban (codex-design-review "Wait discipline"): one absorbing
+     foreground wait or one armed Monitor held silently -- never ~10s manual
+     re-polls with narrator turns.
+   - **Crash != verdict.** If the dispatch exits non-zero or the `.out` shows a
+     Codex crash (`app-server exited unexpectedly`, `rc=1`) instead of a
+     structured verdict, RE-DISPATCH that leg; never treat the crash output as
+     findings or as "approve". Codex `rc=1` crashes are intermittent (measured
+     2026-07-12); a re-dispatch of the SAME prompt usually succeeds. In a
+     multi-kind broker round this is the `review-envelope.py` `needs_redispatch`
+     set -- re-run only the crashed leg(s), reuse the already-clean ones.
+4. Triage findings -- invoke `Skill(name="superpowers:receiving-code-review")` before any edit that acts on them. `codex_review_completed.py` records the review and its reception in `.claude/state/last-codex-review.json` (gitignored, schema documented in `.claude/state/README.md`). **Adversarial-review false-positive watch:** Codex reads code without runtime context and frequently flags "missing lock" when the caller already holds it, "race" on paths single-threaded by construction (BSP boot phase 0), or "buffer overflow" on buffers static-asserted larger than the access. Verify at file:line before classifying. Priority for valid findings: always fix `Critical` and `High`; fix `Medium` unless accepted with a concrete technical reason.
+5. Rebuild and run relevant tests after fixes -- **via
+   `bash scripts/overnight/run-artifact.sh <label> -- <command>` on every
+   round** (deterministic JSON envelope: verdict + every error line + artifact
+   path; a GREEN run costs zero model tokens -- no agent dispatch). Dispatch
+   `diagnostic-digester` ONLY on a failure with a large artifact. You still
+   quote the `build/build.log` tail yourself and it must
+   show `=== BUILD OK ===`. This loop is where ~90% of a hard section's
+   context burns (TODO-12 section-8 measurement); inline `bash
+   scripts/build.sh` is the single-round exception, not the rule. Repeated
+   symbol lookups across rounds go through lsp-bridge
+   (`definition`/`references`), not inline `bash grep`.
+6. **Pre-dispatch self-diff gate, then** re-review the same section with focus on previous findings and changed files.
+   - BEFORE re-dispatching: read the fix diff against this round's + all prior rounds' findings and self-check the fix-then-regress shapes (canonical rule: review-todo-section step 6) -- scope creep, an operation reordered before its precondition, `==` where a bit-flag test is needed, sentinel/boundary handling, re-opening a prior finding. A localized fix that passes the gate needs no fresh Codex round.
+   - If re-dispatch is warranted, dispatch to Codex rescue subagent again with the fix context.
+7. Iterate fix -> self-diff gate -> build/test -> re-review until a round is clean, up to the pass cap in .conclave/reviewers.toml (55).
+8. End-state rules.
+   - If unresolved `Critical`/`High` remain after round 3, do not mark section complete; keep `[/]` or `[ ]` and add explicit follow-up checklist items with ownership and `→ XREF` where needed.
+   - Record a compact findings summary for the section with resolved vs accepted items.
+
+## Guardrails
+
+- Do not claim resolution without code + build/test evidence.
+- Do not weaken assertions/tests to silence findings.
+- Fix root causes, not surface symptoms.
+- Keep scope section-targeted; do not widen into full-file roadmap cleanup.
+- Always use the Codex plugin for the review -- self-review has implementation bias and misses things that a fresh reader catches (proven: §1 Codex found 2 Critical issues self-review missed).

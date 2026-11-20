@@ -1,0 +1,1707 @@
+<!-- docs: covers=todo/00-infrastructure/TODO-04-usermode-test-framework.md sources=src/kernel/test/test_usermode.c,include/kernel/test/test_usermode.h,scripts/test.sh,scripts/utest-json-harvest.py,scripts/utest-frame.py,scripts/utest-refusal-id.py reviewed=2026-11-15 -->
+# User-Mode Test Output Formats
+
+The user-mode test launcher emits **four** output streams on serial.
+Three are machine-readable (TAP, JUnit XML, JSON), one is the
+human-readable default. All four can be enabled simultaneously; the
+launcher interleaves them tagged with distinct prefixes so downstream
+tooling can split them by `grep`.
+
+Governing roadmap: [TODO-04 -- User-Mode Test Framework](../../todo/00-infrastructure/TODO-04-usermode-test-framework.md).
+Launcher implementation: [src/kernel/test/test_usermode.c](../../src/kernel/test/test_usermode.c).
+
+---
+
+## Enabling formats
+
+Each format is controlled by an independent `boot.conf` flag. Defaults
+are all `0`; opt in per-run:
+
+| `boot.conf` key    | Effect                                                                                    |
+|--------------------|-------------------------------------------------------------------------------------------|
+| `test=1`           | (prereq) launcher runs at all                                                             |
+| `tap=1`            | `1..N` plan line + `ok N - <name>` / `not ok N - <name>` per binary                       |
+| `xml=1`            | `[UTEST-XML] <testsuite>` / `[UTEST-XML] <testcase>` + `[UTEST-XML-SUMMARY]` envelope     |
+| `json=1`           | One `[UTEST-JSON] {...}` per binary + the trailing `run_report`, `summary`, `run_meta` records |
+| `utest_filter=<patterns>` | Restrict the run to binaries matching a `:`-separated pattern list (63 bytes max) |
+
+`scripts/test.sh` mirrors these as `QUIET=1`, `XML=1`, `JSON=1`, `TAP=1`,
+`UTEST_FILTER=<patterns>` and `UTEST_TIMEOUT_MS=<ms>` command-line flags and patches them into the booted
+`boot.conf`.
+
+`XML=1` and `JSON=1` also assemble host-side artifacts --
+`build/test-results.xml` and `build/test-results.json`. Both are gates: if
+the requested stream never reaches serial, or reaches it in a state that
+disagrees with its own summary, the run FAILS and the artifact says why.
+Neither ever publishes a clean-looking empty result to stand in for a broken
+pipeline.
+
+### The report dimension (2026-07-28)
+
+Every format now carries a THIRD outcome alongside pass and fail. A test
+binary submits its own counts through `SYS_TEST_REPORT` at `UTEST_END`
+(assertions passed, assertions failed, and skip BLOCKS taken), because a
+process exit code has room for two outcomes only -- `0` and the
+whole-binary `77`. Before this, a binary that skipped one sub-test and
+passed the rest reached every machine consumer as an ordinary exit 0,
+claiming coverage the run never had.
+
+Two independent dimensions, never summed:
+
+- **binary verdicts** -- what the exit codes said. These are the numbers
+  in the legacy `=== N passed ... ===` line, in `summary.passed/failed/
+  skipped`, and in one TAP point / one `<testcase>` per binary.
+- **the report** -- assertion counts and skip blocks the binaries reported
+  about themselves. One `UTEST_SKIP` guards a block that may contain
+  several assertions, so a skip block is never comparable to an assertion
+  count.
+
+Reports are ring-3 data and are treated as untrusted. The kernel refuses a
+repeat submission or an out-of-range count; the launcher then reconciles
+the report against the exit status it observed and escalates a
+self-contradicting binary to FAIL rather than publishing its numbers. Two
+diagnostic lines carry the dimension: `[UTEST-REPORT] <name> ...` per
+reporting binary, and one `[UTEST-REPORT-SUMMARY]` for the run.
+
+---
+
+## Record framing (always on)
+
+**Every launcher-owned record is framed with a per-boot nonce, and every
+host parser refuses a record that is not.** Ring-3 stdout and the launcher
+share one serial stream -- `sys_write(fd=1, ...)` copies caller-controlled
+bytes straight to `serial_putchar` with no annotation -- so before framing a
+test binary could print a byte-identical summary line and the runner's
+boot-completion poll would accept it, stop QEMU, and report success without
+ever seeing the real verdict. The same shared namespace let a binary inject
+`[UTEST-XML]` / `[UTEST-JSON]` records straight into the assembled artifact.
+
+The nonce rides the klog SUBSYSTEM field, so records read `UTEST-<8 hex>:`
+where a forgery can only manage `UTEST:`:
+
+```
+[INFO] UTEST-1a2b3c4d: [UTEST-FRAME] v=1 run=1
+[ OK ] UTEST-1a2b3c4d: test_syscall.exe: PASS (exit=0)
+[ OK ] UTEST-1a2b3c4d: [UTEST-FRAME-END] run=1 records=105
+```
+
+It rides the subsystem rather than the message because every record is
+bounded by klog's 256-byte message field and the JSON summary already
+measured 242 of 255 usable bytes; the subsystem is a `const char *`, so the
+tag costs the record budget nothing.
+
+**Learn the frame, never pattern-match it.** A consumer takes the nonce from
+the TAG of the FIRST `[UTEST-FRAME]` announcement and then requires exactly
+that prefix on every record it reads. Accepting any `UTEST-[0-9a-f]{8}:`
+prefix accepts a GUESSED one, which is not hypothetical: `test_forge.exe`
+prints `UTEST-deadbeef: [UTEST-FRAME-END]`, and against a generic pattern
+that line ended the run early.
+
+The announcement body carries NO copy of the nonce. Every ring-3-readable
+disk sink (`kernel.log`, `events.jsonl`, the per-subsystem files) renders
+the tag through an alias back to the plain `UTEST`, and a body copy would
+survive that alias and put the value back into the log a test binary can
+open. There is likewise no "frame absent" placeholder prefix: ring 3
+controls serial, so any printable sentinel becomes an acceptance prefix. An
+unlearned frame runs NO acceptance pattern at all.
+
+Each run brackets itself with `[UTEST-FRAME] ... run=N` and
+`[UTEST-FRAME-END] run=N`, and a terminator only counts when it closes the
+open announcement with the SAME ordinal -- otherwise a `run=1` open and a
+`run=2` close reconcile, and two runs can compensate each other's count
+errors across the boundary.
+
+First announcement wins: the launcher announces before it creates any ring-3
+task, so nothing of that run can have printed ahead of it. A later, different
+nonce is an imitator -- its records never match the learned prefix, and
+`scripts/test.sh` additionally fails the run on the conflict. It does not
+discard the frame, because that would let one binary printing one string
+throw away every genuine result.
+
+**`[UTEST-FRAME-END]` is the run's completion signal, not the summary.**
+`records=` counts every framed record emitted before it, so a consumer that
+saw the whole stream counts exactly `records + 1` framed lines for that run.
+A binary that prints a plausible summary and then hangs cannot produce this
+line, and a truncated stream cannot reconcile. `test_usermode_run()` is safe
+to call repeatedly: the nonce is generated once per boot and never
+rewritten (klog retains the subsystem pointer, so rewriting it would
+re-attribute retained entries), while each run gets its own ordinal and its
+own record count.
+
+The mechanism's boundary is framing, not cryptography: the threat model is a
+BUGGY binary printing something that matches a launcher pattern by accident
+as much as a hostile one. Ring 3 cannot read the nonce back through any
+syscall, but a binary that opens the on-disk kernel log can read it there.
+
+---
+
+## Human-readable default (always on)
+
+Every binary produces two kernel-side lines:
+
+```
+[INFO] UTEST-1a2b3c4d: <name>: PASS (exit=0)
+[ OK ] UTEST-1a2b3c4d: === N passed, M failed, K skipped of T total ===
+```
+
+A binary passes only on exit 0 with proof it ran: a syscall from ring 3.
+A binary that timed out fails as a timeout whatever status it then died
+with, a pass or skip status with no ring-3 syscall is counted as never ran
+(an `ERROR` record), and a binary whose `fork()` descendants did not finish
+fails as `descendants did not finish`, even when its own exit was clean.
+
+Plus whatever the user-mode harness writes via `[PASS]` / `[FAIL]` /
+`[UTEST-BEGIN]` / `[UTEST-END]` lines. This stream is parsed by
+`scripts/test.sh` step 5 for the terminal summary; every machine-
+readable format is derived from the same verdict.
+
+---
+
+## TAP (Test Anything Protocol)
+
+Enabled with `boot.conf tap=1` (or `scripts/test.sh QUIET=1` + a later
+TAP flag). Emits TAP-13 shape:
+
+```
+ok 1 - test_harness_smoke.exe
+ok 2 - test_harness_smoke.exe::skipped-block-1 # SKIP reported by binary
+ok 3 - test_syscall.exe
+not ok 4 - test_leaky.exe # exit=2
+1..4
+```
+
+**The plan is TRAILING** (changed 2026-07-28; TAP-13 permits it at either
+end). A binary that reports skip blocks contributes one extra point per
+block, so the launcher cannot state the total until every binary has run.
+A skipped block gets its own point, named `<binary>::skipped-block-<k>`,
+carrying a real `# SKIP` directive -- the binary's own point keeps its
+true verdict, because reporting a partly-verified binary as skipped is
+just the opposite falsehood. The label is positional because the kernel
+receives a COUNT, not the identity of each skipped block.
+
+After a `Bail out!` the stream ends: no further points and **no plan**,
+per the TAP contract that nothing follows a bail-out. `scripts/test.sh`
+treats any observed bail-out as a run failure, since an aborted suite left
+most binaries unexecuted.
+
+**A point the launcher cannot represent faithfully is emitted as a
+FAILURE, never omitted and never silently shortened:**
+
+```
+[UTEST-RECORD-OVERFLOW] TAP point 7 could not be represented
+not ok 7 - unrepresentable # TAP record refused
+```
+
+Two cases produce it, and both used to corrupt the point silently. TAP
+puts its directive LAST, and every record is bounded by the 256-byte
+transport, so a name long enough to push `# SKIP` past the limit turned a
+skipped test into a bare passing `ok`; synthetic skip-record points, whose
+names are built into a `VFS_MAX_NAME + 24` buffer, lost it for any long
+parent. And a name containing `#` would choose its own TAP meaning --
+`test_a # SKIP fake.exe` reads as a skip -- because the name validator
+rejects path characters and control bytes but permits `#`, and
+glob-discovered names come from the filesystem rather than the manifest.
+Refusing in the failing direction is the only safe option: the alternative
+reads as a pass.
+
+Lines pass through the kernel log prefix (`[INFO] UTEST-<nonce>: `), so a
+TAP parser consuming the raw serial log must learn the frame, require it,
+and then strip everything up to the first `1..` / `ok` / `not ok` /
+`Bail out!` token per line.
+`scripts/test.sh`'s post-processor does not currently produce a
+standalone TAP file (TAP is less useful than XML/JSON for CI), but
+nothing stops a downstream consumer from writing one.
+
+---
+
+## JUnit XML (`xml=1`)
+
+JUnit XML is the de-facto CI test-result format. GitLab's
+`artifacts.reports.junit`, GitHub Actions' `actions/upload-artifact`
++ test annotation readers, and Jenkins' JUnit plugin all parse it
+natively.
+
+### Wire format on serial
+
+Because the launcher does not know the final test counts until after
+every binary runs, the `<testsuite ...>` opener uses placeholder zero
+attributes; the real counts arrive in a trailing
+`[UTEST-XML-SUMMARY]` line. `scripts/test.sh`'s post-processor
+harvests both streams and regenerates a valid file at
+`build/test-results.xml`.
+
+```
+[UTEST-XML] <testsuite name="impossible-os-usermode" tests="0" failures="0" skipped="0" errors="0" time="0">
+[UTEST-XML] <testcase name="test_harness_smoke.exe" classname="correctness" time="0.080"/>
+[UTEST-XML] <testcase name="test_leaky.exe" classname="correctness" time="0.090"><failure message="1 handle(s) leaked"/></testcase>
+[UTEST-XML] <testcase name="test_skip_me.exe" classname="correctness" time="0.010"><skipped message="exit=77"/></testcase>
+[UTEST-XML] <testcase name="refused_1_test_a_b.exe_dd94b2b6.exe" classname="correctness" time="0.000"><error message="name refused: charset"/></testcase>
+[UTEST-XML-SUMMARY] tests=4 failures=2 skipped=1 time=0.180 aborted=0 not_run=0 errors=1
+[UTEST-XML] </testsuite>
+```
+
+`aborted=` and `not_run=` are the run-completeness dimension: `aborted=1`
+means the launcher cut the suite short (the cause is on its framed
+`suite ABORT (<cause>)` line) and `not_run=` counts the planned
+binaries that never executed. They are appended after `time=` because every
+host parser is a greedy `.*<key>=(...)` expression plus an end-unanchored
+validating grep, so trailing fields extend the line without disturbing any
+existing extraction. `scripts/test.sh` fails the run if they are absent and
+publishes an infrastructure-error document instead of assembling a normal
+one: it boots the kernel it just built, so a summary without them is
+producer drift, not an old artifact, and a document asserting
+`aborted="false"` would be a claim the stream never made.
+
+`errors=` is the never-ran dimension and is trailing for the same reason.
+It counts the binaries that never EXECUTED -- a refused name, or a launch
+that produced no task -- and it is an overlapping **subset** of `failures=`
+on this line, not a sibling of it: the producer counts such a binary in
+both, so the legacy `=== N failed` summary, the serial fail-closed recount
+and the TAP stream all keep describing one failure population. The host is
+what projects the pair into JUnit's disjoint attributes, and it reconciles
+before it projects (below). Absence is a refusal, exactly like the two
+completeness fields.
+
+### Element schema
+
+```xml
+<testsuite
+    name="impossible-os-usermode"
+    tests="N"              <!-- every binary testcase record, INCLUDING the
+                                 never-ran ones, plus skip-block records and
+                                 the synthetic abort record when aborted -->
+    failures="N"           <!-- binaries that RAN and failed: assertions,
+                                 leaks, isolation, and a timeout that had
+                                 already reached the exec attempt. Projected:
+                                 the producer's failures= minus its errors= -->
+    skipped="N"            <!-- binaries that exited 77 + skip-block records -->
+    errors="N"             <!-- binaries that never RAN, plus 1 when the smoke
+                                 gate aborted the suite. DISJOINT from
+                                 failures= here, even though the producer
+                                 reports it as a subset. FOUR sources:
+                                 (1) an ingest refusal (name refused, not
+                                     test-shaped, unusable attribute, absent
+                                     planned binary, fail-closed aggregate),
+                                 (2) task_create failure -- no task existed,
+                                 (3) a loader exit before ring 3 (missing
+                                     file, staging allocation, short read,
+                                     task_exec refusal or destroyed image),
+                                 (4) a timeout that never reached the exec
+                                     call at all.
+                                 A timeout AFTER the exec attempt stays a
+                                 FAILURE: an adopted frame hanging in ring 3
+                                 cannot be told apart from one never adopted
+                                 until the scheduler records ring-3 entry -->
+    time="S.MMM"           <!-- wall-clock seconds for the whole suite -->
+    timestamp="..."        <!-- ISO-8601 UTC, xs:dateTime with the trailing Z -->
+    hostname="...">        <!-- uname -n, filtered to [A-Za-z0-9._-] -->
+  <!-- Always emitted, and always the first child (the JUnit schema requires
+       that position). Absence means the artifact predates the completeness
+       dimension; it never means the run completed. -->
+  <properties>
+    <property name="aborted" value="true|false"/>
+    <!-- Only when aborted. The launcher's framed label: smoke failed, reap
+         degraded or clock stalled; "cause not named" if no such line exists. -->
+    <property name="abort_cause" value="CAUSE"/>
+    <property name="not_run" value="N"/>
+    <!-- Run identity. Present on every document this pipeline writes,
+         including the synthetic error documents and the refusal envelopes:
+         an artifact nobody can place is the one a dashboard most needs to
+         place. Identity never softens a refusal -- errors="1" and the
+         <error> element stay exactly as they were. -->
+    <property name="schema" value="utest-run-identity-v1"/>
+    <property name="run_id" value="TIMESTAMP-PID-RANDOM"/>
+    <property name="commit" value="SHA[-dirty]"/>
+    <property name="leg" value="HOST-ACCEL-Ncpu[-ciparity][-LABEL]"/>
+    <property name="leg_source" value="derived|derived+override"/>
+    <property name="accel" value="kvm|tcg"/>
+    <property name="cpus" value="N"/>
+    <property name="qemu" value="QEMU-BINARY-BASENAME"/>
+    <property name="host" value="wsl2|linux|..."/>
+    <property name="ci_parity" value="true|false"/>
+  </properties>
+  <!-- Emitted ONLY on an aborted run. The properties above are queryable but
+       inert: the smoke gate aborts on any non-PASS verdict INCLUDING skip,
+       and a skipped smoke leaves failures="0" with every remaining count
+       internally consistent -- so a plain JUnit consumer would report a run
+       where most binaries never executed as green. This record, and the
+       errors="1" that matches it, are what make the document itself red. -->
+  <testcase name="suite-abort" classname="infrastructure">
+    <error message="suite aborted (CAUSE); N binaries never ran"/>
+  </testcase>
+  <testcase
+      name="test_<stem>.exe"
+      classname="correctness"     <!-- test-type taxonomy label -->
+      time="S.MMM">               <!-- per-binary wall-clock seconds -->
+    <!-- PASS: self-closing <testcase ... /> -->
+    <failure message="..."/>      <!-- FAIL: the binary RAN and failed -->
+    <skipped message="..."/>      <!-- SKIP (exit=77): optional reason -->
+    <error message="..."/>        <!-- the binary never RAN: an ingest refusal,
+                                       a launch that produced no task, a loader
+                                       exit before ring 3, or a timeout that
+                                       never reached the exec call (the four
+                                       sources listed on errors= above). Same
+                                       convention as the suite-abort record,
+                                       and the reason JUnit has two elements -->
+  </testcase>
+  <!-- One synthetic record per skip BLOCK a binary reported. classname is
+       always "skip-block", which is how a consumer separates these from
+       real binaries structurally rather than by parsing the name. The
+       parent binary keeps its own true verdict above. -->
+  <testcase name="test_<stem>.exe::skipped-block-<k>" classname="skip-block" time="0.000">
+    <skipped message="sub-test block skipped (reason on serial log)"/>
+  </testcase>
+</testsuite>
+```
+
+`tests=` counts RECORDS, not binaries, so it equals the number of
+`<testcase>` elements in the file and `skipped=` equals the number of
+`<skipped/>` elements. To recover the binary count alone, subtract the
+`skip_records` value from the JSON summary or the `[UTEST-REPORT-SUMMARY]`
+line.
+
+### CI integration
+
+**GitHub Actions** -- upload the file as an artifact so a workflow like
+[dorny/test-reporter](https://github.com/dorny/test-reporter) can read
+it:
+
+```yaml
+- name: Upload JUnit XML
+  uses: actions/upload-artifact@v4
+  with:
+    name: usermode-test-results
+    path: build/test-results.xml
+```
+
+**GitLab CI** -- report directly via the built-in junit schema:
+
+```yaml
+artifacts:
+  when: always
+  reports:
+    junit: build/test-results.xml
+```
+
+**Jenkins** -- use the JUnit plugin:
+
+```groovy
+junit 'build/test-results.xml'
+```
+
+---
+
+## JSON lines (`json=1`)
+
+Typed schema for downstream automation (dashboards, trend analysis,
+regression bisect). `scripts/test.sh JSON=1` assembles the record stream
+into `build/test-results.json` -- see "Assembled artifact" below, which is
+what a consumer should read. This section documents the wire stream behind
+it.
+
+### Wire format
+
+```
+[UTEST-JSON] {"record_kind":"binary","name":"test_harness_smoke.exe","type":"correctness","status":"PASS","time_ms":80,"asserts_passed":3,"asserts_failed":0,"skip_blocks":1}
+[UTEST-JSON] {"record_kind":"skip_block","name":"test_harness_smoke.exe::skipped-block-1","parent":"test_harness_smoke.exe","skip_index":1,"status":"SKIP","reason":"sub-test block skipped (reason on serial log)"}
+[UTEST-JSON] {"record_kind":"binary","name":"test_leaky.exe","type":"correctness","status":"FAIL","time_ms":90,"reason":"1 handle(s) leaked"}
+[UTEST-JSON] {"record_kind":"binary","name":"test_skip_me.exe","type":"correctness","status":"SKIP","time_ms":10,"reason":"exit=77"}
+[UTEST-JSON] {"record_kind":"binary","name":"refused_1_test_a_b.exe_dd94b2b6.exe","type":"correctness","status":"ERROR","time_ms":0,"reason":"name refused: charset"}
+[UTEST-JSON] {"record_kind":"run_report","asserts_passed":3,"asserts_failed":0,"skip_blocks":1,"skip_records":1,"binaries_reported":1,"binaries_invalid":0,"binaries_unreported":2}
+[UTEST-JSON] {"summary":{"passed":1,"failed":2,"errors":1,"skipped":1,"total":4,"time_ms":180}}
+[UTEST-JSON] {"record_kind":"run_meta","aborted":false,"not_run":0}
+```
+
+**Why the run-level data is split across three records.** Every record
+crosses to the host through `klog`, whose ring entry is `message[256]` and
+which bounds the formatted message to that size. A record wider than that is
+cut mid-object in transit, and a truncated JSON object is unparseable rather
+than merely short -- silently. With the assertion dimension nested inline the
+summary record measured 242 of the 255 usable bytes on a live run, so it
+overflowed on a suite with four-digit binary counts. Each dimension therefore
+gets its own record, sized to fit every field at its `uint32` maximum, and
+the host assembler nests them back together. The constraint stops at the
+wire: a consumer of `build/test-results.json` sees one summary object.
+
+The stream always ends `run_report`, `summary`, `run_meta`, in that order.
+The assembler rejects any other tail as a cut-and-resumed stream.
+
+**`record_kind` leads every record and is the stream's discriminator.**
+The stream carries FOUR kinds, and a consumer must accept all of them:
+`binary` (one per binary), `skip_block` (one per synthetic skip record),
+plus the two run-level records `run_report` and `run_meta`. The assembled
+FILE adds a fifth, `infrastructure`, which exists only in `testcases[]` and
+only on an aborted run (see the `suite-abort` record below) -- it is written
+by the host, never by the launcher, so it never appears on the wire. A consumer
+that counted every object with a `name` would report more testcases than
+`summary.total` and skew every pass rate derived from it; one that
+accepted only the two name-bearing kinds would reject the run-level
+records the harvester requires. Key on `record_kind`, never on the
+presence of `name`.
+
+`summary.total` counts BINARIES, and the skip records are counted separately
+as `summary.reported.skip_records`. State the relation as explicit array
+invariants rather than one `records ==` equation, which was ambiguous about
+whether it meant wire records or published arrays and became false outright
+once an aborted run gained a host record:
+
+```
+len(testcases)   == summary.testcase_total == summary.total + summary.synthetic_errors
+len(skip_blocks) == summary.reported.skip_records
+```
+
+On the WIRE (the raw `[UTEST-JSON]` stream, which carries no host record) the
+producer's own count is `total + skip_records` binary and skip_block records,
+plus the three run-level records `run_report`, `summary` and `run_meta`.
+
+**An aborted run carries a `suite-abort` record, and it is NOT a binary.**
+The XML side injects a synthetic `<testcase name="suite-abort">` carrying an
+`<error>` so any generic JUnit consumer reds the build by walking testcase
+elements alone; the JSON artifact does the same, appending one record with
+`record_kind: "infrastructure"`, `synthetic: true`, and `status: "ERROR"` to
+`testcases`. Without it the abort rides only as the boolean
+`summary.aborted`, and a consumer following the worked recipe below sees a
+smaller but internally consistent -- and apparently green -- set, because the
+binaries that never ran were never published as records.
+
+That record moves NONE of the producer counters. `total`,
+`passed`/`failed`/`skipped`, `errors` and every `reported.*` field describe
+binaries the LAUNCHER accounted for, and one infrastructure event standing
+for `not_run` omitted binaries is not an additional binary; writing it into
+those counters would publish a binary that never existed. The host dimension
+is stated explicitly instead:
+
+| Field                      | Type    | Notes                                                     |
+|----------------------------|---------|-----------------------------------------------------------|
+| `summary.synthetic_errors` | integer | Host-synthesized ERROR records in `testcases` (0 or 1 today) |
+| `summary.testcase_total`   | integer | `total + synthetic_errors` -- the length of `testcases[]`  |
+
+Both are written on EVERY published run, not only aborted ones, for the same
+reason the XML `<properties>` block is: absent must mean "this artifact
+predates the dimension", never "zero". So a consumer reconciling record
+counts keys on `testcase_total`, and one that wants producer facts only
+filters `record_kind == "binary"`.
+
+`summary.reported` is the report dimension described at the top of this
+document. `binaries_unreported` is the partition slot for every binary
+WITHOUT an accepted self-report -- a binary that never called
+`SYS_TEST_REPORT`, one whose launch failed, and an ingest refusal that
+never ran at all. It is what makes silence legible: not reporting is a
+different fact from reporting zero skips, and only the second is evidence
+of full coverage.
+`binaries_invalid` counts every REJECTED or INCOMPLETE report, not only
+exit-status contradictions. A report is invalid when the binary submitted
+twice, submitted a count above its ceiling, died between claiming the
+submission slot and publishing it, or reported counts that contradict its
+exit status (zero failures with a failing exit, failures with exit 0, or
+any report alongside the whole-binary skip status 77). All four are
+trust-boundary failures rather than test outcomes: the launcher has
+already failed those binaries, and their counts are excluded from the
+totals rather than published.
+
+### Field schema
+
+Per-binary record:
+
+| Field             | Type     | Notes                                                                 |
+|-------------------|----------|-----------------------------------------------------------------------|
+| `record_kind`     | string   | Always `"binary"`; discriminates from `"skip_block"` and the host `"infrastructure"` record |
+| `name`            | string   | Binary filename (validated to test_*.exe prefix/suffix at ingest)     |
+| `type`            | string   | Test-type taxonomy label                                              |
+| `status`          | string   | `"PASS"` / `"FAIL"` / `"SKIP"` / `"ERROR"`. `ERROR` means the binary never RAN (refused name, launch failure) and is a SUBSET of the `failed` population, not a fourth bucket -- `summary.failed` counts it too |
+| `time_ms`         | integer  | Wall-clock milliseconds from `task_create` to launcher verdict        |
+| `reason`          | string   | Optional; launcher-formatted fail/skip explanation                    |
+| `asserts_passed`  | integer  | Optional; present only when the binary submitted an ACCEPTED report   |
+| `asserts_failed`  | integer  | Optional; same condition                                              |
+| `skip_blocks`     | integer  | Optional; skip SITES taken, not assertions                            |
+
+Skip-block record (one per reported skip block):
+
+| Field         | Type     | Notes                                                      |
+|---------------|----------|------------------------------------------------------------|
+| `record_kind` | string   | Always `"skip_block"`                                      |
+| `name`        | string   | `<binary>::skipped-block-<k>`                              |
+| `parent`      | string   | The binary that reported it -- group on this               |
+| `skip_index`  | integer  | 1-based index of the skip site within that binary          |
+| `status`      | string   | Always `"SKIP"`                                            |
+| `reason`      | string   | Fixed text; the human-readable reason stays on serial      |
+
+Host `suite-abort` record (present only when `summary.aborted` is true):
+
+| Field         | Type     | Notes                                                      |
+|---------------|----------|------------------------------------------------------------|
+| `record_kind` | string   | Always `"infrastructure"` -- never produced by the launcher |
+| `synthetic`   | boolean  | Always `true`; the machine-readable "this is a host projection" flag |
+| `name`        | string   | Always `"suite-abort"`, matching the XML `<testcase name>`  |
+| `classname`   | string   | Always `"infrastructure"`                                   |
+| `status`      | string   | Always `"ERROR"`, so a `testcases[]`-only walk reds the run |
+| `abort_cause` | string   | The launcher's framed `suite ABORT (<cause>)` label: `smoke failed`, `reap degraded` or `clock stalled`. `cause not named` when no framed line of that shape exists; it is never guessed |
+| `reason`      | string   | `suite aborted (<cause>); N binaries never ran`             |
+| `time_ms`     | integer  | Always 0 -- it describes an omission, not an execution      |
+
+Summary record (wire) -- binary counts only:
+
+| Field                                 | Type     | Notes                                              |
+|---------------------------------------|----------|----------------------------------------------------|
+| `summary.passed`                      | integer  | binaries with verdict=PASS                         |
+| `summary.failed`                      | integer  | binaries with verdict=FAIL (all causes), INCLUDING the never-ran ones |
+| `summary.errors`                      | integer  | the subset of `failed` that never RAN (status=`ERROR`); reconciled against those records and refused on mismatch |
+| `summary.skipped`                     | integer  | binaries with verdict=SKIP (exit=77)               |
+| `summary.total`                       | integer  | `passed + failed + skipped` -- BINARIES only       |
+| `summary.time_ms`                     | integer  | Suite wall-clock milliseconds                      |
+
+`run_report` record -- the assertion dimension, nested under
+`summary.reported` in the assembled artifact:
+
+| Field                   | Type     | Notes                                              |
+|-------------------------|----------|----------------------------------------------------|
+| `record_kind`           | string   | Always `"run_report"`                              |
+| `asserts_passed`        | integer  | assertions that held, summed over accepted reports |
+| `asserts_failed`        | integer  | assertions that did not                            |
+| `skip_blocks`           | integer  | skip sites taken, summed over accepted reports     |
+| `skip_records`          | integer  | synthetic records emitted (== skip_blocks unless the run-wide budget clipped them) |
+| `binaries_reported`     | integer  | binaries whose report was accepted                 |
+| `binaries_invalid`      | integer  | binaries whose report contradicted their exit      |
+| `binaries_unreported`   | integer  | binaries with no accepted self-report: never reported, launch failed, or refused at ingest |
+
+`run_meta` record -- the run-completeness dimension, merged into `summary`
+in the assembled artifact:
+
+| Field         | Type     | Notes                                                       |
+|---------------|----------|-------------------------------------------------------------|
+| `record_kind` | string   | Always `"run_meta"`                                         |
+| `aborted`     | boolean  | the launcher cut the suite short; the `suite-abort` record names why. A JSON boolean, not 0/1, so a consumer walking the object generically cannot sum it with a count |
+| `not_run`     | integer  | planned binaries that never executed. Always 0 when `aborted` is false; the assembler rejects any other combination |
+
+Emitted on EVERY run, not only aborted ones: absence must mean "this
+producer predates the dimension", never "the run completed". This is the
+only thing separating an aborted suite from a smaller complete one --
+the gate aborts on any non-PASS smoke verdict *including SKIP*, which
+leaves `failed` at 0 and every other count internally consistent.
+
+### Assembled artifact (`build/test-results.json`)
+
+`scripts/test.sh JSON=1` runs `scripts/utest-json-harvest.py`, which
+validates the stream and publishes the document below via a temporary file
+and atomic rename. Any artifact from a previous run is removed first, so a
+death before publication cannot leave a stale file that reads as current.
+
+```json
+{
+  "schema": "utest-json-v2",
+  "testcases": [ /* every record_kind=binary record, in stream order,
+                    plus the host record_kind=infrastructure suite-abort
+                    record LAST when the run aborted */ ],
+  "skip_blocks": [ /* every record_kind=skip_block record */ ],
+  "summary": {
+    "passed": 1, "failed": 1, "skipped": 1, "total": 3, "time_ms": 180,
+    "reported": { /* the run_report fields */ },
+    "aborted": false, "not_run": 0,
+    "synthetic_errors": 0, "testcase_total": 3
+  },
+  "run_identity": { /* build/test-run-identity.json, verbatim; null if absent */ }
+}
+```
+
+### Run identity and artifact paths
+
+The RECORD is a per-invocation directory; every stable pathname is an alias
+into it. `scripts/test.sh` derives a `run_id` in Step 0a, ahead of every exit
+path, and creates `build/test-runs/<run_id>/` with a non-recursive `mkdir` --
+which FAILS if the directory exists, so the identity is collision-proof rather
+than merely improbable.
+
+| Path | Meaning |
+|---|---|
+| `build/test-runs/<run_id>/test-results.{xml,json}` | the RECORD: immutable, never rewritten by another run |
+| `build/test-runs/<run_id>/record-complete.json` | the commit marker (`utest-run-record-v1`) |
+| `build/test-runs/<run_id>/test-run-identity.json` | the record's identity (`utest-run-identity-v1`): which leg, commit and environment PRODUCED it |
+| `build/test-results.{xml,json}` | alias: THIS invocation. Cleared in Step 0a before anything can fail |
+| `build/test-results-<leg>.{xml,json}` | alias: the latest COMPLETED run of that leg |
+| `build/test-results-<leg>.run` | **the resolution path**: a pointer (`utest-leg-pointer-v1`) naming the record that leg currently resolves to |
+| `build/test-run-identity.json` | alias for the record's identity document |
+
+Publication is **settle -> commit marker -> aliases**, in that order, and each
+step gates the next:
+
+1. Every format the run OWED but never published gets its refusal document, so
+   the record's contents are settled before the marker describes them.
+2. The marker is written. **If it cannot land, NO alias is published** and the
+   run fails -- a stable pathname pointing into a record with no marker is the
+   uncommitted-record exposure the marker exists to prevent.
+3. The aliases are copied out, identity LAST.
+
+Every alias write goes through a private temp plus `mv`, so no alias is ever
+newer than the record it points at and none can be observed half-written. A
+`SIGKILL` before the marker leaves every alias absent, which is fail-CLOSED:
+absence sends a consumer to the record directory, whereas a stale alias would
+answer with another run's document.
+
+Per-file `mv` makes each alias atomic but does not make the alias SET atomic,
+so **identity is the generation pointer**. It carries `run_id` and is
+published after the documents, so a consumer that resolves through
+`build/test-run-identity.json` and cross-checks its `run_id` against the
+`run_id` inside the document it read either sees one coherent generation or
+detects the skew. The record plus its marker remains the authoritative pair;
+the aliases are a compatibility surface.
+
+### Resolving one leg's documents (`build/test-results-<leg>.run`)
+
+The per-leg alias set is republished as a set: the old files are removed and
+the new ones renamed in, so **every member is briefly absent by construction**.
+Absence is fail-closed and sends a consumer to the record, but it is the wrong
+contract for the thing you resolve THROUGH. So the leg carries a pointer as
+well, and that is the supported way to read a leg's results:
+
+```json
+{ "schema": "utest-leg-pointer-v1", "leg": "tcg-2cpu",
+  "run_id": "20260731T104512Z-4711-9f2c1a0b",
+  "record": "test-runs/20260731T104512Z-4711-9f2c1a0b",
+  "marker": "record-complete.json" }
+```
+
+The pointer is replaced by ONE rename per completed run, and it is never a
+member of the cleared alias set. It therefore always names a **complete,
+immutable, marker-committed** record: the only two states a reader can observe
+are the previous generation and the new one, both internally coherent, and
+there is no window in which the leg resolves to nothing.
+
+Publication is not atomic ACROSS the pointer and the aliases, and the
+asymmetry is deliberate in both directions:
+
+- **Alias set torn or unpublishable -> the pointer does not move.** It stays on
+  the last wholly-published generation and the run is failed.
+- **Aliases published, then the pointer fails to advance -> the aliases are
+  AHEAD of the pointer**, and the run is failed. They are not rolled back:
+  rolling back would delete a valid new generation's documents to match an
+  older pointer, and the rollback can fail too. **The pointer is authoritative**
+  -- a consumer resolving through it reads the older generation and is correct
+  to; only alias-enumerating consumers see the newer one.
+
+The pointer is deliberately minimal. `record-complete.json` is the
+authoritative statement of what a record holds, so the pointer restates none
+of it. `record` is emitted purely as a convenience, and a consumer must
+**derive** the path from the validated `run_id` rather than trust it (see step
+2 below) -- the two agree in everything this script writes, but a consumer
+validates what it reads, not what the writer intended.
+
+**Resolution algorithm (fail-closed; never fall back to the aliases):**
+
+1. Read `build/test-results-<leg>.run`. Absent -> that leg has no completed
+   run: **stop**.
+2. **Validate the pointer before it can name anything.** Reject unless it
+   parses as JSON with NO duplicate keys and carries exactly
+   `{schema, leg, run_id, record, marker}` with `schema ==
+   "utest-leg-pointer-v1"`, `leg` equal to the leg you asked for, `run_id`
+   matching `[A-Za-z0-9._-]+` and not beginning with `.`, `record ==
+   "test-runs/<run_id>"`, and `marker == "record-complete.json"`. Then resolve
+   the record as `build/test-runs/<run_id>` -- **built from the validated
+   `run_id`**, never from the `record` string -- so a malformed or
+   version-skewed pointer cannot redirect you outside `build/test-runs/`.
+3. Read `<record>/record-complete.json`. Absent, unparseable, `schema !=
+   utest-run-record-v1`, `run_id` not equal to the pointer's, or `status !=
+   complete` -> re-read the pointer ONCE (a concurrent run may have advanced it
+   mid-resolution) and retry from step 2. Still bad -> report the generation
+   unavailable or corrupt: **stop**.
+   **Then bind the record to the leg you asked for**, because nothing so far
+   has. Steps 1-3 prove the pointer is well-formed *for that leg's filename*
+   and that the record it names exists and is committed complete -- they never
+   ask whether that record was PRODUCED by that leg, so a pointer holding leg
+   `<A>`'s exact document while naming a completed run of leg `<B>` satisfies
+   every one of them, and you would read `<B>`'s results believing them to be
+   `<A>`'s. Reject unless the marker carries `identity ==
+   "test-run-identity.json"` (the marker is the record's inventory, and
+   `identity` is legitimately `null` for a record that has none -- such a
+   record cannot be bound, and a `test-run-identity.json` the marker does not
+   name is not part of the record), and that document parses as
+   `utest-run-identity-v1` with NO duplicate keys, `run_id` equal to the
+   pointer's, and `leg` equal to the leg you asked for. Anything else ->
+   report the generation unavailable: **stop**. Do not fall back to the
+   aliases, and do not resolve to the record anyway -- silently reading
+   another leg's results is the failure this check exists to make impossible.
+
+   **The identity document's LAYOUT is part of its contract, exactly as the
+   lease document's is** (see "Step 2b" below for the same rule and the same
+   reason). `utest_pointer_pin_id` validates it positionally -- fourteen lines,
+   `{` and `}` alone at the ends, these twelve keys in this order, two-space
+   indented, the first eleven carrying a trailing comma and `ci_parity`
+   carrying none (it is the last member, so a comma there would not be JSON at
+   all), `cpus` an unquoted JSON integer and `ci_parity` an unquoted boolean:
+
+   ```json
+   {
+     "schema": "utest-run-identity-v1",
+     "run_id": "20260731T104512Z-4711-9f2c1a0b",
+     "timestamp": "2026-07-31T10:45:12Z",
+     "commit": "9f2c1a0b",
+     "leg": "wsl2-tcg-2cpu",
+     "leg_source": "derived",
+     "host": "wsl2",
+     "hostname": "devbox",
+     "accel": "tcg",
+     "cpus": 2,
+     "qemu": "qemu-system-x86_64",
+     "ci_parity": false
+   }
+   ```
+
+   A consumer may parse it however it likes, but it must not treat a
+   semantically-equal document in a DIFFERENT shape as resolvable: retention
+   would not pin such a record, so the generation it names can be pruned out
+   from under the reader and a lease over it is refused. The producer emits
+   only this shape; anything else came from somewhere else.
+4. **Open** the documents the marker NAMES -- and take the names from the
+   MARKER, not from your own assumptions -- out of the record directory, not
+   out of the aliases, opening both before processing either. The payload
+   documents and the marker are never rewritten, so once you hold the
+   descriptors the pair you read is one run's no matter how many runs publish
+   while you read. (`leases/` inside the record is the one exception and is an
+   explicitly mutable control namespace -- see below. Nothing the marker names
+   ever lives in it.)
+   **The marker's `xml` and `json` fields are independently nullable**: `XML=1`
+   and `JSON=1` are separate switches, so `null` means "this run did not carry
+   that format" and is not an error -- a resolver that demands both rejects
+   valid single-format generations. A non-null value must be a **contained
+   basename** (no `/`, not `.` or `..`, not absolute); reject anything else
+   rather than joining it, or a corrupted marker walks you straight out of the
+   record you just validated.
+5. If any open fails with `ENOENT`, go back to step 1, up to a small fixed
+   number of restarts (3 is plenty). Do not treat it as an error before the
+   bound is exhausted, do not retry forever, and do not reach for the aliases.
+   **This is the fallback for an UNLEASED reader.** A reader that took a lease
+   in step 2b has already been promised the record will not be removed, so an
+   `ENOENT` there is a defect rather than a race and should be reported, not
+   retried.
+
+Step 4 is what makes the whole thing work, and step 3's "never fall back" is
+what keeps it honest: falling back to `build/test-results-<leg>.{xml,json}`
+after a failed resolution would silently hand back a different generation --
+the exact mixed-generation read the pointer exists to prevent.
+
+**What step 5 is for, and why it is BOUNDED.** Immutability protects the bytes
+behind a descriptor you already hold; it does not protect a record you have
+merely *resolved*. In the window between reading the pointer and opening the
+documents, the leg can publish a new generation -- which unpins the one you
+resolved -- and a later prune can then remove it once it falls past the
+retention cutoff. That is the one race the pointer does not close on the writer
+side, and no rename scheme can: it is a lifetime question, not an atomicity
+one. Restarting usually wins immediately, because the record the current
+pointer names is normally pinned -- but "usually" is the honest word and a
+retry loop must not be written as though it were "always". Two things break the
+guarantee: a leg outside the `UTEST_POINTER_PIN_MAX` ranking is not pinned at
+all, and sustained publish-then-prune traffic can invalidate each successive
+resolution in turn. Hence a finite bound and an honest "generation
+unavailable" -- for a reader that did not take a lease.
+
+### Step 2b: taking a reader lease (`<record>/leases/`)
+
+A retry loop is no answer for a reader that cannot restart -- a one-shot CI
+step, a pipeline reading over a mount. Such a reader takes a **lease** on the
+generation it resolved, and retention then may not remove that record while the
+lease is live:
+
+**One line, and the line breaks are not cosmetic.** The validator regenerates
+this document from the fields it reads and compares it byte for byte, so a
+consumer that copies a prettified version writes a lease the next prune treats
+as malformed and removes -- silently losing the protection it thinks it has.
+This is the exact byte sequence, wrapped here only by your viewer:
+
+```json
+{ "schema": "utest-reader-lease-v1", "run_id": "20260731T104512Z-4711-9f2c1a0b", "holder": "4711.81368387.4026531836.07fa53da-a126-427f-a676-abe29dee42c9", "lease_id": "44ba3df21fd76d24", "acquired_at": 1785549033, "expires_at": 1785549333 }
+```
+
+**Ordering is the whole mechanism, and the obvious construction does not work.**
+Writing a lease and then re-checking the record only NARROWS the window: a prune
+can classify the record as unleased, you can publish your lease and verify it,
+and the prune can then remove the record it had already decided to remove.
+Nothing in that sequence establishes a happens-before. So acquisition runs under
+one mutex, `build/.test-retention.lock`, which `utest_prune_records` also holds
+for its entire body. Take it exclusively (`flock`), then:
+
+1. Resolve the pointer as in steps 1-3, binding included. A lease is a durable
+   hold, so acquiring one over an unbound pointer would make a cross-leg
+   mis-resolution permanent rather than momentary; `utest_lease_acquire`
+   refuses on exactly the check retention pins on.
+2. If `<record>/leases/` is absent, **refuse** -- the record is gone or was never
+   completed. Never create it: retention counts directories, so a resurrected
+   leases-only skeleton would take a slot in the newest-`UTEST_RECORD_KEEP` set
+   and push a complete record past the cutoff.
+3. Count the records already holding a live lease. At `UTEST_LEASE_MAX` (8),
+   **refuse explicitly** and use the unleased fallback -- a lease that can be
+   revoked without telling its holder is not a lease, so the cap is enforced
+   here rather than by discarding grants later.
+4. Write the document above to `<record>/leases/<holder>.<lease_id>.lease` by
+   staging a sibling and `mv -fT`. `holder` is
+   `<pid>.<starttime>.<pid_ns_inode>.<boot_id>` -- all four, because a pid means
+   nothing outside its PID namespace and a start time means nothing outside its
+   boot. `lease_id` is a fresh nonce **per acquisition, not per process**: the
+   pathname must identify the acquisition, or two overlapping reads in one
+   process share a filename and the first release unlinks the second's grant.
+   Both timestamps must be JSON integers (no leading zeros) of at most 12
+   digits; a lease that is not is treated as malformed and swept.
+5. Re-check that the record and its marker are still present. Under the lock a
+   prune cannot have run inside this sequence, so absence means one completed
+   *before* you took the lock: unlink your lease and refuse.
+6. Release the lock, then open both documents. Every later prune must take the
+   same lock to run at all, so the lease is already visible to it -- which is
+   why the lock is held for microseconds and never for the length of a read.
+7. `unlink` your own lease when done. No lock is needed: a prune either counted
+   it (and keeps the record one more pass) or finds it gone and treats the
+   record as unleased, which is exactly what releasing means.
+
+**A lease is bounded in three independent ways, because it must not turn
+`UTEST_RECORD_KEEP` back into a suggestion.** It expires at
+`UTEST_LEASE_TTL` (300s, normalised into 1..86400) after `acquired_at` -- the
+pruner applies that ceiling itself rather than trusting `expires_at`, since a
+bound only the writer enforces is not a bound. An `acquired_at` in the FUTURE is
+resolved by the holder's LIVENESS, because neither obvious answer is safe:
+clamping it forward on each pass recomputes the deadline from a moving origin
+and renews the lease forever, while deleting it outright revokes a valid lease
+after an NTP correction or a VM restore -- mid-read, which is the one thing the
+lease promises will not happen. A future-dated lease whose holder is provably
+LIVE is honoured; one whose holder cannot be observed is swept. The pruner also
+samples its clock only after taking the mutex, so a lease published by an
+acquirer while the pruner was waiting is never mistaken for a future one. A holder that is *provably* gone (readable `/proc`, matching PID
+namespace, matching boot id, and the pid absent or carrying a different start
+time) is reclaimed before the TTL; every failure to *observe* is treated as
+UNKNOWN and waits out the TTL instead, because a wrong "dead" verdict deletes a
+record a live reader is using. **The rule is that only positive, readable evidence yields a verdict; anything
+else is UNKNOWN.** Concretely that covers: no `/proc`; an unreadable or
+unparseable `stat`; an unreadable boot id or PID-namespace id; a holder whose
+own fields do not parse; a holder from a **different PID namespace** (a
+container sharing `build/` records a namespace-local pid, commonly 1, and
+reading that against the host's `/proc/1` would find a different start time and
+conclude the reader had died); a holder carrying a **degraded sentinel**
+(`start=0` or `ns=0`, written when the acquirer could not observe its own
+identity -- comparing an absence against a real value is how "I could not see"
+becomes "it was recycled"); and an absent pid under a procfs that is **hiding
+processes** (`hidepid=2` makes another user's live process invisible, and a
+plain existence test cannot tell that from the process being gone -- so absence
+is only taken as evidence when `/proc/1` is visible, which is exactly the
+question "would this procfs have shown it to me?"). And the count of
+leased records is capped at acquisition by `UTEST_LEASE_MAX` (8, normalised into
+0..10000, where 0 disables leases outright -- the same shape as
+`UTEST_POINTER_PIN_MAX`). The lease is meant to cover
+resolve-to-open, which is milliseconds; the TTL is a leak-catcher, not a working
+lifetime.
+
+**What it does not do.** Byte-validating a lease against the canonical document
+proves its GRAMMAR, never its provenance -- anything running as this user can
+write a well-formed lease, exactly as it can write a pointer. The cap and the
+TTL are what make that harmless. On a host with no `flock`, the mutex is
+unavailable, leases degrade to cooperative best-effort, and the step 5 fallback
+stays load-bearing.
+
+Retention understands the pointer. `utest_prune_records` keeps the newest
+`UTEST_RECORD_KEEP` (20) records and additionally **pins** the record a live
+pointer resolves to, so the documented path does not dangle after twenty
+unrelated runs of another leg. The pin is bounded by `UTEST_POINTER_PIN_MAX`
+(the 64 most recently published pointers that actually validate -- the whole
+contract of step 2 plus the marker and the leg binding of step 3) because
+`UTEST_LEG` can mint unboundedly many distinct leg names, and an unconditional
+exemption would nullify the disk bound. **Only pointers inside that ranking are
+protected:** past 64 live legs, the least recently published leg's current
+record is an ordinary age candidate, and resolution for that leg can become
+unavailable -- which is why step 5 is bounded rather than infinite.
+`UTEST_POINTER_PIN_MAX=0` disables pinning outright. The marker in step 3 is
+checked against its CANONICAL LAYOUT for that purpose -- the exact ten-line,
+eight-key document `scripts/test.sh` writes, with each field bound to its own
+contract -- so a hand-written marker carrying every required token at nested or
+reordered keys wins no pin even though it satisfied the older substring tests.
+That strictness is deliberately one-sided: a pin protects a record against
+retention, and protecting a generation no compliant consumer could resolve is
+the wasted budget the validation exists to prevent. Step 3's own reader contract
+is unchanged -- consumers parse the marker, they do not byte-match it. The
+identity document is validated the same way and to the same depth: all twelve
+keys are bound to their own grammars (an ISO timestamp, a hex commit, closed
+enumerations for `leg_source` and `accel`, a non-zero JSON integer for `cpus`, a
+bare boolean for `ci_parity`), rather than the nine of them that used to be
+accepted as "any scalar". Any pointer left naming an
+absent record -- pruned past the cap, or removed by hand -- is deleted by the
+same pass, so a consumer sees "no pointer" rather than "a pointer to nothing".
+
+Two exceptions to that deletion, and both are cases where "absent" is not a
+fact the pass established. **A pointer the pass could not READ is preserved,
+not swept.** The extraction distinguishes a document carrying no `run_id` from
+a read that never completed -- a killed reader, a transient EIO, an unreadable
+regular file -- and only the first authorises the unlink; the second leaves the
+pointer exactly where it is. **A pointer whose record is held in a prune claim
+is likewise preserved**, because such a record's canonical directory is
+legitimately absent while the claim holds it, and sweeping the pointer would
+mean the record returns with neither pointer nor pin for the next age cut to
+take.
+
+The pin pass is also bounded in TIME, because validating a pointer reads
+documents and the whole pass holds the retention mutex that a reader waits ten
+seconds for. `UTEST_POINTER_PIN_BUDGET` (8 seconds, normalised into 3..86400)
+covers the enumeration of `build/`, the sort, and every validation together, and
+the candidate set is separately bounded at four times `UTEST_POINTER_PIN_MAX`.
+The floor is the OPERATION COUNT: a validation makes three bounded reads -- one
+per document, since each is now read from a single snapshot rather than a size
+probe plus a read -- so below three seconds no candidate could ever be started
+and the knob would silently switch retention off instead of making it quick.
+**When any of those bounds is reached, the pass says so and DEFERS the age cut
+entirely** -- it keeps every record rather than deleting one whose pointer it
+never examined, because candidates are ranked newest-first and a truncated pass
+cannot know that what it did not reach was unprotected. Retention then simply
+happens on a later run, which is the same direction a lock timeout already
+takes. A `build/` that keeps triggering this needs attention rather than
+patience: `UTEST_POINTER_PIN_MAX=0` prunes without pinning at all.
+
+**The candidate bound is the one that CONVERGES rather than merely deferring.**
+Every other reason above is transient and clears itself on a later pass, but an
+oversized pointer namespace is a steady state: more than four times
+`UTEST_POINTER_PIN_MAX` pointer files means every later pass is truncated too,
+so the age cut would never run again and records would accumulate without bound
+until an operator intervened. So a pass that hits it removes the
+least-recently-published pointers -- oldest first, bounded per pass, and
+ANNOUNCED with a count -- until the namespace fits, and retention resumes on its
+own. This deliberately overturns the sweep's usual weakness (it otherwise
+removes only what does not resolve, because deleting a pointer destroys
+something a human may have put there): when the bound is on the COUNT, a valid
+pointer is as much of a problem as an invalid one. The trade is stated rather
+than hidden -- the deferral it replaces loses records permanently and silently,
+while this loses the least recently published pointers, says so, and is undone
+by re-running that leg.
+
+Retention also honours reader leases, and the two exemptions answer different
+questions: the pin protects the record the CURRENT pointer names, the lease
+protects one a reader has ALREADY resolved and therefore survives the leg
+publishing again. The same pass reclaims every lease that is malformed, past its
+TTL ceiling, or whose holder is provably gone, in every record rather than only
+in the age candidates -- otherwise `leases/` would only ever grow. **The
+worst-case directory size is therefore `UTEST_RECORD_KEEP` +
+`UTEST_POINTER_PIN_MAX` + `UTEST_LEASE_MAX` records** (20 + 64 + 8 by default,
+less any overlap), not `UTEST_RECORD_KEEP` alone. Those three are the CAPPED
+holds. That sum is the STEADY state, not an instantaneous ceiling: the age cut
+attempts at most `UTEST_AGE_BUDGET` records per pass, so a corpus that grew
+faster than one run can reclaim sits above the sum until later passes drain it.
+Each pass takes the OLDEST candidates first, so the backlog shrinks
+monotonically rather than being reshuffled. Four further holds are uncapped by design and sit outside that sum: an
+unresolved sweep claim, a directory at a lease or lease-staging name, a record
+whose lease census could not be completed, and a record still held in an
+unresolved PRUNE claim. Each is fail-closed -- the
+pass could not establish that the record is free, so it keeps it and says so on
+stdout -- and each is therefore bounded by how many such records exist rather
+than by a knob. The lease census carries a PER-RECORD bound
+(`UTEST_CENSUS_BUDGET`, 8 seconds, floored at 1) rather than a per-pass one, so
+one record with many slow lease documents can no longer hold the retention mutex
+for as long as it takes -- and, equally deliberately, cannot consume a budget
+that later records would need. A per-pass deadline was rejected precisely
+because records are censused newest-first, so exhausting it would leave the
+OLDEST records unclassified on every pass, which are the ones the disk bound
+most needs reclaimed. A `build/` accumulating them is reporting a real problem
+(a stalled mount, or something writing directories where files belong), not
+drifting quietly. `UTEST_LEASE_MAX=0` disables
+leases outright. Should a non-conforming reader exceed the cap anyway, the
+newest `UTEST_LEASE_MAX` leased records are held and the pruner SAYS how many it
+did not hold -- a disk bound that silently discarded grants would be the same
+mistake the pin came close to making. If a reader holds the retention lock when
+a run starts, that run skips retention and says so rather than deleting records
+it cannot safely classify; `flock` releases on process death, so a wedged reader
+bounds itself.
+
+**An aged record is destroyed through a DETACHED object, never through its
+published name.** Classification and destruction are two loops, so a writer that
+takes no retention mutex -- which is by definition the writer of a blocking
+directory -- could appear between them and be removed recursively by a run that
+had already announced such things are never removed. Re-asking the question
+immediately before the delete narrowed that window to a syscall pair; it did not
+close it. So the age cut now claims a private staging wrapper under
+`build/test-runs/` with an atomic `mkdir`, renames the record inside it under its
+own unchanged name, re-takes the fail-closed holds on the detached directory, and
+destroys only what it proved free of blockers. If a hold fires, the record is
+restored WHOLE -- atomic `mkdir` on the published name, then the rename, so a
+record published there meanwhile is never replaced and a writer that landed
+entries in the destination makes the rename refuse rather than clobber.
+
+A prune killed between the detach and the verdict leaves the record under the
+staging name, so the next pass reaps those claims BEFORE it does anything else:
+it restores what it can identify, and REPORTS and KEEPS what it cannot. Nothing
+ever deletes a claim's contents -- the reap only restores or `rmdir`s, for the
+reason the lease-level sweep reaper does: a glob-and-delete reap would turn every
+preserved record into a delayed wrongful delete one pass later.
+
+One residual is stated rather than closed: a process holding a directory
+descriptor or working directory inside the record across the rename can still
+create entries through that handle after the recheck. No rename closes that, so
+the guarantee is **pathname replacement**, not mutation-freedom; closing it would
+require every writer to participate in the retention mutex, which is exactly what
+a non-conforming writer does not do.
+
+Both formats go through that one path. An alias that cannot be written fails
+the run rather than going silently missing, and finalization happens before
+the final verdict precisely so that failure can still change the exit code.
+
+**A directory that merely exists is not a completed record.** It is created
+before the run does anything, so a death can leave it holding only an identity
+file or one of two requested formats. `record-complete.json` is written LAST
+and names exactly which documents the record contains; check it before
+trusting any of them:
+
+```json
+{
+  "schema": "utest-run-record-v1",
+  "run_id": "...",
+  "status": "complete",
+  "qemu_pid": 12345,
+  "qemu_state": "reaped",
+  "xml": "test-results.xml",
+  "json": "test-results.json",
+  "identity": "test-run-identity.json"
+}
+```
+
+That is the LAYOUT as written, not a pretty-printing of it: retention validates a
+marker against these exact ten lines before letting it pin a record, so a
+reformatted document with the same field set wins no pin. Consumers are
+unaffected -- step 3 above parses the marker and has never byte-matched it.
+
+`status` is `complete` once both formats have had their chance to assemble;
+an exit before that point records `incomplete`, and an absent marker means the
+run never reached its own cleanup. `status` describes the RECORD, not the
+verdict -- a run whose tests failed still leaves a complete record. A format
+the run did not produce is `null` rather than missing. A marker that cannot be
+written fails the run: a green exit over an uncommitted record would be the
+same false-green this lifecycle exists to close.
+
+`qemu_pid` names the VM this run launched (`null` for an exit that never
+reached the launch) and `qemu_state` says what became of it: `none` (never
+launched), `running`, `reaped` (confirmed gone), or `unreaped` (it survived
+both a `SIGTERM` and a `SIGKILL`). The pair is what lets a later invocation
+tell "exited cleanly" from "died with a live VM". `status` alone cannot:
+finalization runs BEFORE the final verdict, so the VM is reaped inside
+finalization -- ahead of the marker -- precisely so `qemu_state` is a fact at
+the time the marker claims it rather than a prediction the cleanup trap has yet
+to fulfil.
+
+The pid is ALSO written to `build/test-runs/<run_id>/qemu.pid` at launch time,
+as `<pid> <starttime> <boot_id> <run_id>`. That copy exists because a `SIGKILL`
+prevents any marker from ever being written, which is exactly the case an
+orphan investigation cares about; see
+[Orphaned-QEMU recovery](#orphaned-qemu-recovery) below.
+
+The two alias kinds mean DIFFERENT things and only one is "current".
+
+The canonical unsuffixed pair names **this invocation**. It is cleared in Step
+0a ahead of every exit path, so no preflight exit -- one occurring before the
+leg is even derivable -- can leave a stale document under it, and an
+incomplete run publishes its refusal there and nowhere else.
+
+The leg-suffixed pair accumulates one per configuration and means **the latest
+COMPLETED run of that leg**. No leg alias is cleared up front -- not another
+configuration's, and not even the running leg's own -- because clearing it
+would erase a perfectly good completed artifact on behalf of a run that might
+then die. A leg alias is only ever REPLACED, and only from a record whose
+marker says `complete`. A matrix that runs several legs in sequence therefore
+finds every leg readable at the end, and an aborted leg leaves the previous
+completed one in place rather than overwriting it with a refusal.
+
+The leg set always describes **exactly one run**. At finalization any format
+the current record does not carry is dropped from the set, and it is dropped
+BEFORE the formats it does carry are published: otherwise a run producing only
+XML would leave its new XML beside a previous commit's JSON, and a reader
+landing mid-publication would see that same pair. In this order a reader sees
+the previous generation, a missing file, or the new generation, never two
+generations paired.
+
+A reader that already holds an open descriptor keeps reading its bytes
+regardless; no rename-or-pointer scheme can revoke that. **For a
+generation-coherent view, resolve through the record directory and its
+marker**, not by enumerating the leg pathnames; that is what the record is
+for. `build/test-results-<leg>.run` is the one file that names it -- see
+"Resolving one leg's documents" above for the resolution algorithm.
+
+Records are durable but BOUNDED: the newest `UTEST_RECORD_KEEP` (default 20)
+survive, pruned at the START of a run so an investigation's evidence is never
+removed by the run still writing it -- plus any record a live per-leg pointer
+resolves to, bounded by `UTEST_POINTER_PIN_MAX` (default 64), plus any record a
+reader still holds a lease on, bounded by `UTEST_LEASE_MAX` (default 8). The pin
+pass is bounded in time as well by `UTEST_POINTER_PIN_BUDGET` (default 8s), and
+reaching that bound -- or finding more than `4 * UTEST_POINTER_PIN_MAX`
+candidate pointers -- defers the age cut for that run rather than pruning on an
+incomplete picture.
+
+`scripts/test.sh` derives identity before the build and writes it to the
+record, aliased to `build/test-run-identity.json` (`utest-run-identity-v1`),
+which the harvester reads via `--identity`:
+
+Every field below is emitted by BOTH projections, and a tooling assertion
+compares the two field sets so one cannot gain a field the other lacks.
+`timestamp` and `hostname` ride as `<testsuite>` attributes rather than
+properties; everything else is a `<property>`.
+
+| Field | Source |
+|---|---|
+| `schema` | `utest-run-identity-v1`, the identity contract's own version marker |
+| `run_id` | the record directory name: UTC timestamp, pid, and random suffix |
+| `timestamp` | `date -u` at Step 0a, when the run started, ISO-8601 with `Z` |
+| `commit` | `git rev-parse HEAD`, `-dirty` appended when tracked files differ |
+| `leg` | `<host>-<accel>-<n>cpu`, plus `-ciparity` and any validated `UTEST_LEG` label |
+| `leg_source` | `derived`, or `derived+override` when `UTEST_LEG` added a label |
+| `host` | `wsl2` when WSL is detected, else lowercased `uname -s`, charset-filtered |
+| `hostname` | `uname -n`, charset-filtered |
+| `accel` | read back from the arguments QEMU receives, never from display text |
+| `cpus` | `SMP_CPUS`, the same variable behind the `-smp` flag |
+| `qemu` | basename of the QEMU binary actually invoked, charset-filtered |
+| `ci_parity` | whether `CI_PARITY=1` selected the distro QEMU and forced TCG |
+
+`UTEST_LEG` may only ADD a label. `scripts/test.sh` can select KVM or TCG and
+nothing else, so an override that renamed a leg to `whpx`, `vbox` or
+`baremetal` would publish coverage nothing executed; the derived accelerator
+and CPU count stay in the name and in their own fields regardless, and the
+provenance is recorded. A label that does not match `^[a-z0-9][a-z0-9-]{0,31}$`
+-- the FIRST character must be alphanumeric, so a leading hyphen is refused --
+is rejected rather than ignored, because the value lands in a filename.
+
+Publication is fail-closed at both ends. The canonical pair is invalidated
+before anything in the run can fail -- including the argument check above --
+and an EXIT/INT/TERM trap armed before the environment preflight publishes an
+identity-bearing refusal (`summary_error: "run_incomplete"`, and in XML
+`errors="1"` with `aborted`/`not_run` present so a current refusal is never
+read as an artifact predating the completeness dimension) for any exit that
+never reached assembly. A signalled run carries `128+signo`, never 0. A failed or interrupted run therefore leaves a document that names
+itself, never the previous run's success sitting where CI would upload it as
+current.
+
+**Concurrent same-tree runs are NOT a supported mode, and the refusal is
+explicit.** `scripts/test.sh` takes an exclusive `flock` on
+`build/.test-run.lock` and exits 1 if another run holds it. This is a
+DECISION, not a limitation waiting to be lifted: the script patches the shared
+`boot.conf`, boots with a fixed `build/test.log` serial sink, and copies OVMF
+vars to one fixed path, so two overlapping runs corrupt each other's BOOT
+state long before their artifacts could collide. Per-run records make
+concurrent runs non-colliding without making them meaningful; supporting them
+for real means per-invocation `boot.conf`, serial log and OVMF paths, which is
+a much larger change than the artifacts and one nothing has asked for. The
+leg-suffixed aliases separate CONFIGURATIONS run one after another, not
+simultaneous runs.
+
+Two details make the refusal safe. The lock is taken BEFORE the artifact
+lifecycle is armed, so a refusing run touches no shared name and publishes no
+document -- acquiring it after the canonical clear would delete the artifacts
+of the run it is deferring to. And QEMU is launched with the lock descriptor
+closed (`9>&-`): `SIGKILL` bypasses the cleanup trap, and an inherited
+descriptor would let an orphaned VM hold the lock and wedge every later run.
+An orphaned QEMU still owning the shared `boot.conf` after a `SIGKILL` is a
+pre-existing hazard the lock neither creates nor closes; it is tracked
+separately. If `flock` is unavailable the run says so and proceeds rather than
+failing a lone run that would have been fine.
+
+The artifact is a GATE, not a convenience. A stream that does not agree with
+its own summary must fail the run rather than publish a smaller plausible
+result. Every refusal reason it can emit:
+
+| `summary_error`             | Meaning                                                            |
+|-----------------------------|--------------------------------------------------------------------|
+| `missing_stream`            | `JSON=1` was requested and no `[UTEST-JSON]` record reached serial  |
+| `malformed_record`          | a record is not parseable JSON, or is not an object                 |
+| `producer_overflow`         | the launcher published its own overflow marker instead of a record  |
+| `unknown_record_kind`       | a record carries a `record_kind` this assembler does not know       |
+| `missing_summary`           | records reached serial but the summary did not -- stream truncated  |
+| `duplicate_summary`         | more than one summary record                                        |
+| `missing_report`            | no `run_report` record -- the assertion dimension is absent         |
+| `duplicate_run_report`      | more than one `run_report` record                                   |
+| `missing_completeness`      | no `run_meta`, or its `aborted`/`not_run` are not a bool/int        |
+| `duplicate_run_meta`        | more than one `run_meta` record                                     |
+| `records_after_summary`     | the stream does not end `run_report`, `summary`, `run_meta`         |
+| `malformed_summary`         | the summary is not an object                                        |
+| `malformed_report`          | a `run_report` counter, or a value in a binary record's assertion triple, is not a non-negative integer |
+| `unknown_status`            | a binary record carries a status outside `PASS`/`FAIL`/`SKIP`/`ERROR` |
+| `missing_errors`            | the summary carries no usable `errors` count -- absent is a refusal, never read as zero |
+| `count_mismatch`            | binary count, per-status counts, skip-record count, the `ERROR` record count vs `summary.errors`, `errors` exceeding either `failed` or `binaries_unreported`, the number of records carrying an assertion triple vs `binaries_reported`, or those triples' sums vs the `run_report` totals, disagree with the summary |
+| `error_self_report`         | a never-ran (`ERROR`) binary record carries `asserts_passed`/`asserts_failed`/`skip_blocks` -- a shape the producer cannot emit, since a binary that never ran submitted no report |
+| `partial_report`            | a binary record carries some but not all of `asserts_passed`/`asserts_failed`/`skip_blocks` -- the launcher writes the three as one block, so a partial triple cannot be summed |
+| `report_partition_mismatch` | `binaries_reported + binaries_invalid + binaries_unreported` does not equal `summary.total`, although the launcher increments exactly one of them per binary |
+| `inconsistent_completeness` | a not-aborted run nevertheless reports binaries as not run          |
+| `no_python3`                | written by `scripts/test.sh` when the assembler cannot run at all   |
+| `run_incomplete`            | written by `scripts/test.sh` when a run that OWED a JSON artifact ended before assembly (early exit, signal, or a format that never published) |
+
+On refusal it writes an explicit error envelope -- `"summary": null` plus a
+`summary_error` reason and `detail` -- and exits nonzero, so `test.sh` fails
+the run. `summary` is null rather than zero-filled on purpose: a consumer
+keying on the summary must be unable to read a refused artifact as a clean
+run that happened to have no tests. The same stance applies when `JSON=1`
+was requested and no stream reached serial at all (`missing_stream`).
+
+An empty suite is a valid, publishable state: a run whose filter selects
+zero binaries writes a complete envelope with empty arrays and explicit
+zeros, never a missing file.
+
+### Extraction
+
+The assembled artifact is the intended consumer surface; `jq` over the raw
+serial stream still works for ad-hoc queries:
+
+```sh
+# Did this run actually finish, or did the smoke gate cut it short?
+jq '.summary | {total, aborted, not_run}' build/test-results.json
+
+# Per-binary pass rate. The artifact already separates the record kinds, so
+# there is no discriminator to remember and no way to inflate the count with
+# the synthetic skip-block records. On an ABORTED run this also yields the
+# host `suite-abort` ERROR record, which is deliberate: a walk of
+# `testcases[]` alone must not read a cut-short run as green.
+jq -c '.testcases[] | {name, status, time_ms}' build/test-results.json
+
+# Producer binaries only -- the population summary.total counts:
+jq -c '.testcases[] | select(.record_kind == "binary")
+       | {name, status}' build/test-results.json
+
+# Which binaries skipped work, and how much:
+jq -c '.testcases[] | select((.skip_blocks // 0) > 0)
+       | {name, skip_blocks, asserts_passed}' build/test-results.json
+
+# Every skipped block, grouped under its binary:
+jq -c '.skip_blocks | group_by(.parent)' build/test-results.json
+
+# Trend the honesty signal: silence is not the same as zero skips.
+jq '.summary.reported
+    | {skip_blocks, binaries_unreported, binaries_invalid}' build/test-results.json
+
+# Refused artifact? summary is null and the reason is named:
+jq 'if .summary == null then {refused: .summary_error, detail} else "ok" end' \
+   build/test-results.json
+```
+
+Reading the raw serial stream instead (no artifact, e.g. triaging a run that
+refused to publish) means keying on `record_kind` yourself, and remembering
+that `reported` lives in the separate `run_report` record on the wire:
+
+```sh
+# Per-binary pass-rate from serial. Prefer build/test-results.json: the
+# harvester already learns the frame, binds each terminator to its
+# announcement, reconciles the record count per run, and publishes only the
+# last COMPLETE run. Reading serial directly means doing all of that
+# yourself. If you must, use the same parser rather than a grep:
+python3 scripts/utest-frame.py build/test.log     # {"nonce":..., "ok":true, ...}
+
+# An executable recipe. It emits ONLY the parser-selected run's records: a
+# full-log grep on the learned prefix still merges repeated runs, and an empty
+# prefix (refused stream) degrades it to an unframed search that accepts
+# ring-3 forgeries. A refusal terminates the recipe rather than continuing
+# with partial data:
+python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("f", "scripts/utest-frame.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+r = m.parse_file("build/test.log")
+if not r["ok"]:
+    sys.exit("no complete framed run on serial -- refuse this log")
+marker = r["prefix"] + "[UTEST-JSON] "
+for line in r["lines"]:
+    i = line.find(marker)
+    if i >= 0:
+        print(line[i + len(marker):].strip())
+' | jq -c 'select(.record_kind == "binary") | {name, status}'
+
+# The assertion dimension and the completeness dimension, from their own records:
+grep '\[UTEST-JSON\] {' build/test.log |
+  sed 's/.*\[UTEST-JSON\] //' |
+  jq -c 'select(.record_kind == "run_report" or .record_kind == "run_meta")'
+```
+
+---
+
+## Escaping contract
+
+User-controlled strings (test binary names, reason messages) are
+escaped before emission:
+
+- **XML**: `&`, `<`, `>`, `"`, `'` become `&amp;` / `&lt;` / `&gt;` /
+  `&quot;` / `&apos;`. Control bytes < 0x20 other than TAB/LF/CR are
+  dropped (XML 1.0 forbids them).
+- **JSON**: `"` -> `\"`, `\` -> `\\`, `\n` / `\r` / `\t` -> C-style
+  escapes, any other control byte < 0x20 -> `\u00HH`.
+
+Today's inputs never trigger escaping on the happy path: since the
+charset gate below, an accepted binary name contains no byte either
+escaper rewrites, so N accepted bytes cost N bytes on the wire. The
+escape stays as defense-in-depth for reason strings and for future
+consumers that might let a binary set its own.
+
+---
+
+## Binary name bound and refusal records
+
+### The bound is derived, not chosen
+
+A binary name used to be bounded only by `VFS_MAX_NAME` (256) while
+every record is bounded by `UTEST_RECORD_LINE_MAX` (256, klog's
+message field). A long enough name therefore pushed each emitter onto
+its own overflow fallback -- the XML testcase dropped the name, the
+JSON record substituted `"overflow"`, the TAP point became
+`unrepresentable`, and the human verdict line lost its `: PASS` /
+`: FAIL` token off the end. That last one is what the host's
+fail-closed recount greps for, so the binary silently left the count.
+
+`UTEST_MAX_BINARY_NAME` is the **minimum**, across every name-bearing
+record kind, of `(UTEST_RECORD_LINE_MAX - 1 - fixed_k) / mult_k`:
+
+| Record kind | Name appears | Room left for the name |
+|---|:---:|:---:|
+| Human verdict line | 1x | 196 |
+| `[UTEST-XML] <testcase>` | 1x | 120 |
+| `[UTEST-JSON]` `record_kind:binary` (ran, may report) | 1x | **37** |
+| `[UTEST-JSON]` `record_kind:binary` (never ran) | 1x | 108 |
+| `[UTEST-JSON]` `record_kind:skip_block` | **2x** | **37** |
+| TAP point (skip-record shape) | 1x | 182 |
+| `[UTEST-REPORT]` line | 1x | 160 |
+
+Each `fixed_k` is summed from that kind's own format literals through
+`UTEST_LIT(s)`, so editing a format string moves the bound with it.
+The skip_block binds at **37** because it carries the name twice (as
+`name` and again as `parent`), and the binary record's report-bearing
+shape ties it at 37 -- which is why the derivation takes the minimum
+instead of assuming the twice-carried kind is worst.
+
+The binary record is measured as TWO shapes rather than one. A record
+carries the assertion-report fields only for a binary that submitted a
+valid self-report, and a never-ran `ERROR` submitted none, so the wide
+status token and the report triple can never appear together;
+`u_format_json_testcase` drops the report fields for an ERROR to keep
+that true by construction. Charging one record for both would reserve a
+shape no run can emit and pay for it in filename budget -- the bound
+comes out a byte short, and names that ran yesterday get refused today.
+
+Digit widths come from each
+value's own cap, and `time_ms` is clamped at emit (`u_clamp_time_ms`)
+so its width is a fact rather than an assumption about run length.
+
+`%s: format=%s` is deliberately outside the minimum: no consumer
+parses it, and its second operand is a loader constant rather than
+part of the record contract.
+
+### Accepted charset
+
+`[A-Za-z0-9._-]`. This is what makes the bound provable: both
+escapers are the identity on every accepted byte. The set also
+subsumes the path checks the validator used to make one at a time
+(`\`, `/`, `:`, control bytes) and additionally excludes `#` and
+space, which closes the TAP-directive injection the point formatter
+previously had to defend against on its own.
+
+### A refusal is counted, never dropped
+
+Two outcomes that used to look the same are now distinct:
+
+- **Not a test file.** A readdir entry that is not `test_*.exe` is
+  ignored silently, as before.
+- **Test-shaped but refused.** A manifest entry, or a discovered
+  `test_*.exe`, that fails the length, charset, traversal or
+  embedded-NUL gate is a binary somebody intended to run. It is
+  counted into `total_planned`, never launched, and published through
+  the *existing* record kinds -- so no consumer needs a new shape:
+
+```
+refused_1_test_a_b.exe_9f2c41ab.exe: FAIL (name refused: charset)
+not ok 4 - refused_1_test_a_b.exe_9f2c41ab.exe # name refused: charset
+[UTEST-XML] <testcase name="refused_1_..." classname="correctness" time="0.000"><error message="name refused: charset"/></testcase>
+[UTEST-JSON] {"record_kind":"binary","name":"refused_1_...","type":"correctness","status":"ERROR","time_ms":0,"reason":"name refused: charset"}
+```
+
+**Why the machine artifacts say ERROR and the human channels say FAIL.**
+JUnit's convention is that `<failure>` is an assertion the test failed and
+`<error>` is something that stopped it from running; this pipeline already
+used `<error>` for the structurally identical suite-abort record. A refused
+binary never ran, so it is an `<error>` (and a JSON `status:"ERROR"`), and
+the same applies to a launch whose `task_create` produced no task. The
+human verdict line, the TAP point and the legacy `=== N failed` summary
+keep the FAIL vocabulary they always had, because the host's fail-closed
+recount counts those very lines against that summary -- re-spelling them
+would make the two disagree about a run neither got wrong. `<failure>` is
+now exactly "the binary ran and failed", which is what a dashboard's
+failures column should mean.
+
+The identity is `refused_<ordinal>_<sanitized prefix>_<8 hex>.exe`.
+The raw name never reaches serial, an artifact or a log line. Within
+a run, distinctness comes from the **ordinal** rather than from hash
+strength -- no digest width can guarantee it, and an operator who
+cannot tell two refusals apart cannot act on either. The FNV-1a
+digest covers the entry's exact byte **span**, so it survives an
+embedded NUL and correlates the same bad name across runs. The
+identity ends in `.exe` because the host's recount greps for a `.exe`
+name followed by a verdict token.
+
+**Mapping an identity back to a filename.** The identity deliberately
+never echoes the raw name, and a charset refusal has the very byte that
+caused it rendered `_` in the prefix -- so the digest is the only
+correlator, and `scripts/utest-refusal-id.py` is what computes it:
+
+```bash
+# Which manifest entry produced this identity?
+python3 scripts/utest-refusal-id.py match refused_1_test_a_b.exe_dd94b2b6.exe \
+    --manifest build/system/test-manifest.txt
+# What digest would this candidate name produce?
+python3 scripts/utest-refusal-id.py digest --name 'test_a#b.exe'
+python3 scripts/utest-refusal-id.py digest --hex 746573745f00782e657865   # bytes with a NUL
+```
+
+Which inputs to try, and why the tool takes several: the manifest path
+hashes the entry's exact first-token span (embedded NUL included, comment
+tail and attribute tokens excluded), while the directory-glob path hashes
+the readdir basename. `--manifest` reproduces the first exactly;
+`--names-from`/`--nul-from` cover the second; `--hex` is the canonical
+form for a name carrying a NUL or a control byte, which no argv string
+and no NUL-delimited list can represent. Matching compares the WHOLE
+identity -- digest *and* sanitized prefix -- reports every candidate that
+matches, and exits `4` (AMBIGUOUS) rather than naming one when several do,
+because a 32-bit FNV-1a cannot promise a unique reverse mapping. Exit `0`
+is one match, `3` no match, `2` a usage error.
+
+One identity shape carries no prefix at all: a manifest token whose FIRST
+byte is NUL is refused for the NUL (a NUL anywhere in the span means
+`len != span_len`), and its stored C string is the truncation at that byte
+-- empty -- so the launcher emits `refused_<ordinal>__<digest>.exe`. The
+correlator accepts it and matches on the digest, because refusing it would
+break the embedded-NUL case the tool exists to cover; it prints an explicit
+`NOTE: this identity carries NO prefix` line so a digest-only match is never
+mistaken for a prefix-confirmed one. Pass the span with `--hex`, since no
+argv string can carry the leading NUL.
+
+**Aggregate refusals carry their own identity kind:
+`agg_<label>_<value>.exe`.** The five fail-closed aggregates are not
+refusals of a NAME -- no file produced them -- so there is nothing for the
+correlator to hash back to, and they no longer borrow the refusal shape to
+say so. `match` recognizes them on the leading `agg_` token and reports
+them as aggregates, naming the label and the value, without searching any
+candidate; it exits **5**, which is deliberately neither `0` (something
+matched) nor `3` (something was missing). The recognition is structural, so
+a copy of the tool that predates a newly added aggregate still classifies
+it correctly -- it never mirrors the kernel's list of labels.
+
+```bash
+python3 scripts/utest-refusal-id.py match agg_manifest_bad_unknown.exe
+# -> AGGREGATE ... label 'manifest_bad' ... no correlation attempted   (exit 5)
+```
+
+The grammar is exact, and the correlator enforces all of it -- a shape that
+merely *looks* like an aggregate is a usage error (exit 2), not a record:
+
+```
+identity := "agg_" label "_" value ".exe"
+label    := [A-Za-z0-9._-]+          and must appear in the launcher's table
+value    := "unknown" | "0" | [1-9][0-9]*        ASCII only, no leading zeros,
+                                                 inclusive range 0..4294967295
+```
+
+So `agg_plan_kept_007.exe` (leading zero), `agg_plan_kept_4294967296.exe`
+(past uint32), a value written with non-ASCII decimal digits, and any label
+the table does not carry are all rejected rather than reported. The
+launcher emits canonical ASCII decimal from a `uint32_t`, so each of those
+is corruption, and authenticating one would present a damaged identity as
+genuine launcher output.
+
+The value's **unit lives in the label**, because it is not one semantic
+type across the seven paths:
+
+| Identity | Published when | Value |
+|---|---|---|
+| `agg_plan_pages_<n>.exe` | the enumeration plan could not be allocated | pages **requested** |
+| `agg_plan_kept_<n>.exe` | more entries than one run can enumerate | entries **retained** before the cap |
+| `agg_manifest_kept_<n>.exe` | more malformed manifest entries than can be published individually | refusals **retained** before the cap |
+| `agg_manifest_bad_unknown.exe` | the manifest exists but would not parse | **unknown** -- see below |
+| `agg_glob_kept_<n>.exe` | more glob refusals than can be published individually | refusals **retained** before the cap |
+| `agg_filter_bad_unknown.exe` | the `utest_filter=` value was longer than the 63 bytes boot.conf can carry, so no binary was planned | **unknown** (the loader keeps only the prefix that fits) |
+| `agg_filter_unmatched_<n>.exe` | pattern `<n>` of `utest_filter=` (counting from 1, empty segments included) explicitly matched no binary the plan considered: a misspelled name, or an opt-in binary missing from the image. Selection by default (ordinary binaries planned beside an opt-in name) is not a match | the pattern's **position** |
+
+Whether a kind publishes a number is a COLUMN in the launcher's table, not
+a per-call-site decision, so exactly one value form is emittable per kind.
+`match` reads that table out of the kernel source (the same way it reads
+the manifest cap) and refuses `agg_plan_kept_unknown.exe`,
+`agg_manifest_bad_0.exe`, or any label the table does not contain, rather
+than authenticating a corrupted or ABI-skewed artifact. Run out of the
+tree, where there is no table to consult, it still classifies the identity
+but says the label and form were **not** verified.
+
+A `_kept` number is what SURVIVED, not what was lost: the loss is whatever
+came after the cap bit, which by construction was never counted. And
+`manifest_bad` carries the literal `unknown` rather than a number, because
+a manifest that would not parse leaves the number of lost entries
+underivable -- the older shape published `0` there, which reads as
+"nothing was lost" on the one path where the loss is total.
+
+Until 2026-07-31 these five published through the same
+`refused_<n>_<prefix>_<8hex>.exe` shape with a number in the digest slot,
+which made them indistinguishable from a per-name refusal and let `match`
+in principle name an unrelated candidate whose `fnv1a32` happened to equal
+that number -- a false attribution the all-candidates rule could not catch,
+because the digest genuinely agreed. Every label is asserted at compile
+time to fit the derived name bound, so an aggregate identity never
+truncates and always names which path published it.
+
+Three counters move together with each refusal or an artifact would
+contradict itself: `counters[1]` (failed binaries, with `counters[3]`
+recording the never-ran subset of it), the TAP point,
+and `rt.unreported` -- the JSON harvester requires
+`reported + invalid + unreported == summary.total`, and a refused
+binary submitted no self-report. The caller adds `total_ran`, so
+`not_run = total_planned - total_ran` stays honest.
+
+Refusals are published in a **preflight pass before any binary
+launches**. They are enumeration results, not executions, and emitting
+them inside the two-phase run loop made them hostage to it: refusals
+are correctness-typed, so they landed in the non-smoke phase, which a
+failing smoke binary breaks out of before reaching.
+
+A refusal is counted **regardless of `filter=`**, and a refused
+*manifest* entry is counted **regardless of whether the manifest is
+authoritative**: the filter selects among binaries the launcher can
+identify, and matching it would mean trusting the very bytes the
+refusal rejected.
+
+Refused manifest entries live in their own bounded array
+(`UTEST_MANIFEST_REFUSAL_MAX`, 64) rather than competing with runnable
+entries for slots. That separation is load-bearing: while they shared
+one array, the runnable cap was checked *before* classification and
+stopped parsing, so a malformed entry in the tail of an oversized
+manifest was never examined -- and the "tail runs via glob" fallback
+that was supposed to cover it could not, because a name refused for an
+embedded NUL or an illegal byte may not exist as a directory entry at
+all. Runnable entries no longer have a cap of their own at all: they go
+straight into the enumeration plan (`UTEST_PLAN_MAX`, 256), which is
+the single capacity bounding what one run can enumerate from either
+source. The old 128-entry runnable cap and its glob tail-fallback are
+both gone.
+
+Exhausting the refusal array is itself published as a refusal, through
+the same path as any other (`reason: refusal array full`), rather than
+as a bare diagnostic. Both artifact formats reconcile record *count*
+against the summary total -- the JSON harvester checks the PRODUCER
+record count against `summary.total` separately from the report
+partition, before any host record is appended -- so a counter bumped
+without a record does not merely under-describe the run, it makes the
+whole artifact unparseable. In the published file that same relation is
+stated as `summary.testcase_total`, which counts the host `suite-abort`
+record too.
+
+A refused name discovered from *both* the manifest and the directory is
+published once. That dedup compares names the way the filesystem does:
+`C:` is IXFS, which folds ASCII case, so `test_Bad.exe` and
+`test_bad.exe` are one file. `REFUSE_NUL` entries are excluded from it,
+because their stored string is the truncation at the NUL and no
+filename can contain one. The dedup for *accepted* entries folds case
+the same way, and so does `utest_filter=`: the two must agree, because
+a folded dedup beside a literal filter can suppress a requested binary
+entirely. Filesystem identity does not settle manifest *policy*,
+though -- two case variants of one file that disagree on `type=` or
+`expects_tasks=` are published as a single `manifest duplicate
+conflict` failure and run under neither declaration. A refusal is
+terminal for its identity, so no later variant can revive it; only
+*exact* identities count for that, never the sanitized prefix a glob
+refusal stores.
+
+### Incomplete runs
+
+The launcher enumerates `C:\` exactly once, into an immutable plan, and
+both execution phases iterate that plan -- there is no second directory
+walk. A planned binary that disappears before its turn is published by
+name as a counted `planned binary absent` failure, and if it was a
+smoke binary it aborts the suite like any other smoke non-PASS. The
+completeness reconciliation remains as the net for entries that
+produced no result at all (the tail a smoke abort never reaches): a run
+whose `total_ran` is short of `total_planned` emits
+
+```
+[UTEST-RUN-INCOMPLETE] planned 18 binaries but ran 17 -- 1 planned binary/binaries produced no result
+```
+
+which `scripts/test.sh` counts as a run failure. Previously this
+reconciliation ran only for smoke-aborted runs, so a completed run
+could publish `not_run=0` while quietly having skipped a binary.
+
+---
+
+## Orphaned-QEMU recovery
+
+`scripts/test.sh` reaps its backgrounded QEMU from a cleanup trap. `SIGKILL`
+runs no trap, so a killed wrapper can leave a live VM still holding the shared
+boot state the tree owns -- the patched `boot.conf`, the `build/test.log`
+serial sink, the `build/OVMF_VARS_4M.fd` pflash copy, and
+`build/system-disk.img`. The run lock cannot see that VM: QEMU is launched with
+the lock descriptor closed (`9>&-`), so it holds no lock to contend for.
+
+Three mechanisms close the window, in the order a run meets them.
+
+**1. Parent death reaps the VM, in the kernel.** QEMU is launched through
+[`scripts/pdeathsig.py`](../../scripts/pdeathsig.py), which arms
+`prctl(PR_SET_PDEATHSIG, SIGKILL)` and then `exec`s the real QEMU -- so `$!`
+is still QEMU's own pid and the existing kill/wait path is unchanged. The
+helper takes the expected parent pid and refuses to `exec` at all unless
+`getppid()` matches it BOTH before and after the `prctl`. That is what closes
+the fork-then-prctl race: re-reading `getppid()` after the call alone proves
+nothing, because a parent that died before the FIRST read makes both reads
+agree on the already-reparented value. `test.sh` probes the mechanism with
+`--check` before launching (a set-id target or one carrying file capabilities
+would have PDEATHSIG cleared across the `exec`) and WARNS on the terminal
+rather than silently offering a guarantee it cannot keep.
+
+**2. A live orphan is detected before anything shared is touched.** The check
+runs immediately after the run lock is taken, which is earlier than it looks
+like it needs to be: below that point the script clears the canonical aliases,
+prunes older run records, and REBUILDS `system-disk.img` -- an image the orphan
+holds open as a writable AHCI drive. A refusal at the `boot.conf` patch would
+arrive after the disk had already been rewritten underneath a live VM. A
+refusing run therefore touches no shared name at all, exactly like the
+concurrent-run refusal, and owes no document to anyone.
+
+Ownership is proven by an EXACT open-descriptor match in
+[`scripts/qemu-orphan.py`](../../scripts/qemu-orphan.py), which reads `/proc`
+directly (no `lsof`/`fuser` dependency) and never gates on process name --
+`QEMU_BIN` is caller-supplied and need not contain "qemu". A descriptor whose
+file has been unlinked reads back as `<path> (deleted)`, which is the MAIN case
+rather than an edge case: `test.sh` deletes `build/test.log` before each launch,
+so a previous run's orphan holds precisely a deleted serial sink.
+
+The default on detection is REFUSAL, naming the pid and the path it holds.
+`UTEST_ORPHAN_REAP=1` reaps instead, for an unattended caller where a refusal
+would halt every later gate -- but only a holder whose pid, `starttime` and
+`boot_id` match what `build/.test-qemu.pid` recorded when THIS TREE launched a
+VM. An open descriptor proves a process is using one of our files, not that we
+started it: a `tail -f build/test.log` or a disk-image inspector presents the
+same evidence a leaked VM does, and reaping on that alone would SIGKILL an
+operator's unrelated process unattended. A holder with no recorded provenance is
+named and refused even in reap mode.
+
+Two distinct guarantees are easy to conflate here. Provenance (above) answers
+"is this OUR VM". Identity answers "is this still the SAME process": a pid is a
+reused name, so `qemu-orphan.py reap` pins the target with a pidfd before
+validating anything, re-checks the recorded `starttime` and `boot_id`, and
+re-confirms the process still holds one of this tree's files immediately before
+it signals. Termination is then detected by pidfd readability rather than by
+signal 0, which a zombie still accepts. Failing any check refuses rather than
+signalling on a guess.
+
+**3. The pid is recorded so a later run can attribute one.** See `qemu_pid` /
+`qemu_state` in the [commit marker](#run-identity-and-artifact-paths) above,
+plus `build/test-runs/<run_id>/qemu.pid` written at launch and the shared
+`build/.test-qemu.pid` the next run reads. Neither file is authority to signal;
+they name the run that leaked a VM. A clean run clears the shared pidfile, and
+so does a run that finds nothing holding its files -- a pidfile whose VM is
+already gone is stale by construction.
+
+If the detector itself cannot run, the run REFUSES and prints the detector's own
+error. This is deliberately not the stance taken for a missing `flock`, and the
+difference is what the two silences mean: a missing `flock` is a static property
+of the host guarding a hazard the operator can see, while a detector that ran and
+errored has produced no evidence either way about a hazard that is invisible by
+construction -- an orphan from a `SIGKILL`ed run, holding the `system-disk.img`
+this run is about to rewrite underneath it. Treating "no evidence" as "no orphan"
+is the corruption the guard exists to prevent. `UTEST_ORPHAN_UNCHECKED=1` is the
+separate escape hatch that proceeds anyway, saying loudly that the guarantee is
+absent; it is deliberately not the same switch as `UTEST_ORPHAN_REAP=1`, because
+"reap what you find" and "proceed having found nothing out" are different
+decisions.
+
+---
+
+## Cross-references
+
+- **Launcher implementation:** [src/kernel/test/test_usermode.c](../../src/kernel/test/test_usermode.c)
+- **Orphan detection / reaping:** [scripts/qemu-orphan.py](../../scripts/qemu-orphan.py) -- `/proc` descriptor ownership, identity-checked reap
+- **Parent-death wrapper:** [scripts/pdeathsig.py](../../scripts/pdeathsig.py) -- `PR_SET_PDEATHSIG` + expected-parent verification
+- **Public API:** [include/kernel/test/test_usermode.h](../../include/kernel/test/test_usermode.h)
+- **Governing TODO:** [TODO-04 -- User-Mode Test Framework](../../todo/00-infrastructure/TODO-04-usermode-test-framework.md)
+- **Sibling environment matrix:** [usermode-env-matrix.md](usermode-env-matrix.md)
+- **CI runner:** [scripts/test.sh](../../scripts/test.sh) -- XML post-processor at step 6, JSON at step 6b
+- **JSON assembler:** [scripts/utest-json-harvest.py](../../scripts/utest-json-harvest.py) -- validation rules and refusal reasons

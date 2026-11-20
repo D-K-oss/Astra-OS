@@ -1,0 +1,482 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Impossible OS — Build & Smoke Test
+#
+# Runs on every push to main and on pull requests.
+# Builds the full OS disk image using the project's build.sh wrapper.
+# Normal CI does NOT upload the disk image; a manual workflow_dispatch can opt in
+# when someone explicitly needs the exact built image for debugging.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      upload_disk_image:
+        description: 'Upload build/system-disk.img as a CI artifact'
+        required: false
+        default: false
+        type: boolean
+
+# Every push to main gets its own verdict; only a pull request cancels its
+# superseded runs. Grouping main by ref and cancelling left 16 of 30 runs
+# without a verdict in the 2026-09-28 canary, and a test broken by cae757fbe
+# surfaced only on a later push because its own run was cancelled.
+concurrency:
+  group: build-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  LLVM_VERSION: "19"
+  # Node 20 actions runtime is removed from runners 2026-09-16 (forced to 24
+  # from 2026-06-16). Opt in now so checkout/cache/upload-artifact run on 24.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Compile cache (ccache through scripts/build.sh). The size bound keeps one
+  # saved cache small; the compiler is identified by its version output, since
+  # a runner image reinstalls the same package with a new mtime.
+  CCACHE_MAXSIZE: "400M"
+  CCACHE_COMPILERCHECK: "%compiler% --version"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and test the OS
+    runs-on: ubuntu-26.04
+    # The pinned CI image holds the whole toolchain (scripts/ci/image/Dockerfile);
+    # this job installs nothing, so a package-mirror outage cannot fail it.
+    container:
+      image: ghcr.io/rizonesoft/impossible-os-ci@sha256:d5d684cc6bc2740e127b72c56189f9a424c800041db489844d1939e39b019176
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --init: GitHub makes `tail -f /dev/null` PID 1, which never reaps an orphan.
+      options: --init --user 1001:1001
+    # A runaway backstop, NOT a performance budget -- and it has now been eaten
+    # by suite growth twice. 15 became a live gate on 2026-08-04 (last green
+    # 30864937433 at 14m52s, 8s of margin; run 31056543625 then had `Stale-ABI
+    # fixtures` killed at the wall) and was raised to 25. MEASURED 2026-08-19,
+    # the same wall again: the four newest green jobs ran 23m03s / 21m18s /
+    # 22m54s / 20m21s -- under two minutes of margin at worst -- and runs
+    # 32216947553 and 32222383232 were both killed at exactly 25m1Xs.
+    #
+    # THE KILL IS DISGUISED. GitHub reports a `timeout-minutes` kill with
+    # conclusion `cancelled`, which is indistinguishable in every dashboard
+    # from a benign supersession by the next push -- so this job stopped
+    # producing a verdict for hours without anything looking red.
+    # `scripts/overnight/ci-check.py` calls that shape a completed drought;
+    # that note is the only thing that surfaces it.
+    #
+    # Raised to 40: ~17 minutes of headroom over the worst observed green,
+    # while still failing a hung step long before GHA's 6h default.
+    timeout-minutes: 60
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for build_info.h commit hash
+
+      # ── Verify toolchain matches scripts/setup.sh sentinel contract ─────────
+      # If this fails, the inline apt install above and scripts/setup.sh have
+      # drifted. Fix whichever side is out of sync -- do NOT mask with `|| true`.
+      - name: Verify toolchain sentinels and version floors
+        run: bash scripts/setup.sh --verify
+
+      # ── Style lint (cheap, no build required) ─────────────────────────────
+      # Enforces include-guards, 120-char line length, trailing whitespace,
+      # snake_case function names, and -- most important for drift -- no
+      # numeric-TODO shorthand (TODO-NN sectionN, DNN TNN) outside todo/**.
+      # The legacy-XREF sweep drained the pre-existing allowlist, so any new
+      # drift is now a CI failure instead of a silent warning.
+      - name: Run style lint
+        run: bash scripts/lint.sh
+
+      # AI workflow regression pack (AI Development System roadmap). Checks doctrine presence,
+      # Authority Hierarchy integrity, AGENTS.md file contract, zero-trailer
+      # commit policy, autonomous-agent boundary, skill catalog sync,
+      # index-link integrity, and related surfaces. Runs before the build so
+      # AI-workflow drift is caught at PR time rather than after the user
+      # notices a broken invariant.
+      - name: Run AI workflow regression pack
+        run: bash scripts/test-ai-system.sh --quiet
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      # scripts/build.sh routes clang through ccache when it is installed. The
+      # cache lives in the runner's home, never a root-owned path (unprivileged
+      # tar cannot restore those). A cache-service fault costs a cold compile,
+      # not the job.
+      # The key starts ccache-image-: a cache saved by a job on the hosted runner
+      # stored its paths relative to /home/runner/work/..., so restoring one in the
+      # container wrote to /.cache (2026-11-13). Container saves restore cleanly.
+      - name: Restore compile cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/.cache/ccache
+          key: ccache-image-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-tests-on-${{ github.sha }}
+          restore-keys: |
+            ccache-image-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-tests-on-
+
+      - name: Configure compile cache
+        run: |
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          CCACHE_DIR="$HOME/.cache/ccache" ccache --zero-stats
+
+      - name: Build OS (clean)
+        run: bash scripts/build.sh clean
+
+      # The make graph must stand on its own: raw `make all` in a copy of the
+      # tracked tree with no build/, twice (scripts/test-raw-make.sh says why).
+      - name: Raw make builds a fresh tree
+        run: bash scripts/test-raw-make.sh
+
+      - name: Compile cache statistics
+        if: always()
+        run: ccache --show-stats
+
+      # ── Verify build success ────────────────────────────────────────────────
+      - name: Verify build sentinel
+        run: |
+          LAST_LINE=$(tail -1 build/build.log)
+          echo "Build log last line: $LAST_LINE"
+          if [ "$LAST_LINE" != "=== BUILD OK ===" ]; then
+            echo "::error::Build did not complete successfully"
+            echo "--- Last 30 lines of build.log ---"
+            tail -30 build/build.log
+            exit 1
+          fi
+          echo "✅ Build succeeded"
+
+      # ── Prove the panic-path ownership transitions are single, atomic ───────
+      # Each audited helper must claim a resource AND record its owner in ONE
+      # lock-prefixed compare-exchange, so that an NMI or #MC landing at any
+      # instruction boundary leaves the resource free or attributably owned. No
+      # fixture can see that: a two-step implementation reaches an identical
+      # post-state and no test can schedule the abort. It is checked against the
+      # disassembly of the object that was just built.
+      #
+      # HERE rather than in the tooling pack above, which runs BEFORE the clean
+      # build -- there the object does not exist yet, so the gate could only
+      # ever skip. --required refuses to pass on a missing or stale object, so
+      # this step cannot silently become a no-op the way the skip would.
+      - name: Verify atomic claim transitions (generated object)
+        run: bash tools/atomic-claim-check/check.sh --required
+
+      # ── Verify disk image exists ────────────────────────────────────────────
+      - name: Verify disk image
+        run: |
+          if [ ! -f build/system-disk.img ]; then
+            echo "::error::build/system-disk.img not found"
+            exit 1
+          fi
+          SIZE=$(stat -c%s build/system-disk.img)
+          echo "✅ system-disk.img: $(( SIZE / 1024 / 1024 )) MiB"
+
+      # ── boot_info ABI drift-detection regression ───────────────────────────
+      # Mutates the mirror header into known-broken fixtures and verifies
+      # tools/boot-info-manifest/compare.sh names the expected first-mismatch
+      # field. Depends on build/boot-info-abi.kernel.json emitted by the
+      # Build step above. Guards against a future compare.sh regression
+      # silently letting real ABI drift ship.
+      - name: Run boot_info ABI drift tests
+        run: make test-boot-info-abi
+
+      # ── Unit tests ──────────────────────────────────────────────────────────
+      # GHA ubuntu-latest does not expose /dev/kvm reliably -- test.sh falls
+      # back to TCG. TCG on the shared runner is ~10x slower than KVM, so
+      # the default 60s TIMEOUT is too tight once the suite crosses ~400
+      # registered cases (the desktop UI frame-timing oracle work on
+      # 2026-04-22 landed the 587th suite and pushed the TCG run past
+      # the 60s wall). Bump to 300s; the job-level `timeout-minutes: 15`
+      # still caps runaway runs. Serial output goes to build/test.log,
+      # uploaded on failure below.
+      - name: Run unit tests
+        run: TIMEOUT=300 bash scripts/test.sh QUIET=1
+
+      # LSP-MCP bridge harness (TODO-07 in 00-infrastructure). Host-side
+      # Python tests; do NOT depend on the kernel build but DO need the
+      # mcp SDK (clean SKIP without it) and clangd-19 (installed in the
+      # LLVM apt step above). The runtime regression pack scripts/test-
+      # tooling.sh ABOVE runs the same harness, but listing it as a
+      # standalone step makes a regression here visible at the right
+      # place in the GitHub Actions log instead of buried inside the
+      # tooling pack output. clangd-19 is the only LSP installed in CI;
+      # the other 4 LSPs (asm-lsp, bash-language-server, pyright, pwsh
+      # + PSES) are absent, so per-language sub-tests SKIP cleanly.
+      # Stress sub-test 8a runs against clangd. Boundary test validates
+      # the source audit independently.
+      - name: Run LSP-MCP bridge tests
+        run: |
+          bash scripts/lsp-mcp/tests/test_bridge.sh
+          bash scripts/lsp-mcp/tests/test_boundary.sh
+
+      # Stale-ABI QEMU fixtures: builds one half (bootloader or kernel)
+      # at BOOT_INFO_VERSION - 1, swaps it into a disposable system-disk
+      # copy via mtools, boots QEMU+KVM headless, and asserts the
+      # pre-jump bootloader fatal (SEC_ROLLBACK / ABI MISMATCH) OR
+      # kernel-side boot_version_classify fault fires with the expected
+      # fault-class line. Regression gate: detects the case where
+      # someone removes the version check and the stale pair would
+      # silently proceed.
+      #
+      # MANDATORY as of 2026-05-01: the advisory-rollout window for
+      # the stale-ABI fixture harness closed after multiple consecutive
+      # clean runs against the green-CI shape (see the Stale-ABI
+      # QEMU Fixture Harness Notes in
+      # todo/01-boot-platform/TODO-01-boot-protocol-abi-handoff.md).
+      # The harness env-probes KVM/OVMF/mtools and SKIPs cleanly when
+      # any are missing -- and run-fixtures.sh upgrades a full-SKIP to
+      # FAIL when GITHUB_ACTIONS=true so silent no-ops cannot meet the
+      # regression-gate contract.
+      - name: Stale-ABI fixtures
+        run: make stale-abi-fixtures
+
+      # Anti-rollback NVRAM fixtures: four sequenced boots (B, A, C, D) over ONE
+      # persistent OVMF_VARS.fd proving the compositor-steady gate on
+      # the IPOSRequiredSecVersion floor through the live UEFI Runtime
+      # Services SetVariable path -- the last mile a kernel unit test
+      # cannot reach. Regression gate: detects a raise that fires on a
+      # boot which never reached its first composited frame, which
+      # advances the security floor on a machine that could not
+      # actually complete its boot and strands it on a broken image.
+      #
+      # Invoked BY PATH rather than through a `make` target: the root
+      # Makefile is receipt surface (the build/test/smoke receipts are
+      # computed over it), so an unattended run may not add a target
+      # there. A `make rollback-fixtures` wrapper is tracked as an
+      # operator-gated item in the boot-protocol ABI handoff roadmap,
+      # under "Scripted anti-rollback NVRAM fixture harness".
+      #
+      # Same env contract as the stale-ABI step above: the harness
+      # env-probes OVMF/mtools/QEMU and SKIPs cleanly when any are
+      # missing, and upgrades a full-SKIP to FAIL under GITHUB_ACTIONS
+      # so a silent no-op cannot satisfy the gate. Runners have no
+      # /dev/kvm, so this is the TCG leg.
+      - name: Anti-rollback NVRAM fixtures
+        run: bash scripts/debug/rollback-fixtures/run-fixtures.sh
+
+      # ── Optional disk-image artifact (manual runs only) ────────────────────
+      # The raw disk image is by far the largest CI artifact and quickly burns
+      # through GitHub's shared artifact quota. Keep normal push/PR runs
+      # artifact-free; when someone truly needs the exact built image, use
+      # workflow_dispatch with upload_disk_image=true.
+      - name: Upload disk image (manual opt-in)
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_disk_image
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-disk
+          path: build/system-disk.img
+          retention-days: 1
+          if-no-files-found: error
+
+      # Logs are small and useful for diagnosis, but only on failures.
+      # retention-days kept at 1 so the shared GitHub Actions artifact
+      # quota recovers fast -- hit the cap on 2026-04-22 which stalled
+      # this step with "Artifact storage quota has been hit". The job
+      # already tolerates this failure via continue-on-error, but a
+      # shorter retention keeps the cap from biting again.
+      - name: Upload build + test logs on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build/build.log
+            build/test.log
+          retention-days: 1
+          if-no-files-found: ignore
+
+      # Per-test crash-artifact bundles written by the desktop UI test
+      # framework's isolation section (screen.png + serial.log + etw.bin
+      # + wm.json when an assertion fails inside TEST_CAT_DESKTOP). The
+      # capture hook itself is still blocked on the post-desktop-init
+      # test harness (tracked in the same section's Deferred list), so
+      # today this step is a forward-compat wiring: the upload runs on
+      # failure and uploads nothing (`if-no-files-found: ignore`) when
+      # the capture hook has not yet populated build/test-artifacts/.
+      # Retention stays at 1 day to share the quota recovery with the
+      # logs step above.
+      - name: Upload desktop test-artifacts on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-test-artifacts
+          path: build/test-artifacts/
+          retention-days: 1
+          if-no-files-found: ignore
+
+  # The pack took 19m25s of the job's 30 minutes (measured 2026-11-07), so a tooling
+  # failure and the OS verdict both waited on it. Its own job reports each sooner.
+  # Nothing in the build job reads what the pack produces.
+  tooling-pack:
+    name: Tooling regression pack
+    runs-on: ubuntu-26.04
+    # The pinned CI image holds the whole toolchain (scripts/ci/image/Dockerfile);
+    # this job installs nothing, so a package-mirror outage cannot fail it.
+    container:
+      image: ghcr.io/rizonesoft/impossible-os-ci@sha256:d5d684cc6bc2740e127b72c56189f9a424c800041db489844d1939e39b019176
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --init: GitHub makes `tail -f /dev/null` PID 1, which never reaps an orphan.
+      options: --init --user 1001:1001
+    timeout-minutes: 60
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for build_info.h commit hash
+
+      # ── Verify toolchain matches scripts/setup.sh sentinel contract ─────────
+      # If this fails, the inline apt install above and scripts/setup.sh have
+      # drifted. Fix whichever side is out of sync -- do NOT mask with `|| true`.
+      - name: Verify toolchain sentinels and version floors
+        run: bash scripts/setup.sh --verify
+
+      # ── Host-side tooling regression pack (cheap, no build required) ───────
+      # Exercises the wrapper contract, hook lifecycle, and workflow YAML
+      # without actually compiling the OS. Catches drift between local docs
+      # and CI before the build stage runs.
+      #
+      # TEST_TOOLING_SKIP_LSP_MCP=1: the standalone "Run LSP-MCP bridge tests"
+      # step below runs test_bridge.sh + test_boundary.sh once for log
+      # placement. Skip the duplicate run here so CI does not pay the
+      # clangd cold-spawn + stress pass twice per build.
+      - name: Run tooling regression pack
+        env:
+          TEST_TOOLING_SKIP_LSP_MCP: "1"
+        run: bash scripts/test-tooling.sh --quiet
+
+  # The ruleset requires this check by name, so it stays here and answers for both jobs:
+  # with the pack split out, a failing pack must still block a merge. `always()` because
+  # a skipped or failed dependency would otherwise skip this job, and a skipped required
+  # check reads as passed.
+  required-check:
+    name: Build Impossible OS
+    needs: [build, tooling-pack]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the OS build and the tooling pack
+        env:
+          OS_RESULT: ${{ needs.build.result }}
+          PACK_RESULT: ${{ needs.tooling-pack.result }}
+        run: |
+          echo "OS build: $OS_RESULT; tooling pack: $PACK_RESULT"
+          [ "$OS_RESULT" = success ] && [ "$PACK_RESULT" = success ]
+
+  # ── Release-flavor compile+link gate (test-surface exclusion) ───────────────
+  # scripts/test-tooling.sh proves the KERNEL_TESTS flavor CONTRACT via
+  # `make -n` text only (a dry-run plan, never an actual compile), so nothing
+  # in CI previously stopped the release flavor bit-rotting between merges --
+  # a guard added to kernel/security/etc. that silently fails to compile under
+  # KERNEL_TESTS=off would go unnoticed until a release cut. This job runs a
+  # full clean off-flavor build on every push/PR. Independent job (not a step
+  # in `build` above) so its failure is attributed clearly and it can run in
+  # parallel; it does NOT run scripts/test.sh -- the KERNEL_TESTS suite itself
+  # is compiled out under this flavor, so there is nothing to run.
+  build-release-flavor:
+    name: Build (KERNEL_TESTS=off release flavor)
+    runs-on: ubuntu-26.04
+    # The pinned CI image holds the whole toolchain (scripts/ci/image/Dockerfile);
+    # this job installs nothing, so a package-mirror outage cannot fail it.
+    container:
+      image: ghcr.io/rizonesoft/impossible-os-ci@sha256:d5d684cc6bc2740e127b72c56189f9a424c800041db489844d1939e39b019176
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --init: GitHub makes `tail -f /dev/null` PID 1, which never reaps an orphan.
+      options: --init --user 1001:1001
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # scripts/build.sh routes clang through ccache when it is installed. The
+      # cache lives in the runner's home, never a root-owned path (unprivileged
+      # tar cannot restore those). A cache-service fault costs a cold compile,
+      # not the job.
+      # The key starts ccache-image-: a cache saved by a job on the hosted runner
+      # stored its paths relative to /home/runner/work/..., so restoring one in the
+      # container wrote to /.cache (2026-11-13). Container saves restore cleanly.
+      - name: Restore compile cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/.cache/ccache
+          key: ccache-image-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-tests-off-${{ github.sha }}
+          restore-keys: |
+            ccache-image-${{ runner.os }}-llvm${{ env.LLVM_VERSION }}-tests-off-
+
+      - name: Configure compile cache
+        run: |
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          CCACHE_DIR="$HOME/.cache/ccache" ccache --zero-stats
+
+      - name: Build OS (clean, KERNEL_TESTS=off)
+        env:
+          KERNEL_TESTS: "off"
+        run: bash scripts/build.sh clean
+
+      - name: Compile cache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Verify build sentinel
+        run: |
+          LAST_LINE=$(tail -1 build/build.log)
+          echo "Build log last line: $LAST_LINE"
+          if [ "$LAST_LINE" != "=== BUILD OK ===" ]; then
+            echo "::error::Release-flavor build did not complete successfully"
+            echo "--- Last 30 lines of build.log ---"
+            tail -30 build/build.log
+            exit 1
+          fi
+          echo "✅ Release-flavor build succeeded"
+
+      # No src/kernel/test/ object and none of the three explicitly-pruned
+      # extra TUs (ntfs_test.c, ixfs_test.c, test_threads.c) should exist in
+      # this flavor's build output -- a fast, direct check that the Makefile
+      # prune actually fired rather than trusting a green build alone (a
+      # stale incremental object from a prior `on` build could otherwise
+      # slip through the link on a misconfigured runner).
+      - name: Verify test TUs were pruned
+        run: |
+          for f in build/kernel/test build/kernel/fs/ntfs/ntfs_test.o build/kernel/fs/ixfs/ixfs_test.o build/kernel/main/test_threads.o; do
+            if [ -e "$f" ]; then
+              echo "::error::$f exists in a KERNEL_TESTS=off build (should be pruned)"
+              exit 1
+            fi
+          done
+          echo "✅ No pruned test TUs present in build output"
+
+      - name: Upload build log on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-release-flavor-log
+          path: build/build.log
+          retention-days: 1
+          if-no-files-found: ignore

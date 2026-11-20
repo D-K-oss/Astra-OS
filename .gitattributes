@@ -1,0 +1,24 @@
+# ============================================================================
+# Line-ending policy -- deliberately NARROW.
+#
+# This file pins LF for the generated-ABI surface ONLY. It is not a repo-wide
+# `* text=auto` policy: that would renormalize every tracked file on the next
+# checkout, which is a much larger and riskier change than the problem below.
+#
+# Why these files. `make check-abi` compares the two ABI facades against the
+# canonical constants in scripts/gen-user-abi.py (see CANONICAL_SHIM_* there):
+# canonical UTF-8 text, modulo line endings. check_shim_form() normalizes
+# newlines on read precisely so a core.autocrlf=true checkout -- which clang
+# compiles identically -- does not fail the gate. Pinning LF here is the OTHER
+# half of that: it keeps the repository side canonical so the normalization is
+# a safety net for pre-existing clones rather than the thing the contract rests
+# on. The two defenses are independent on purpose.
+#
+# The generated contract is listed for the same reason -- gen-user-abi.py
+# renders it with LF and --check compares the rendering against the file.
+# ============================================================================
+
+abi/generated/abi_contract.h   text eol=lf
+include/kernel/abi_hash.h      text eol=lf
+user/include/abi_numbers.h     text eol=lf
+scripts/gen-user-abi.py        text eol=lf

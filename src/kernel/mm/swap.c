@@ -1,0 +1,486 @@
+/* ============================================================================
+ * swap.c -- Swap / Page File Support
+ *
+ * Disk-backed swap with Clock (second-chance) page replacement.
+ * Uses pagefile.sys on the IXFS partition as the backing store.
+ *
+ *   1. Copy page contents to a swap slot (pagefile)
+ *   2. Write SWAP_ENCODE_PTE(slot_id) into the PTE, verifying the leaf still
+ *      maps the captured frame -- the marker goes in BEFORE the frame is freed
+ *   3. Free the physical frame directly -- only after the marker is committed,
+ *      so a failed/raced encode never strands the page
+ *
+ * Swap in flow (on page fault):
+ *   1. Read PTE → decode swap slot ID
+ *   2. Allocate a new physical frame
+ *   3. Copy swap slot contents to the frame
+ *   4. Map the page back (virt → new phys)
+ *   5. Free the swap slot
+ *
+ * Clock algorithm:
+ *   Circular scan of tracked pages. For each candidate:
+ *   - If Accessed bit clear → victim found
+ *   - If Accessed bit set → clear it, advance clock hand
+ * ============================================================================ */
+
+#include "kernel/mm/swap.h"
+#include "kernel/mm/pmm.h"
+#include "kernel/mm/vmm.h"
+#include "kernel/mm/heap.h"
+#include "kernel/klog.h"
+#include "kernel/fs/vfs.h"
+#include "kernel/drivers/framebuffer.h"
+#include "registry.h"
+
+/* Path to the pagefile on disk */
+#define PAGEFILE_PATH  "C:\\Impossible\\System\\pagefile.sys"
+
+/* --- Swap slot storage (disk-backed via pagefile.sys) --- */
+static struct vfs_node *pagefile = (void *)0;  /* open file handle */
+/* Page-copy staging buffer: one pmm page reached through its HHDM alias, NOT a
+ * 4 KiB static. The freestanding-kernel rule bans large statics, and freeing
+ * this page keeps the section-9 walker conversion under the pre-section-7 image
+ * ceiling. HHDM (not the raw identity address) so the buffer survives section
+ * 5's identity teardown -- ixfs copies it CPU-side (ixfs_file_write), so it is
+ * never DMA'd from this pointer. Allocated in swap_init; NULL until then. */
+static uint8_t  *swap_temp_buf = (void *)0;
+swap_slot_t  swap_slots[SWAP_MAX_SLOTS];
+static uint32_t     swap_num_slots = 0;
+uint32_t     swap_used = 0;
+static uint32_t     swap_inited = 0;
+
+/* --- Clock replacement state --- */
+static clock_entry_t clock_entries[CLOCK_MAX_PAGES];
+static uint32_t      clock_hand = 0;
+static uint32_t      clock_count = 0;
+
+/* --- PTE manipulation helpers --- */
+
+/* Read a PTE value for a virtual address.
+ * We walk the page tables manually to get the raw PTE. */
+static uint64_t swap_read_pte(uintptr_t virt)
+{
+    /* Walk the live page tables (PML4 -> PDPT -> PD -> PT). Every table
+     * pointer is derived through pt_walk() (the HHDM walk helper), so the walk
+     * keeps working once section 5 retires the bootloader identity map. Mask
+     * with PTE_ADDR_MASK, NOT ~0xFFF: leaving high bits (e.g. NX) set would push
+     * the frame past the HHDM window and trip pt_walk's hard-error. */
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+
+    uint64_t *pml4 = pt_walk(cr3 & PTE_ADDR_MASK);
+    uint32_t pml4_idx = (uint32_t)((virt >> 39) & 0x1FF);
+    uint32_t pdpt_idx = (uint32_t)((virt >> 30) & 0x1FF);
+    uint32_t pd_idx   = (uint32_t)((virt >> 21) & 0x1FF);
+    uint32_t pt_idx   = (uint32_t)((virt >> 12) & 0x1FF);
+
+    if (!(pml4[pml4_idx] & 1)) return 0;
+    uint64_t *pdpt = pt_walk(pml4[pml4_idx] & PTE_ADDR_MASK);
+
+    if (!(pdpt[pdpt_idx] & 1)) return 0;
+    /* Check for 1 GiB huge page */
+    if (pdpt[pdpt_idx] & VMM_FLAG_HUGE) return pdpt[pdpt_idx];
+
+    uint64_t *pd = pt_walk(pdpt[pdpt_idx] & PTE_ADDR_MASK);
+    if (!(pd[pd_idx] & 1)) {
+        /* PD entry not present -- but it might have swap bits.
+         * However, swap is stored at PT level, so check if PD points to a PT. */
+        return 0;
+    }
+
+    /* Check for 2 MiB huge page */
+    if (pd[pd_idx] & VMM_FLAG_HUGE) return pd[pd_idx];
+
+    uint64_t *pt = pt_walk(pd[pd_idx] & PTE_ADDR_MASK);
+    return pt[pt_idx];
+}
+
+/* Write a PTE value for a virtual address at the 4 KiB PT level.
+ * Used to encode swap metadata when Present=0. Returns 0 on success, -1 if
+ * any level is absent OR a huge (1 GiB/2 MiB) leaf is encountered -- a huge
+ * leaf's frame is a DATA frame, not a page table, and must NEVER be descended
+ * into (matching swap_read_pte's huge stops). Descending would write swap
+ * metadata into unrelated physical memory. */
+static int swap_write_pte(uintptr_t virt, uint64_t pte_val, uintptr_t expected_phys)
+{
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+
+    /* pt_walk + PTE_ADDR_MASK: same HHDM walk discipline as swap_read_pte. */
+    uint64_t *pml4 = pt_walk(cr3 & PTE_ADDR_MASK);
+    uint32_t pml4_idx = (uint32_t)((virt >> 39) & 0x1FF);
+    uint32_t pdpt_idx = (uint32_t)((virt >> 30) & 0x1FF);
+    uint32_t pd_idx   = (uint32_t)((virt >> 21) & 0x1FF);
+    uint32_t pt_idx   = (uint32_t)((virt >> 12) & 0x1FF);
+
+    if (!(pml4[pml4_idx] & 1)) return -1;
+    uint64_t *pdpt = pt_walk(pml4[pml4_idx] & PTE_ADDR_MASK);
+
+    if (!(pdpt[pdpt_idx] & 1)) return -1;
+    if (pdpt[pdpt_idx] & VMM_FLAG_HUGE) return -1;   /* 1 GiB leaf, not a PD */
+    uint64_t *pd = pt_walk(pdpt[pdpt_idx] & PTE_ADDR_MASK);
+
+    if (!(pd[pd_idx] & 1)) return -1;
+    if (pd[pd_idx] & VMM_FLAG_HUGE) return -1;        /* 2 MiB leaf, not a PT */
+    uint64_t *pt = pt_walk(pd[pd_idx] & PTE_ADDR_MASK);
+
+    /* Verify the leaf still maps the frame swap_out captured before the
+     * pagefile I/O. If a concurrent unmap/remap changed it, DO NOT overwrite --
+     * stranding the swap marker over an unrelated mapping would let swap_out
+     * free a frame it no longer owns. Report -1, mutating nothing. The current
+     * flat single-CPU cooperative scheduler makes this verify+write atomic;
+     * full SMP/preemptive serialization of swap is a separate swap-wide concern
+     * (swap_slots/clock_entries are likewise unlocked). */
+    if (!(pt[pt_idx] & VMM_FLAG_PRESENT) ||
+        (pt[pt_idx] & PTE_ADDR_MASK) != expected_phys)
+        return -1;
+
+    pt[pt_idx] = pte_val;
+    vmm_flush_tlb(virt);
+    return 0;
+}
+
+/* --- Page copy helper --- */
+static void page_copy(void *dst, const void *src)
+{
+    uint64_t *d = (uint64_t *)dst;
+    const uint64_t *s = (const uint64_t *)src;
+    uint32_t i;
+    for (i = 0; i < SWAP_SLOT_SIZE / sizeof(uint64_t); i++)
+        d[i] = s[i];
+}
+
+/* --- API implementation --- */
+
+void swap_init(uint32_t num_slots)
+{
+    uint32_t i;
+    uint32_t reg_slots;
+
+    if (num_slots == 0)
+        num_slots = SWAP_MAX_SLOTS;
+    if (num_slots > SWAP_MAX_SLOTS)
+        num_slots = SWAP_MAX_SLOTS;
+
+    /* Check Registry for configured swap size */
+    {
+        HKEY hMem = (HKEY)0;
+        uint32_t disp;
+        long rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\Memory",
+                               0, KEY_READ, &hMem);
+        if (rc != ERROR_SUCCESS) {
+            rc = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\Memory",
+                                0, (const char *)0, 0, KEY_ALL_ACCESS,
+                                (void *)0, &hMem, &disp);
+        }
+        if (rc == ERROR_SUCCESS) {
+            if (RegGetDword(hMem, "SwapSlots", &reg_slots) == ERROR_SUCCESS) {
+                if (reg_slots > 0 && reg_slots <= SWAP_MAX_SLOTS)
+                    num_slots = reg_slots;
+            } else {
+                /* Store default value in Registry */
+                RegSetDword(hMem, "SwapSlots", num_slots);
+            }
+            RegCloseKey(hMem);
+        }
+    }
+
+    /* Create the pagefile on disk */
+    if (!vfs_is_mounted('C')) {
+        klog(LOG_DEBUG, "swap", "C: drive not mounted -- swap disabled");
+        return;
+    }
+
+    vfs_create(PAGEFILE_PATH, VFS_FILE);
+    pagefile = vfs_open(PAGEFILE_PATH, VFS_O_READ | VFS_O_WRITE);
+    if (!pagefile) {
+        klog(LOG_WARN, "swap", "Failed to open pagefile -- swap disabled");
+        return;
+    }
+
+    /* Allocate the page-copy staging buffer (one page), reached via its HHDM
+     * alias. Without it there is no buffer to stage swap I/O through, so a
+     * failure disables swap. On an HHDM-translation failure the frame did
+     * allocate, so reclaim it before bailing. */
+    uintptr_t staging_phys = pmm_alloc_contiguous(1);
+    swap_temp_buf = (uint8_t *)mm_phys_to_hhdm(staging_phys);
+    if (!swap_temp_buf) {
+        klog(LOG_WARN, "swap", "Failed to allocate swap staging buffer -- swap disabled");
+        if (staging_phys)
+            pmm_free_frame(staging_phys);
+        pagefile = (void *)0;
+        return;
+    }
+
+    /* Pre-allocate pagefile size by writing a zero byte at the end */
+    {
+        uint8_t zero = 0;
+        uint32_t end_offset = num_slots * SWAP_SLOT_SIZE - 1;
+        vfs_write(pagefile, end_offset, 1, &zero);
+    }
+
+    /* Initialize slot table */
+    for (i = 0; i < num_slots; i++) {
+        swap_slots[i].in_use = 0;
+        swap_slots[i].virt_addr = 0;
+    }
+
+    /* Initialize clock entries */
+    for (i = 0; i < CLOCK_MAX_PAGES; i++) {
+        clock_entries[i].in_use = 0;
+        clock_entries[i].virt_addr = 0;
+    }
+
+    swap_num_slots = num_slots;
+    swap_used = 0;
+    clock_hand = 0;
+    clock_count = 0;
+    swap_inited = 1;
+
+    klog(LOG_INFO, "swap", "Initialized: %u slots (%u KiB) -- pagefile.sys",
+           (uint64_t)num_slots, ((uint64_t)num_slots * 4));
+}
+
+int swap_out(uintptr_t virt_addr)
+{
+    uint32_t i;
+    uintptr_t phys;
+    uint32_t slot_offset;
+    int rc;
+
+    if (!swap_inited || !pagefile)
+        return -1;
+
+    /* Find a free swap slot */
+    for (i = 0; i < swap_num_slots; i++) {
+        if (!swap_slots[i].in_use)
+            break;
+    }
+
+    if (i >= swap_num_slots) {
+        klog(LOG_WARN, "swap", "No free swap slots");
+        return -1;
+    }
+
+    /* Get the physical address of the page */
+    phys = vmm_get_physical(virt_addr);
+    if (!phys) {
+        klog(LOG_WARN, "swap", "Cannot swap out %p: not mapped", virt_addr);
+        return -1;
+    }
+
+    /* Swap operates on 4 KiB pages only. Reject a huge (2 MiB / 1 GiB) leaf
+     * BEFORE touching a slot or the pagefile: swap_write_pte must never descend
+     * into a huge leaf's DATA frame as if it were a page table. */
+    if (swap_read_pte(virt_addr) & VMM_FLAG_HUGE) {
+        klog(LOG_WARN, "swap", "Cannot swap out huge page %p", virt_addr);
+        return -1;
+    }
+
+    /* Copy page contents to temp buffer, then write to pagefile */
+    page_copy(swap_temp_buf, (const void *)virt_addr);
+    slot_offset = i * SWAP_SLOT_SIZE;
+    rc = vfs_write(pagefile, slot_offset, SWAP_SLOT_SIZE, swap_temp_buf);
+    if (rc < 0) {
+        klog(LOG_ERROR, "swap", "Failed to write slot %u to pagefile", (uint64_t)i);
+        return -1;
+    }
+
+    /* Encode the swap marker into the PTE BEFORE releasing the frame, so a
+     * failed encode never strands the page: on -1 the mapping and the frame are
+     * untouched and the slot stays free (no vmm_unmap_page-then-fallible-write
+     * window that could free the frame and then lose it). swap_write_pte
+     * replaces the present 4 KiB PTE with the Present=0 swap marker and flushes
+     * the TLB. */
+    if (swap_write_pte(virt_addr, SWAP_ENCODE_PTE(i), phys) != 0) {
+        klog(LOG_ERROR, "swap", "swap_out: %p PTE absent/changed since capture -- aborting", virt_addr);
+        return -1;
+    }
+    /* PTE now holds the swap marker; free the frame directly. NOT
+     * vmm_unmap_page -- that would clear the marker we just wrote. */
+    pmm_free_frame(phys);
+
+    /* Update slot metadata */
+    swap_slots[i].in_use = 1;
+    swap_slots[i].virt_addr = virt_addr;
+    swap_used++;
+
+    return (int)i;
+}
+
+int swap_in(uint32_t swap_id, uintptr_t virt_addr)
+{
+    uintptr_t new_frame;
+    uint32_t slot_offset;
+    int rc;
+
+    if (!swap_inited || !pagefile || swap_id >= swap_num_slots)
+        return -1;
+
+    if (!swap_slots[swap_id].in_use)
+        return -1;
+
+    /* Allocate a new physical frame */
+    new_frame = pmm_alloc_frame();
+    if (!new_frame) {
+        /* If OOM, try to swap out another page first */
+        uintptr_t victim = swap_clock_victim();
+        if (victim) {
+            swap_out(victim);
+            new_frame = pmm_alloc_frame();
+        }
+        if (!new_frame) {
+            klog(LOG_ERROR, "swap", "Cannot swap in: out of physical memory");
+            return -1;
+        }
+    }
+
+    /* Read swap slot contents from pagefile into temp buffer */
+    slot_offset = swap_id * SWAP_SLOT_SIZE;
+    rc = vfs_read(pagefile, slot_offset, SWAP_SLOT_SIZE, swap_temp_buf);
+    if (rc < 0) {
+        klog(LOG_ERROR, "swap", "Failed to read slot %u from pagefile", (uint64_t)swap_id);
+        pmm_free_frame(new_frame);
+        return -1;
+    }
+
+    /* Map the new frame at the virtual address */
+    vmm_map_page(virt_addr, new_frame, VMM_KERNEL_RW);
+
+    /* Copy temp buffer contents to the new page */
+    page_copy((void *)virt_addr, swap_temp_buf);
+
+    /* Free the swap slot */
+    swap_slots[swap_id].in_use = 0;
+    swap_slots[swap_id].virt_addr = 0;
+    swap_used--;
+
+    /* Re-register the page for clock tracking */
+    swap_clock_register(virt_addr);
+
+    return 0;
+}
+
+int swap_handle_fault(uintptr_t fault_addr, uint64_t error_code)
+{
+    uint64_t pte;
+    uint32_t swap_id;
+
+    if (!swap_inited)
+        return 0;
+
+    /* Only handle "page not present" faults */
+    if (error_code & 1)
+        return 0;  /* protection violation, not a swap fault */
+
+    /* Page-align the fault address */
+    fault_addr &= ~(uintptr_t)0xFFF;
+
+    /* Read the PTE */
+    pte = swap_read_pte(fault_addr);
+
+    /* Check if this PTE has our swap marker */
+    if (!SWAP_IS_SWAPPED(pte))
+        return 0;  /* not a swapped page */
+
+    /* Decode the swap slot ID */
+    swap_id = SWAP_DECODE_PTE(pte);
+
+    klog(LOG_DEBUG, "swap", "Swapping in page at %p (slot %u)",
+           fault_addr, (uint64_t)swap_id);
+
+    if (swap_in(swap_id, fault_addr) == 0)
+        return 1;  /* handled -- retry the faulting instruction */
+
+    return 0;  /* swap_in failed */
+}
+
+void swap_clock_register(uintptr_t virt_addr)
+{
+    uint32_t i;
+
+    /* Check if already registered */
+    for (i = 0; i < CLOCK_MAX_PAGES; i++) {
+        if (clock_entries[i].in_use && clock_entries[i].virt_addr == virt_addr)
+            return;  /* already tracked */
+    }
+
+    /* Find a free entry */
+    for (i = 0; i < CLOCK_MAX_PAGES; i++) {
+        if (!clock_entries[i].in_use) {
+            clock_entries[i].virt_addr = virt_addr;
+            clock_entries[i].in_use = 1;
+            clock_count++;
+            return;
+        }
+    }
+}
+
+uintptr_t swap_clock_victim(void)
+{
+    uint32_t passes;
+    uint32_t i;
+
+    if (clock_count == 0)
+        return 0;
+
+    /* Scan up to 2× the array to give every page a second chance */
+    for (passes = 0; passes < CLOCK_MAX_PAGES * 2; passes++) {
+        i = clock_hand;
+        clock_hand = (clock_hand + 1) % CLOCK_MAX_PAGES;
+
+        if (!clock_entries[i].in_use)
+            continue;
+
+        {
+            uintptr_t vaddr = clock_entries[i].virt_addr;
+            uint64_t pte = swap_read_pte(vaddr);
+
+            /* Skip non-present pages */
+            if (!(pte & VMM_FLAG_PRESENT))
+                continue;
+
+            /* Check Accessed bit */
+            if (pte & VMM_FLAG_ACCESSED) {
+                /* Second chance: clear the Accessed bit, keeping the same
+                 * frame (expected_phys = the frame just read, so the leaf
+                 * verify is a no-op here -- no I/O between read and write). */
+                swap_write_pte(vaddr, pte & ~VMM_FLAG_ACCESSED,
+                               pte & PTE_ADDR_MASK);
+                continue;
+            }
+
+            /* Victim found! Remove from clock tracking */
+            clock_entries[i].in_use = 0;
+            clock_count--;
+            return vaddr;
+        }
+    }
+
+    /* Fallback: return the first valid entry */
+    for (i = 0; i < CLOCK_MAX_PAGES; i++) {
+        if (clock_entries[i].in_use) {
+            uintptr_t vaddr = clock_entries[i].virt_addr;
+            clock_entries[i].in_use = 0;
+            clock_count--;
+            return vaddr;
+        }
+    }
+
+    return 0;  /* nothing to evict */
+}
+
+uint32_t swap_get_total_slots(void)
+{
+    return swap_num_slots;
+}
+
+uint32_t swap_get_used_slots(void)
+{
+    return swap_used;
+}
+
+uint32_t swap_get_free_slots(void)
+{
+    return swap_num_slots - swap_used;
+}

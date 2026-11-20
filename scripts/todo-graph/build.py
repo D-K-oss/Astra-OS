@@ -1,0 +1,2448 @@
+#!/usr/bin/env python3
+# ============================================================================
+# build.py -- TODO graph cache generator
+#
+# Walks every `todo/**/*.md` (excluding INDEX.md / TODO-00-INDEX.md), parses
+# YAML frontmatter + Implementation Order table rows + Inputs XREFs +
+# Accepted/Deferred stamp XREFs, then emits a JSON array of node objects to
+# `build/todo-cache.json`.
+#
+# Spec: the TODO-graph generator section of the TODO-metadata-layer plan
+# under todo/00-infrastructure/. Frontmatter schema spec lives in the
+# adjacent schema-and-spec section, with a JSON Schema sidecar at
+# docs/infrastructure/todo-metadata.schema.json once that section ships.
+#
+# Usage:
+#   python3 scripts/todo-graph/build.py [--output build/todo-cache.json]
+#                                       [--root todo/]
+#                                       [--quiet]
+#
+# Exit codes:
+#   0  clean parse of every file
+#   1  any file emitted an error category other than `unknown-field`. That is
+#      the actual rule -- an ALLOWLIST OF ONE, not an enumerated fatal set -- so
+#      a category added later is fatal by default. Today that covers malformed
+#      or missing frontmatter, every field-validation category, an emission
+#      drop, and the two body-Markdown refusals `unclosed-fence` /
+#      `unclosed-comment` (each masks to EOF, so an erased node would otherwise
+#      be indistinguishable from an empty TODO). `<file>: <category>: <message>`
+#      is printed to stderr -- a line number only when the category carries one,
+#      which the body-Markdown refusals do not. The cache file is NOT written,
+#      so a partial cache cannot mask a regression. Canonical list:
+#      docs/infrastructure/todo-metadata.md "Error Catalog""
+#   3  the corpus moved underneath this run (a TODO changed between being read
+#      and the cache being published, or the corpus git history moved). Nothing
+#      is written and any previous cache is left byte-identical -- see
+#      "THE PRODUCER GENERATION WINDOW" below.
+#
+# Performance target: linear in corpus bytes, held by test_build.sh Test 7 as a
+# CPU-time rate (250 ms per MiB of todo/, floor 2 s; 118-153 ms/MiB measured on
+# 2026-09-28 at ~13.5 MB). The original target was 2 s wall-clock for ~86 files.
+# Strategy:
+#   - Single batched `git log` call gets created_at + last_active_at
+#     timestamps for every file in one process invocation.
+#   - YAML parsing uses PyYAML (declared in scripts/setup-deps.sh).
+#   - All other parsing is pure-stdlib regex + string ops.
+#
+# ============================================================================
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+# The corpus fingerprint rule is SHARED with every reader rather than restated
+# here. Two implementations of "has the corpus moved" that can disagree is a
+# worse defect than the window this closes, so the producer records exactly what
+# `cache_schema._scan_corpus` computes and `cache_schema.check_freshness` reads.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cache_schema as _cs  # noqa: E402
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write(
+        "[build.py] FATAL: python3-yaml not installed. Run: bash scripts/setup-deps.sh\n"
+    )
+    sys.exit(1)
+
+
+# ============================================================================
+# THE DECLARED ERROR-CATEGORY SET (section 39).
+#
+# WHY THIS EXISTS. `identity-gate.sh` runs a PRODUCER DIFFERENTIAL: the HEAD
+# producer over the BASE corpus, and the BASE producer over the HEAD corpus.
+# That comparison silently assumes the producer is CORPUS-AGNOSTIC across the
+# range -- and a commit that ADDS a fatal check breaks the assumption by
+# construction. The new check is unrunnable over any corpus predating the
+# repair it demands, and the repair MUST ship with the check or the producer
+# would fail on the live tree. Observed 2026-08-10: 5851cb4db shipped the
+# `unclosed-fence` check together with the 8-line repair it required, and every
+# push after it failed todo-graph.yml at rc 3 INFRASTRUCTURE, over a base
+# (169990014) that predated both halves. It cannot self-clear either --
+# IDENTITY_GATE_LAST_GATED_SHA only advances on a PASS -- so the wedge is
+# permanent until something teaches the gate to tell the two cases apart.
+#
+# WHAT MAKES THEM DISTINGUISHABLE. "The head producer rejects the base corpus
+# with a check that did not exist at base" and "the head producer is broken"
+# look identical from a return code. They differ in exactly one observable: the
+# CATEGORY the refusal was emitted under, and whether the base producer had a
+# check that could emit it at all. So each tree publishes the set of categories
+# it can emit, and `producer_differential.py` asks both sides.
+#
+# WHY A DECLARATION AND NOT A SOURCE SCAN. Section 20 already paid for this
+# lesson on the bucket vocabulary: searching the emitter's source text for a
+# quoted literal is NOT proof of non-emission, because an indexed, concatenated
+# or table-driven emission preserves behaviour and leaves no literal to find.
+# The same rule applies here, so the same shape does: a DECLARATION, bound to
+# reality at RUNTIME by `_assert_declared_categories` below (which refuses any
+# category not named here), and pinned to a literal AST shape by test_build.sh
+# so it cannot become a computed expression that declares whatever it emits.
+#
+# ADDING A CATEGORY. Add it here in the same commit that adds the check. The
+# runtime binding fails the build otherwise, so this cannot drift unnoticed --
+# which is the property that lets the gate trust the answer.
+# ============================================================================
+# ENUMERATED BY AST, NOT BY GREP -- and the distinction was paid for on the
+# commit that introduced this block. A `grep 'errors.append(("'` found SIX
+# categories; the real set is TWELVE, because six of them are appended in a
+# wrapped call whose category literal sits on its own line. The runtime binding
+# below caught the six missing ones immediately (test_build.sh went 571/577),
+# which is the whole argument for having it: a declaration nothing checks is a
+# declaration that is wrong.
+EMITTED_ERROR_CATEGORIES = frozenset({
+    "emission-drop",
+    "forbidden-field",
+    "invalid-field",
+    "invalid-id",
+    "malformed-yaml",
+    "missing-frontmatter",
+    "missing-required",
+    "schema-version",
+    "unclosed-comment",
+    "unclosed-fence",
+    # Section 42: the four OTHER EOF-consuming CommonMark HTML block types
+    # (`<script>`/`<pre>`/`<style>`/`<textarea>`, a processing instruction, a
+    # declaration, CDATA). Separate from `unclosed-comment` so the category
+    # never claims "comment" about a construct that is not one.
+    "unclosed-html",
+    "unknown-field",
+    "unknown-status",
+})
+
+# The ONE non-fatal category. Named here rather than spelled inline at the two
+# places that branch on it, so "which categories are fatal?" has a single
+# answer: everything declared above except this. That is the allowlist-of-one
+# rule from the exit-code block, expressed as data instead of as a comment.
+WARNING_ERROR_CATEGORIES = frozenset({"unknown-field"})
+
+
+def _assert_declared_categories(errors, rel):
+    """Bind the declaration to reality.
+
+    A category this module can EMIT but does not DECLARE would make
+    `--emitted-error-categories` a lie, and the identity gate reasons about
+    novelty from that answer -- so an undeclared category is not a parse error
+    about the corpus, it is a defect in this file. It must be loud and it must
+    not be confusable with a corpus failure, so it raises rather than joining
+    the fatal-error count.
+    """
+    for cat, _msg in errors:
+        if cat not in EMITTED_ERROR_CATEGORIES:
+            raise AssertionError(
+                f"[build.py] INTERNAL: {rel} emitted the undeclared error "
+                f"category '{cat}'. Add it to EMITTED_ERROR_CATEGORIES -- the "
+                f"identity gate reads that declaration to tell a NEW check "
+                f"apart from a broken producer, and an undeclared category "
+                f"makes that answer unsound."
+            )
+
+
+# PyYAML's default safe loader uses last-key-wins on duplicate mapping keys.
+# The frontmatter spec (docs/infrastructure/todo-metadata.md Parsing Rules)
+# promises duplicate keys are a hard malformed-yaml failure. Subclass
+# SafeLoader and override mapping construction to raise on the first duplicate.
+class _DupRejectingLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_mapping_no_dupes(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"duplicate key {key!r} in mapping",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_DupRejectingLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_no_dupes,
+)
+
+
+# --- Constants -----------------------------------------------------------
+
+VALID_STATUSES = {"draft", "active", "blocked", "done", "superseded"}
+ID_REGEX = re.compile(r"^[a-z][a-z0-9-]{0,58}[a-z0-9]$")
+REQUIRED_FIELDS = ("schema_version", "id", "domain", "status", "title")
+# THE PARSER ALLOWLIST -- which frontmatter keys are KNOWN, not which ones are
+# emitted. The two lists differ by exactly one member and saying so here stops
+# the difference reading as a bug: `$schema` is an AUTHORING pointer that tells
+# a validator where to find the sidecar, and it deliberately never enters the
+# cache (Codex consistency, [medium], rejected as a defect on this evidence).
+OPTIONAL_FIELDS = (
+    "$schema",
+    "owners",
+    "depends_on",
+    "satisfies",
+    "superseded_by",
+    "file_patterns",
+    "effort",
+)
+# The authored optional fields that DO reach a cache node, stated once so the
+# copy loop in `build_node` and the drop assertion beside it cannot disagree.
+_EMITTED_OPTIONAL = tuple(f for f in OPTIONAL_FIELDS if f != "$schema")
+
+# THE PRODUCER'S SIDE OF THE CONTRACT, DECLARED SO IT CAN BE COMPARED BOTH WAYS.
+# `main`'s runtime scan subtracts `EMITTED_NODE_FIELDS` from the keys actually
+# emitted, so it catches a field ADDED without being declared -- and can never
+# catch one DROPPED, because a key that stopped being emitted simply is not in
+# the set being subtracted. The digest cannot see it either: it certifies the
+# DECLARATION, so a producer that quietly stops emitting `effort` or
+# `depends_on` publishes under a perfectly valid identity and every reader falls
+# back to its default. That is the read-but-never-emitted failure this whole
+# section exists to close, reappearing one layer down (Codex adversarial,
+# section 25, [medium]).
+#
+# Note the earlier `emission-drop` check in `build_node` does NOT close this:
+# it iterates `_EMITTED_OPTIONAL`, the same list the copy loop iterates, so
+# deleting a field from `OPTIONAL_FIELDS` removes it from the copy AND from the
+# check together. Only a comparison against the SHARED declaration is
+# load-bearing, which is why these two tuples exist.
+# DERIVED FROM THE SHARED DECLARATION, never restated here. These were
+# hand-written tuples until the section-25 review, and the duplication was the
+# free parameter every version of this guard was defeated through: a category
+# could be edited on the producer side while the shared name set -- and so the
+# contract digest -- stayed identical. Now the mode lives in
+# `cache_schema.EMITTED_NODE_FIELD_MODES`, is part of the digest, and these are
+# a view of it, so there is no producer-local copy left to drift.
+def _fields_in_mode(mode: str) -> tuple:
+    return tuple(sorted(f for f, m in _cs.EMITTED_NODE_FIELD_MODES.items()
+                        if m == mode))
+
+
+_ALWAYS_EMITTED = _fields_in_mode(_cs.FIELD_ALWAYS)
+# Emitted only when non-empty, by deliberate contract (the key is omitted rather
+# than published as `[]`), so it cannot join the per-node presence check below.
+_CONDITIONAL_EMITTED = _fields_in_mode(_cs.FIELD_CONDITIONAL)
+
+# The one remaining producer-local list is the FRONTMATTER authoring surface, so
+# it is the one that still needs comparing: dropping a name from
+# `OPTIONAL_FIELDS` would stop the copy loop emitting it while the shared
+# declaration still promised it.
+if frozenset(_EMITTED_OPTIONAL) != frozenset(_fields_in_mode(_cs.FIELD_OPTIONAL)):
+    raise AssertionError(
+        "the authored optional fields and cache_schema's optional-mode fields "
+        "disagree; declared-not-authored="
+        f"{sorted(frozenset(_fields_in_mode(_cs.FIELD_OPTIONAL)) - frozenset(_EMITTED_OPTIONAL))}, "
+        "authored-not-declared="
+        f"{sorted(frozenset(_EMITTED_OPTIONAL) - frozenset(_fields_in_mode(_cs.FIELD_OPTIONAL)))}. "
+        "Both sides move together or the producer contract digest certifies a "
+        "field the producer no longer writes")
+
+# THE UNION ALONE IS NOT ENOUGH, because it flattens the EMISSION MODE. Moving
+# `sections` from `_ALWAYS_EMITTED` into `_CONDITIONAL_EMITTED` (and making its
+# assignment conditional) leaves the union identical, leaves the digest
+# identical -- the field name is still declared -- and silently removes the
+# field from the per-node presence scan, which derives from the same reduced
+# tuple. The producer would then publish nodes missing a SCHEMA-REQUIRED field
+# under a binding certifying the current contract (Codex re-adversarial,
+# section 25, round 4, [medium]).
+#
+# `cache.schema.json`'s `required` list is the authority on which fields must be
+# on every node, so the mode is CHECKED AGAINST IT rather than restated: the two
+# were byte-equal hand-written copies, and that duplication was the free
+# parameter every version of this guard was defeated through. Read from the
+# schema beside `cache_schema` (not this file's `__file__`, which the mutation
+# fixtures copy elsewhere).
+_SCHEMA_PATH = Path(_cs.__file__).resolve().parent / "schema" / "cache.schema.json"
+with open(_SCHEMA_PATH, "r", encoding="utf-8") as _sfh:
+    _SCHEMA_REQUIRED = frozenset(json.load(_sfh)["items"].get("required", ()))
+if _SCHEMA_REQUIRED != frozenset(_ALWAYS_EMITTED):
+    raise AssertionError(
+        f"_ALWAYS_EMITTED and the `required` list in {_cs.SCHEMA_REL} disagree; "
+        f"required-not-always={sorted(_SCHEMA_REQUIRED - frozenset(_ALWAYS_EMITTED))}, "
+        f"always-not-required={sorted(frozenset(_ALWAYS_EMITTED) - _SCHEMA_REQUIRED)}. "
+        f"A field the schema REQUIRES must be emitted on every node, so it "
+        f"cannot be reclassified as conditional without the schema saying so")
+
+SUPPORTED_SCHEMA_VERSION = 1
+
+# Gantt row duration (TODO-06 section 25). `render.py` has read this field
+# since section 7 and the producer never emitted it, so every row rendered the
+# `1w` default and the only way to change one was unreachable: a hand-authored
+# `effort:` parsed, warned as an unknown field, and was dropped before the
+# cache.
+#
+# THE GRAMMAR IS NOT RESTATED HERE. It lives in `cache_schema` with the rest of
+# the shared cache contract, so the value this producer accepts and the value
+# `render.py` will draw are the same rule rather than two that agree today. A
+# present-but-invalid value REFUSES rather than falling back to the default --
+# silently defaulting is the exact failure this section exists to close, and it
+# would hide a typo behind a plausible schedule.
+EFFORT_REGEX = _cs.EFFORT_REGEX
+EFFORT_DEFAULT = _cs.EFFORT_DEFAULT
+
+# `> **Accepted:**` / `> **Deferred:**` line header. Captures kind +
+# optional severity. The XREF clauses themselves are extracted in a
+# second pass (XREF_CLAUSE_RE below) because some live stamp lines
+# carry MULTIPLE `-> XREF:` clauses on the same line (TODO-12 SSDT
+# stamps have up to 6); a single regex match only catches the first.
+STAMP_HEADER_RE = re.compile(
+    r"^> \*\*(?P<kind>Accepted|Deferred):\*\*\s+"
+    r"(?:\[(?P<severity>Critical|H|M|L)\]\s+)?",
+    re.MULTILINE,
+)
+
+# Single XREF clause within a stamp line. Captures one target_path /
+# target_section / optional item_name. Iterated to extract every clause
+# on the same line.
+#
+# The target grammar is `_cs.XREF_TARGET_PATTERN`, NOT a local `\S+`: a
+# complete markdown link is one token even when its label contains a space, and
+# the identical grammar is what `validate.py`'s repair path captures with, so
+# the builder and the repairer cannot disagree about where a target ends
+# (TODO-06 section 33). See that constant for why the label refuses nested
+# brackets.
+# SECTION 37 DELETED `XREF_CLAUSE_RE` OUTRIGHT, and the reason it survived the
+# first cut is worth keeping: it was retained on the stated grounds that
+# "`render.py` and the tests still match stamp clauses as a whole for display".
+# THAT WAS FALSE -- `render.py` contains no reference to it, and its only
+# executable consumer was `scripts/test-tooling.sh`, using it as a proxy for
+# "does todo-graph produce an edge for this text?". So the justification was
+# reasoned rather than checked, and what it justified was a SECOND clause parser
+# left standing inside the section whose entire purpose is that there be one
+# (Codex consistency, [medium]). The tooling assertions now ask the real
+# producer via `cache_schema.iter_xref_clauses` plus the stamp policy, which is
+# what they meant all along.
+
+# Inputs XREF line. Two surface forms in the wild:
+#   - plain-text reference (compact TNN section-prefix shorthand)
+#   - `- -> XREF: [link text](markdown-path) -- description`
+# Extract the target slug + section number where present.
+# THE LINK ARM IS THE SHARED GRAMMAR, not a third spelling. It was
+# `\[[^\]]+\]\(([^)]+)\)`, whose label class stops at the first `]`, so the
+# balanced-inner-bracket label the stamp grammar deliberately admits
+# (`[a [inner] label](x.md)`) captured as `[a` here and produced no edge --
+# the same split-brain section 33 exists to remove, one producer over (Codex
+# consistency, section 33 post-ship, [medium]). This arm captures the whole
+# link and `resolve_xref_target` unwraps it, so the destination is followed
+# rather than a truncated label.
+# THE TRAILING BOUNDARY IS PART OF THE GRAMMAR, exactly as at the stamp-repair
+# site. Without it the link arm can finish at the first `)` even when another
+# link follows, so `[a](TODO-01-a.md)[b](TODO-02-b.md)` emitted `TODO-01-a.md`
+# as a clean edge and dropped both the second link and the `§N` -- silently
+# binding malformed authoring to the FIRST destination where the bare-token arm
+# used to hand over the whole token and fail closed. Reported independently by
+# the adversarial and perf legs (section 33 post-ship, [medium]).
+# SECTION 37 CUT THIS DOWN TO THE LEAD-IN. It used to carry its own target
+# arms, its own trailing boundary and its own section-marker tail -- a third
+# spelling of a grammar two other producers also spelled -- and the target now
+# belongs to `cache_schema.parse_xref_clause`. What is genuinely LOCAL to this
+# surface, and all that remains here, is that the arrow must open the bullet.
+INPUTS_XREF_LEAD_RE = re.compile(r"^-\s+->\s+XREF:\s+")
+
+def _inputs_target(token: str) -> str:
+    """Normalise one Inputs target token to a DESTINATION.
+
+    Both Inputs surfaces resolve a token to a destination the same way and now
+    say so once. The shared clause parser deliberately returns the RAW token --
+    the stamp subtree keeps its backticks (194 live targets do, and
+    `resolve_xref_target` strips them at the point of use), so normalising in
+    the parser would rewrite that subtree to fix a difference that only exists
+    here.
+
+    A BACKTICKED TARGET IS A CODE SPAN AND ENDS AT ITS CLOSING BACKTICK. The
+    bullet arm used to encode that as `` `?([^`\\s]+) `` and the table arm as a
+    two-ended `strip`, which disagree on a token whose backtick is INTERNAL:
+    `` `path.md`: description `` is one non-space run, so a two-ended strip
+    leaves the trailing `` `: `` attached and publishes a destination no
+    resolver can match. Exactly one live row does this
+    (`todo/02-kernel-core/TODO-24-alpc-message-ports.md:40`), and the shared
+    parser is what surfaced it -- the old bullet regex hid it by never letting
+    the token past the backtick in the first place.
+
+    NEVER RETURNS EMPTY. `inputs_xrefs[].target_path` carries a schema
+    `minLength` of 1, so an empty destination is not a lax value but a cache a
+    routed consumer REJECTS WHOLE. A doubled delimiter (`` ``path.md`` ``) cuts
+    to nothing at offset zero, and the retired bullet arm never matched that
+    shape at all -- so normalising it to `""` would let a malformed row poison
+    the artifact where it previously produced no edge (Codex adversarial round
+    1, [medium]). Section 33 established the same rule for the link arm; this is
+    that rule, one token shape over: fall back to the RAW token, which does not
+    resolve and therefore surfaces as an ordinary stale-XREF finding.
+
+    THE CELL AND THE TOKEN SHARE THE LEADING-SPAN UNWRAP AND NOTHING MORE, and
+    claiming they were "one rule" is what broke 33h. A bare TOKEN must also stop
+    at an INTERNAL backtick, because the arm this replaced did
+    (`` `path.md`: prose `` is one non-space run); a CELL must not, because a
+    cell legitimately holds a markdown link whose label contains backticks.
+    """
+    if token.startswith("["):
+        return _cs.unwrap_xref_link(token) or token
+    inner = _code_span_inner(token)
+    cut = inner.find("`")
+    if cut >= 0:
+        inner = inner[:cut]
+    return inner or token
+
+
+# `_cell_code_span` was retired by TODO-06 §44. It hand-unwrapped a table
+# cell's leading code span so the whole-cell check could run on the remainder,
+# and it only ever knew SINGLE backticks -- so a doubled-delimiter cell got a
+# mangled destination, and the punctuation it left behind was folded into the
+# section marker. The shared parser locates the marker inside a span and stops
+# at the delimiter on its own (section 40), so the cell now reaches it RAW and
+# the imitation is gone rather than corrected. `_code_span_inner` below is a
+# different rule and stays: it unwraps a TOKEN, which must stop at an internal
+# backtick, where a cell must not.
+
+
+def _code_span_inner(text: str) -> str:
+    """Unwrap a LEADING code span. Anything not opening with a backtick is returned as-is.
+
+    THE GUARD IS THE WHOLE FUNCTION, and dropping it was a real regression
+    caught by sub-test 33h: without it, a table cell holding a link whose LABEL
+    is backticked (`` [`01-test/TODO-01 §1`](TODO-02-b.md) ``) was cut at that
+    label's first backtick and emitted `[` as the destination. A backtick only
+    opens a span when it is FIRST.
+
+    A LEADING BACKTICK COMES OFF EVEN WHEN THE SPAN NEVER CLOSES, which is
+    bug-compatibility with the arm this replaced rather than tidiness:
+    `` `?([^`\\s]+) `` consumed the opener unconditionally, so a BULLET whose
+    span wraps the whole `path §N` construct yielded a clean path and a section
+    that kept the closing backtick. Returning the raw token instead re-attached
+    the opener to 8 live targets -- measured, and visible only because the
+    corpus differential is per clause rather than by count.
+
+    Falls back to the RAW text when the span is empty (`` ``path.md`` ``),
+    because `inputs_xrefs[].target_path` carries a schema `minLength` of 1 and
+    an empty destination is a cache a routed consumer rejects WHOLE.
+    """
+    if not text.startswith("`"):
+        return text
+    inner = text[1:]
+    cut = inner.find("`")
+    if cut >= 0:
+        inner = inner[:cut]
+    return inner or text
+
+# Implementation Order header: detect optional Section column.
+# Looking for table row patterns under `## Implementation Order`.
+# Implementation Order header aliases (live repo formats vary). The Section
+# column names the body section number (`§N`); the Deliverable column names
+# the work item; Depends names predecessor refs; Status holds the `[ ]`
+# checkbox. When the only "what is this" column is `Section` (e.g. live
+# 4-column `Step | Section | Tag | Dependency` tables), `Section` doubles
+# as the deliverable label and `n` is computed from the Step/# column.
+IO_HEADER_KEYS_SECTION = ("section",)
+IO_HEADER_KEYS_DELIVERABLE = ("deliverable",)
+IO_HEADER_KEYS_DEPS = ("depends on", "depends-on", "dependency", "dep", "deps")
+IO_HEADER_KEYS_STATUS = ("status", "mark")
+IO_HEADER_KEYS_ORDER = ("order", "step", "#")
+
+
+# --- File discovery ------------------------------------------------------
+
+
+def walk_todo_files(root: Path) -> list:
+    """Return list of TODO-*.md paths under root, excluding INDEX.md and
+    TODO-00-INDEX.md. Sorted for determinism (byte-identical output on
+    re-runs, per the TODO-metadata-layer idempotency requirement)."""
+    out = []
+    for p in root.rglob("TODO-*.md"):
+        if p.name == "TODO-00-INDEX.md":
+            continue
+        # DIRECTORIES ONLY are excluded here, and only because the reader's
+        # `os.walk` reports them under `dirs` rather than `files` -- so a
+        # directory named `TODO-x.md` belongs to neither side's corpus (Codex
+        # consistency, section 21, [medium]). A non-regular FILE is deliberately
+        # NOT skipped: both sides can see it, so the shared read rule must
+        # REFUSE it on both sides rather than let the producer quietly omit what
+        # every reader rejects (Codex re-adversarial, section 21, [medium]).
+        if p.is_dir():
+            continue
+        out.append(p)
+    return sorted(out)
+
+
+# --- Git timestamps (batched) -------------------------------------------
+
+
+class _Provenance(str):
+    """A typed provenance marker, distinguishable from a real identity string.
+
+    Subclassing `str` keeps every existing `history_id is None` -> truthiness and
+    formatting path working while making `isinstance(p, _Provenance)` the exact
+    test for "this is a marker, not an id". A bare string constant would be
+    indistinguishable from an identity that happened to equal it.
+    """
+
+    __slots__ = ()
+
+
+# Determinate: no corpus file is under `repo_root`, so no timestamp was derived.
+PROVENANCE_NO_DERIVATION = _Provenance("no-derivation")
+# Indeterminate: the walk did not answer and we cannot say why. ABORT, do not
+# re-ask -- a second probe that succeeds describes a different moment.
+PROVENANCE_INDETERMINATE = _Provenance("indeterminate")
+
+# The only answers from `corpus_history_id` that may rescue an INDETERMINATE
+# walk. Both are established by its own explicit probes (`rev-parse --git-dir`
+# reporting not-a-repository, `rev-parse --verify --quiet HEAD` reporting an
+# unborn HEAD), so they are facts about the tree rather than about this moment.
+# `no-history:0` is deliberately ABSENT from the INDETERMINATE set: the walk
+# produces that itself on a successful empty read, so seeing it only from the
+# fallback means the walk failed while git was healthy -- the transient case
+# that must abort.
+_DETERMINATE_NO_GIT = frozenset(("no-repo", "unborn-head"))
+
+# NO_DERIVATION IS A WEAKER CLAIM AND TAKES A WIDER RESCUE SET (Codex
+# adversarial, section 24, [medium]). Applying the INDETERMINATE rule to both
+# markers over-refused a legitimate tree: when no corpus file lives under
+# `repo_root` NO walk was attempted at all, so `no-history:0` from the fallback
+# is not evidence of a failure -- it says the corpus sits in a repository whose
+# history has never touched it, and null timestamps are then the honest and
+# only possible answer. A REAL `tip:count` is still refused for both markers,
+# because that means a history exists which this build did not read.
+_DETERMINATE_NO_DERIVATION = _DETERMINATE_NO_GIT | frozenset(("no-history:0",))
+
+
+def collect_git_timestamps(repo_root: Path, files: list, todo_root=None) -> dict:
+    """Return {relative_path_str: (created_at_iso, last_active_at_iso)} for
+    every file. One subprocess call walks the entire log so we don't pay
+    per-file fork overhead.
+
+    Strategy: `git log --name-only --format=COMMIT %H %ct --reverse` then
+    walk the output, recording the FIRST timestamp we see for each path
+    (created_at) and continuously updating to the LATEST (last_active_at).
+    `--reverse` makes the first-seen=oldest invariant hold without
+    sorting per-file.
+
+    Files with no git history (untracked or new) get None timestamps.
+
+    THE WALK REPORTS ITS OWN PROVENANCE. Returning only the timestamps let the
+    caller pin the history with a SEPARATE `git log`, which is a different
+    generation: move the history to B while this walk resolves, return B-derived
+    timestamps, move back to A, and an A-vs-A comparison publishes B's
+    timestamps under an A binding (Codex re-adversarial, section 21, [high]).
+    The last `COMMIT` line of this very output IS the corpus tip the projection
+    came from, and the number of them is its commit count -- the same pair
+    `cache_schema.corpus_history_id` computes, verified equal on the live repo
+    -- so the provenance costs nothing extra and cannot describe a different
+    walk than the one that ran.
+
+    Returns `(timestamps, provenance)`. Provenance is either the walk-derived
+    identity string, or one of two typed markers -- and COLLAPSING THOSE TWO INTO
+    ONE `None` WAS A HOLE (Codex design review, section 24, [high]). Any `git log`
+    failure used to return `None`, and the caller then minted a history id from a
+    SECOND `corpus_history_id` probe. A transient git failure that cleared between
+    those two calls therefore published null `created_at` / `last_active_at`
+    fields under a perfectly valid history binding, which a history-consuming
+    reader accepts as fresh. The two states are not the same fact:
+
+      `PROVENANCE_NO_DERIVATION` -- DETERMINATE. No corpus file lives under
+      `repo_root`, so no timestamp could be derived from any history and there is
+      genuinely nothing for a history check to protect. The caller resolves the
+      recorded id from `corpus_history_id`, which fails closed on its own.
+
+      `PROVENANCE_INDETERMINATE` -- the walk did not answer and this process
+      cannot say why. The caller must ABORT rather than ask a second time; only
+      the determinate sentinels `no-repo` and `unborn-head`, established by
+      `corpus_history_id`'s own explicit probes, may rescue it.
+
+    A SUCCESSFUL WALK WITH EMPTY OUTPUT IS DETERMINATE, not a failure: an
+    existing HEAD simply has no commit touching the corpus (a tree whose TODO
+    files are still untracked is the ordinary case). That yields `no-history:0`,
+    which is byte-identical to what `corpus_history_id` returns for the same
+    state -- the two must not drift, or the producer's own post-walk comparison
+    would reject legitimate builds.
+
+    THE PATHSPEC IS DERIVED FROM `todo_root`, NOT HARDCODED (Codex consistency,
+    section 24, [medium]). This walk used a literal `-- todo` while the reader's
+    `corpus_history_id` scopes `.` from whatever `--root` it was given, so any
+    corpus in a differently-named in-repo directory had the producer recording
+    the `todo/` history and the post-walk comparison measuring the OTHER
+    directory's -- an rc 3 refusal with nothing concurrent about it. Both sides
+    must name the same paths or "the history moved" means nothing.
+    """
+    rel_paths = set()
+    for f in files:
+        # Files may live outside the repo (e.g. test fixtures under /tmp).
+        # Skip git timestamp collection for those; they get None timestamps.
+        try:
+            rel = f.relative_to(repo_root)
+            rel_paths.add(str(rel))
+        except ValueError:
+            continue
+
+    if not rel_paths:
+        # NO FILE IS UNDER `repo_root`, so no timestamp can be derived from its
+        # history and the walk below would describe a DIFFERENT tree than the
+        # corpus (test fixtures pass `--root /tmp/...` with `--repo-root` at the
+        # live repo, which made the provenance the live repo's corpus tip while
+        # the corpus itself was not in a repository at all). Provenance None is
+        # the honest answer: nothing was derived, so there is nothing for the
+        # history binding to protect.
+        return {}, PROVENANCE_NO_DERIVATION
+
+    created = {}
+    last_active = {}
+    # Path-limit the log walk to the corpus directory so runtime scales with
+    # its history alone, not total-repo history. Without the pathspec the
+    # `--reverse` walk visits every commit in the repo (kernel churn,
+    # docs churn, scripts churn) before producing the first TODO
+    # timestamp, which makes the 2s budget brittle as the repo grows.
+    # Codex quality review caught this: a full-repo scan was the
+    # observed bottleneck once commit count crosses ~10x.
+    #
+    # The pathspec is the corpus's own repo-relative path, so it names exactly
+    # what `corpus_history_id` scopes as `.` from the same directory. It falls
+    # back to `todo` only when `todo_root` was not supplied or does not sit
+    # under `repo_root` -- in which case `rel_paths` is empty and we returned
+    # NO_DERIVATION above, so the pathspec is never actually consulted.
+    #
+    # `--literal-pathspecs` IS LOAD-BEARING NOW THAT THE PATH IS DERIVED (Codex
+    # re-adversarial, section 24, [medium]). `--` ends OPTION parsing; it does
+    # not stop git interpreting pathspec magic, so a directory legitimately
+    # named `:(top)plans` or containing `*` would select something other than
+    # itself. While the pathspec was the hardcoded literal `todo` that could not
+    # bite; taking it from `--root` makes it caller-controlled. The mismatch is
+    # usually a refusal, but if the decoy and the real directory share commits
+    # the tip/count can agree while the emitted filenames never match
+    # `rel_paths` -- null timestamps that pass the post-walk comparison.
+    pathspec = "todo"
+    if todo_root is not None:
+        try:
+            pathspec = Path(todo_root).relative_to(repo_root).as_posix() or "."
+        except ValueError:
+            pass
+    try:
+        # THE WALK AND THE ID MUST READ THE SAME ANCESTRY (section 27). The %ct
+        # values below become `created_at` / `last_active_at`, and `git replace`
+        # or a graft file can change them for an OLDER commit while leaving the
+        # tip and the count `corpus_history_id` records exactly equal. Both
+        # sides therefore disable both mechanisms through the same shared
+        # constants, so producer and reader agree BY CONSTRUCTION rather than by
+        # a probe that could observe a different instant than the walk.
+        # THE PRODUCER CHECKS SHALLOWNESS AROUND ITS OWN WALK, AND MAY NOT
+        # INHERIT THE READER'S PREFLIGHT (Codex adversarial, section 31,
+        # [high], reproduced before accepting). `corpus_history_id` refuses a
+        # shallow corpus at the moment IT is asked -- but on the normal path
+        # THIS walk mints the identity, so the only later probe is the
+        # post-walk comparison in `build_cache`. Let the walk run under a
+        # boundary and the boundary be gone by that comparison, and the
+        # equal-count case section 31 exists for makes the two ids compare
+        # EQUAL: verified 2026-08-09 that `created_at` publishes as 2022-01-01
+        # (the boundary commit) where the full history says 2020-01-01, with
+        # `moved` False and nothing refusing.
+        #
+        # PROBING BOTH SIDES is what binds the answer to THIS generation rather
+        # than to some later instant. It closes every SINGLE transition --
+        # shallow-then-unshallowed by the before-probe, unshallowed-then-shallow
+        # by the after-probe -- and it deliberately claims no more: a boundary
+        # installed AND removed wholly inside one walk reads false twice.
+        # Closing that residue needs the walk to report its own boundary, which
+        # git does not expose.
+        def _shallow_probe():
+            return subprocess.run(
+                ["git", *_cs.HISTORY_GIT_GLOBALS,
+                 "rev-parse", "--is-shallow-repository"],
+                cwd=str(repo_root), env=_cs.history_git_env(),
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+        shallow_before = _shallow_probe()
+        result = subprocess.run(
+            [
+                "git",
+                "--literal-pathspecs",
+                *_cs.HISTORY_GIT_GLOBALS,
+                "log",
+                "--name-only",
+                "--format=COMMIT %H %ct",
+                "--reverse",
+                "--",
+                pathspec,
+            ],
+            cwd=str(repo_root),
+            env=_cs.history_git_env(),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        shallow_after = _shallow_probe()
+        if shallow_before != "false" or shallow_after != "false":
+            _cs._err(
+                _cs.REASON_STALE,
+                f"the corpus was in a shallow repository across the timestamp "
+                f"walk (is-shallow-repository read {shallow_before!r} before "
+                f"and {shallow_after!r} after), so `created_at` would carry "
+                f"the boundary commit's timestamp rather than the commit that "
+                f"introduced the file; run `git fetch --unshallow` and retry")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        # THE WALK DID NOT ANSWER AND THIS PROCESS CANNOT SAY WHY. `git log`
+        # exiting nonzero covers a missing binary, a broken repository, a
+        # corrupt ref and a transient failure alike, and none of those is
+        # evidence that the corpus has no history. Emitting null timestamps and
+        # letting the caller mint an id from a later probe is exactly how a
+        # cleared transient failure published a timestamp-less cache under a
+        # valid binding (Codex design review, section 24, [high]).
+        return {p: (None, None) for p in rel_paths}, PROVENANCE_INDETERMINATE
+
+    cur_ts = None
+    walk_commits = []
+    for line in result.stdout.splitlines():
+        if line.startswith("COMMIT "):
+            parts = line.split(" ", 2)
+            if len(parts) >= 2:
+                walk_commits.append(parts[1])
+            if len(parts) >= 3:
+                try:
+                    cur_ts = int(parts[2])
+                except ValueError:
+                    cur_ts = None
+            else:
+                cur_ts = None
+        elif cur_ts is not None and line in rel_paths:
+            if line not in created:
+                created[line] = cur_ts
+            last_active[line] = cur_ts
+
+    out = {}
+    for p in rel_paths:
+        c = created.get(p)
+        l = last_active.get(p)
+        out[p] = (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(c)) if c else None,
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(l)) if l else None,
+        )
+    # `--reverse`, so the LAST commit seen is the newest corpus-touching one.
+    tip = walk_commits[-1] if walk_commits else "no-history"
+    return out, f"{tip}:{len(walk_commits)}"
+
+
+# --- Frontmatter ---------------------------------------------------------
+
+
+def split_frontmatter(content: str):
+    """Return (frontmatter_dict, body, error_msg). All three are None-able:
+       - (dict, body, None) on parse success
+       - (None, full_content, None) when no frontmatter present (back-compat
+         no-frontmatter mode)
+       - (None, content, error_msg) on malformed YAML
+
+    Tolerates:
+      - UTF-8 BOM prefix (Windows editors save with BOM by default)
+      - CRLF line endings (`---\\r\\n`) -- normalized to LF for the
+        fence search so a Windows-authored TODO with valid frontmatter
+        is parsed instead of misclassified as no-frontmatter.
+    """
+    # ONE NORMALISER, shared with `validate.py` (section 39). It strips the
+    # BOM and folds CRLF exactly as the two hand-rolled strips here did, and
+    # ALSO folds the other breaks `str.splitlines()` honours -- a lone CR
+    # above all. The body walks below use `splitlines()` while the validator
+    # splits on `"\n"`, so a body carrying one of those was two different
+    # documents to the two halves of the tool. Downstream parsers accept LF.
+    content = _cs.normalize_newlines(content)
+    if not content.startswith("---\n"):
+        return None, content, None
+    # Find closing fence on its own line.
+    end = content.find("\n---\n", 4)
+    if end < 0:
+        return None, content, "frontmatter: opening --- has no closing --- fence"
+    yaml_block = content[4:end]
+    body = content[end + 5 :]
+    # Detect tabs (PyYAML treats them as syntax errors but the message is
+    # cryptic; produce a clearer one).
+    for ln_idx, ln in enumerate(yaml_block.splitlines(), start=2):
+        if "\t" in ln:
+            return None, body, f"frontmatter: tab indentation at line {ln_idx} (use spaces)"
+    try:
+        fm = yaml.load(yaml_block, Loader=_DupRejectingLoader)
+    except yaml.YAMLError as exc:
+        # PyYAML's exception carries a problem_mark; re-base its line to
+        # the file's coordinates (frontmatter starts at line 2).
+        if hasattr(exc, "problem_mark") and exc.problem_mark is not None:
+            ln = exc.problem_mark.line + 2
+            return None, body, f"frontmatter: malformed YAML at line {ln}: {exc.problem}"
+        return None, body, f"frontmatter: malformed YAML: {exc}"
+    if not isinstance(fm, dict):
+        return None, body, "frontmatter: top-level must be a mapping (key: value pairs)"
+    # YAML aliases can produce self-referential containers (e.g. `owners: &a [*a]`).
+    # PyYAML's safe_load happily constructs them; downstream json.dumps then
+    # crashes with an uncaught circular reference. Walk the parsed structure
+    # and reject any cycle as malformed-yaml so the generator stays fail-closed.
+    if _has_yaml_cycle(fm):
+        return None, body, "frontmatter: circular reference (recursive YAML alias) in frontmatter"
+    return fm, body, None
+
+
+def _has_yaml_cycle(obj, _seen=None):
+    """Return True if obj contains a self-referential dict or list, walking
+    only containers (dict / list). Strings, ints, etc. are leaves."""
+    if _seen is None:
+        _seen = set()
+    if isinstance(obj, (dict, list)):
+        if id(obj) in _seen:
+            return True
+        _seen.add(id(obj))
+        children = obj.values() if isinstance(obj, dict) else obj
+        for child in children:
+            if _has_yaml_cycle(child, _seen):
+                return True
+        _seen.discard(id(obj))
+    return False
+
+
+def validate_frontmatter(fm: dict) -> list:
+    """Return list of (category, message) tuples. Empty list = clean.
+
+    Categories from §2 error catalog (mirrors docs/infrastructure/todo-metadata.md):
+      malformed-yaml     (handled separately in split_frontmatter; also covers
+                          circular YAML alias cycles via _has_yaml_cycle)
+      missing-frontmatter: file has no frontmatter block at all. Post-§5
+                          (back-fill migration, 2026-04-23) this is FATAL
+                          instead of a back-compat `status=no-frontmatter`
+                          node.
+      unknown-status     : status not in VALID_STATUSES
+      invalid-id         : id fails regex
+      missing-required   : a REQUIRED_FIELDS entry absent
+      schema-version     : schema_version not int OR > SUPPORTED_SCHEMA_VERSION
+      forbidden-field    : hand-authored cache-only field (created_at /
+                          last_active_at) present
+      invalid-field      : optional field present but wrong type/shape
+                          (mirrors the JSON Schema sidecar's per-field
+                          constraints so generator + schema agree)
+    Unknown optional fields produce a WARNING (returned with category
+    'unknown-field'), not an error; caller logs but does not fail."""
+    errors = []
+    for field in REQUIRED_FIELDS:
+        if field not in fm:
+            errors.append(("missing-required", f"required field '{field}' absent"))
+    if "status" in fm and fm["status"] not in VALID_STATUSES:
+        errors.append(
+            (
+                "unknown-status",
+                f"status='{fm['status']}' not one of {sorted(VALID_STATUSES)}",
+            )
+        )
+    if "id" in fm:
+        ident = fm["id"]
+        if not isinstance(ident, str) or not ID_REGEX.match(ident):
+            errors.append(
+                (
+                    "invalid-id",
+                    f"id='{ident}' must match {ID_REGEX.pattern} "
+                    "(lowercase letter start, [a-z0-9-], 2-60 chars, no trailing -)",
+                )
+            )
+    if "schema_version" in fm:
+        ver = fm["schema_version"]
+        # bool is a subclass of int in Python; True/False would otherwise
+        # silently pass the int check. Reject explicitly.
+        if not isinstance(ver, int) or isinstance(ver, bool):
+            errors.append(
+                (
+                    "schema-version",
+                    f"schema_version='{ver}' must be an integer",
+                )
+            )
+        elif ver < 1:
+            errors.append(
+                (
+                    "schema-version",
+                    f"schema_version={ver} must be >= 1 (schema starts at 1)",
+                )
+            )
+        elif ver > SUPPORTED_SCHEMA_VERSION:
+            errors.append(
+                (
+                    "schema-version",
+                    f"schema_version={ver} > generator-supported {SUPPORTED_SCHEMA_VERSION} "
+                    "(forward-incompatible; upgrade scripts/todo-graph/build.py)",
+                )
+            )
+    # FATAL: cache-only auto-derived fields must NOT appear in hand-authored
+    # frontmatter (mirrors the JSON Schema sidecar's not/anyOf/required clause
+    # at docs/infrastructure/todo-metadata.schema.json). The generator computes
+    # both from git log and emits them into build/todo-cache.json only.
+    for cache_only in ("created_at", "last_active_at", "stamped_items"):
+        if cache_only in fm:
+            errors.append(
+                (
+                    "forbidden-field",
+                    f"field '{cache_only}' is auto-derived (cache-only); "
+                    "MUST NOT appear in hand-authored frontmatter "
+                    "(see docs/infrastructure/todo-metadata.md Auto-Derived Fields). "
+                    "stamped_items is emitted by the per-item cache extension only.",
+                )
+            )
+    # FATAL: optional field type/shape mismatches. Mirrors the JSON Schema
+    # sidecar so the generator and the schema enforce identical contracts on
+    # what a clean cache node looks like (no schema/generator split brain).
+    if "title" in fm:
+        if not isinstance(fm["title"], str):
+            errors.append(("invalid-field", f"title must be a string, got {type(fm['title']).__name__}"))
+        elif not fm["title"]:
+            errors.append(("invalid-field", "title must be a non-empty string (schema minLength: 1)"))
+    if "domain" in fm:
+        if not isinstance(fm["domain"], str):
+            errors.append(("invalid-field", f"domain must be a string, got {type(fm['domain']).__name__}"))
+        elif not fm["domain"]:
+            errors.append(("invalid-field", "domain must be a non-empty string (schema minLength: 1)"))
+    if "$schema" in fm and not isinstance(fm["$schema"], str):
+        errors.append(("invalid-field", f"$schema must be a string path, got {type(fm['$schema']).__name__}"))
+    if "owners" in fm:
+        owners = fm["owners"]
+        if not isinstance(owners, list) or not all(isinstance(x, str) for x in owners):
+            errors.append(("invalid-field", "owners must be a list of strings"))
+    for id_list_field in ("depends_on", "satisfies"):
+        if id_list_field in fm:
+            val = fm[id_list_field]
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                errors.append(("invalid-field", f"{id_list_field} must be a list of id strings"))
+            else:
+                for ref in val:
+                    if not ID_REGEX.match(ref):
+                        errors.append(
+                            (
+                                "invalid-field",
+                                f"{id_list_field}[..] entry '{ref}' must match {ID_REGEX.pattern}",
+                            )
+                        )
+                if len(val) != len(set(val)):
+                    errors.append(
+                        ("invalid-field", f"{id_list_field} must be uniqueItems (schema uniqueItems: true)")
+                    )
+    if "superseded_by" in fm:
+        sb = fm["superseded_by"]
+        if not isinstance(sb, str) or not ID_REGEX.match(sb):
+            errors.append(
+                ("invalid-field", f"superseded_by='{sb}' must be a single id string matching {ID_REGEX.pattern}")
+            )
+    if "file_patterns" in fm:
+        fp = fm["file_patterns"]
+        if not isinstance(fp, list) or not all(isinstance(x, str) and x for x in fp):
+            errors.append(("invalid-field", "file_patterns must be a list of non-empty glob strings"))
+        elif len(fp) != len(set(fp)):
+            errors.append(("invalid-field", "file_patterns must be uniqueItems (schema uniqueItems: true)"))
+    if "effort" in fm:
+        ef = fm["effort"]
+        # `isinstance(ef, str)` FIRST, and not merely for tidiness: YAML parses
+        # a bare `effort: 2` as an int, and `EFFORT_REGEX.match(2)` raises
+        # TypeError rather than reporting an invalid field. The message quotes
+        # the value with `!r` so `'2w '` and `'2w'` are distinguishable in the
+        # build log, which a bare `{ef}` renders identically.
+        if not isinstance(ef, str) or not EFFORT_REGEX.match(ef):
+            errors.append(
+                ("invalid-field",
+                 f"effort={ef!r} must be a whole-day or whole-week Gantt "
+                 f"duration matching {EFFORT_REGEX.pattern} (e.g. '3d', "
+                 f"'2w'); omit the field to take the {EFFORT_DEFAULT} default")
+            )
+    # Warnings (don't fail the build)
+    known = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
+    for field in fm:
+        if field not in known and field not in ("created_at", "last_active_at"):
+            errors.append(("unknown-field", f"unknown optional field '{field}' (forward-compat warning)"))
+    return errors
+
+
+# --- Body parsing --------------------------------------------------------
+
+
+def extract_title(content: str) -> Optional[str]:
+    """First `# ` heading, stripped. Returns None if absent."""
+    for ln in content.splitlines():
+        if ln.startswith("# "):
+            return ln[2:].strip()
+    return None
+
+
+def scan_body(body: str):
+    """The shared `ScanResult` for a TODO body -- the
+    shared parsed-document context, computed ONCE per node and passed to the
+    private `_walk_*` functions below.
+
+    A PLAIN TUPLE OF LOCALS, deliberately, and NOT a context object on the
+    public surface. The five walks originally each ran `splitlines()` +
+    `fence_mask()`, which cost +29% node assembly; threading a `(lines, mask)`
+    tuple into them fixed the cost and opened a worse hole -- `zip()` silently
+    truncated on a short mask, and a same-length stale mask misclassified every
+    fenced line. Four hardening rounds each closed one forgery route and
+    revealed the next (validated tuple -> opaque class -> exact-type check ->
+    frozen slots -> `__new__` with empty slots), which is the signature of
+    defending the wrong boundary.
+
+    So there is nothing for a caller to forge, because no caller can pass one:
+    `extract_*(body)` keeps its original one-argument signature and rescans,
+    while `build_node` scans once and calls the `_walk_*` functions with its own
+    locals. The cost fix and the safety property come from the same decision.
+
+    Returns the shared `ScanResult`. `.mask` marks a line that is fenced-code
+    content, a fence delimiter, or inside ANY of CommonMark's seven HTML block
+    types -- everything that is not ordinary Markdown structure. `.terminal` is
+    non-None when the document ends inside a construct that consumes to EOF (a
+    fence or HTML types 1-5); `build_node` treats that as a refusal rather than
+    as an empty document, because it masks to EOF and the node would otherwise
+    be published with every field empty. The terminal value names the construct
+    and its opening line so the message sends the author to the right delimiter.
+    """
+    return _cs.fence_scan(body.splitlines())
+
+
+# A body that ends inside a fence masks everything from the opener to EOF, so
+# EVERY walk below returns empty. That is fail-closed in the sense that no WRONG
+# structure is emitted, but it is fail-SILENT at the graph level: measured
+# 2026-08-10, a fixture with a real Implementation Order, a real `## 1.` heading
+# and a real `- [x]` item behind an unclosed opener built at rc 0 with empty
+# `section_headings`, empty `sections` and zero stamped items, and nothing
+# downstream reported it (Codex adversarial, section 36). An erased node is
+# indistinguishable from an empty TODO, so the producer names it here instead of
+# publishing the erasure.
+#
+# CONTAINER FENCES ARE IN SCOPE since section 39. `fence_scan` consumes the
+# enclosing blockquote and list-item prefixes before applying the 0-3-space
+# rule, so a fence indented five spaces under `100. docs` is masked like any
+# other and an unterminated one is refused here like any other. The scope that
+# remains is HTML blocks other than `<!--` comments, owned by section 42.
+# THE WORDING IS NOT SPELLED HERE ANY MORE. Section 42 routes it through
+# `cache_schema.unclosed_reason(terminal)`, which every gate, the validator and
+# both repair tools already quote -- and with seven CommonMark HTML block types
+# plus fences there is no fixed pair of messages left to hardcode. The producer
+# keeps the DECISION (refuse rather than publish an erased node) and takes the
+# sentence from the shared contract, which is what "one wording" means.
+
+
+def extract_section_headings(body: str) -> list:
+    """Return list of (n, title) tuples for every `## N. Title` heading.
+    `n` is the integer section number; `title` is the prose after the dot.
+
+    FENCE-AWARE: a `## N.` inside a fenced block is an EXAMPLE, not a section.
+    This walk and `validate.py:_scan_markdown` must agree on what a heading is;
+    they did not until section 36, which is how a fixture documenting TODO
+    structure produced an `orphan-io-row` FAIL naming a section that does not
+    exist."""
+    _scan = scan_body(body)
+    return _walk_section_headings(_scan.leaf_views, _scan.mask,
+                                  _scan.in_blockquote)
+
+
+# ONE SECTION CONTEXT, CONSUMED BY THE WHOLE HEADING/ITEM/TABLE CLOSURE.
+#
+# Every walk below reads `ScanResult.views` -- the container-stripped line --
+# rather than the physical line, and section 45 changed them TOGETHER because
+# section 42 measured what happens otherwise. Giving only
+# `_walk_section_headings` the stripped view closed a real hole (a `## N.`
+# indented inside a list item is a heading to CommonMark and was invisible
+# here) and opened a worse one: a root `## 1.`, a list-contained `## 2.` and an
+# indented `[x]` item made that walk emit sections 1 and 2 while
+# `_walk_stamped_items` missed the nested heading and filed the item under
+# section 1 -- shipped-work evidence attributed to the wrong section (Codex
+# adversarial, section 42, [high]). Either all of them share one notion of
+# where a section starts, or none of them may be container-aware.
+#
+# THE CLOSURE IS FIVE WALKS, NOT THE FOUR THE SECTION NAMED.
+# `_walk_unusable_headings` is a fifth `classify_heading` consumer and it is the
+# one that REFUSES a heading whose number cannot be recorded. Left on physical
+# lines it would miss a list-contained over-long heading that the other four now
+# see, so the node would silently omit that section and its items with no error
+# at all -- the omission the refusal exists to prevent (Codex design review,
+# section 45, [high]).
+#
+# `_walk_stamps_xrefs` is deliberately NOT in the closure. It matches
+# `STAMP_HEADER_RE` against a `> **Verified:**` line, so the blockquote marker
+# is part of what it recognises; stripping containers there would delete the
+# thing it matches on. It carries no section context and emits no section-scoped
+# record, which is what makes that safe.
+#
+# Measured before the change: over 90,801 corpus lines, 18,505 carry a container
+# prefix and 9,336 of those sit inside a blockquote, yet the stripped view
+# changes 0 heading classifications and 0 item classifications. The projection
+# is a correctness contract that the current corpus does not exercise, not a
+# behaviour change to it.
+
+
+def _walk_section_headings(leaf_views, masked, in_bq) -> list:
+    """Shared by `extract_section_headings` and `build_node`; see that docstring
+    and the closure note above.
+    """
+    out = []
+    for i, (ln, fenced) in enumerate(zip(leaf_views, masked)):
+        if fenced or in_bq(i):
+            continue
+        h = _cs.classify_heading(ln)
+        # A TITLE IS REQUIRED HERE, as it always was: this walk feeds
+        # `section_headings`, whose consumers render `N. Title`. The shared
+        # matcher makes the title optional so `_walk_stamped_items` can keep its
+        # own (looser) reading of a bare `## 5.`; the difference is stated at the
+        # pattern rather than hidden in two regexes.
+        #
+        # An "over-long" heading is skipped HERE and reported by
+        # `_walk_unusable_headings` as a node ERROR, because there is no number
+        # to record: `section_headings[].n` is a 0-65535 integer and the schema
+        # takes no sentinel. Skipping without the error would publish a node
+        # that silently lacks a section the file plainly has.
+        if h.kind == "ok" and h.title:
+            out.append((h.n, h.title))
+    return out
+
+
+def _walk_unusable_headings(leaf_views, masked, in_bq):
+    """[(category, message)] for every `## N.` whose number cannot be recorded.
+
+    THE HEADING IS NOT DROPPED, it is refused (section 43). The producer used to
+    reach `int()` with an unbounded digit run and raise ValueError out of the
+    whole build; bounding the MATCH instead was tried in section 42 and reverted,
+    because a heading that stops matching stops delimiting its section and every
+    item after it is re-filed under the previous one. So the heading still ends
+    the previous section for every walk, and the node carries an error naming the
+    line -- the same shape an unclosed document already gets.
+
+    CONTAINER-AWARE with the rest of the closure (section 45): see the note
+    above `_walk_section_headings` for why leaving this one walk on physical
+    lines would turn that refusal back into a silent omission.
+    """
+    out = []
+    for i, (ln, fenced) in enumerate(zip(leaf_views, masked)):
+        if fenced or in_bq(i):
+            continue
+        h = _cs.classify_heading(ln)
+        if h.kind == "over-long":
+            out.append(("unusable-heading", _cs.heading_report(i + 1, h)))
+    return out
+
+
+# Backtick-quoted symbol form inside a `[x]` item: `foo_init()` -- captures
+# `foo_init`. Requires parens on the symbol so prose words in backticks
+# (e.g. `INTENTIONAL-STUB`, `[x]`) don't get mis-classified as symbols.
+_ITEM_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)`")
+# Backtick-quoted file-with-line form: `src/kernel/foo.c:42`. Optional
+# leading `./` is stripped. The line number is captured when present.
+_ITEM_FILE_LINE_RE = re.compile(
+    r"`(?:\./)?([A-Za-z0-9_./-]+\.(?:c|h|asm|S|py|sh|md|json|ps1|bat))(?::(\d+))?`"
+)
+# Markdown-link form: [label](path/to/file.ext). Path is taken raw; the
+# resolver normalizes `../`-relative paths against the TODO file's parent.
+_ITEM_MD_LINK_RE = re.compile(
+    r"\[[^\]]+\]\(([^)\s]+\.(?:c|h|asm|S|py|sh|md|json|ps1|bat))(?:#[^)]*)?\)"
+)
+
+
+def _normalize_md_link_path(link: str, todo_rel: str) -> str:
+    """Resolve a markdown-link path relative to the TODO file's parent dir,
+    return repo-rooted POSIX path. Drops fragments. Returns the original
+    `link` on failure (kept opaque so the consumer can warn rather than
+    silently skip)."""
+    try:
+        from posixpath import normpath
+        todo_dir = "/".join(todo_rel.split("/")[:-1])
+        joined = link if link.startswith("/") else (todo_dir + "/" + link)
+        return normpath(joined.lstrip("/"))
+    except Exception:
+        return link
+
+
+def extract_stamped_items(body: str, todo_rel: str) -> list:
+    """Walk each `## N. Title` body for `- [x]` checklist items and emit
+    per-item records:
+
+       {section_n, item_idx, item_text, refs: [{kind, file?, symbol?, line?}]}
+
+    Refs combine three surface forms inside the item text:
+      - `symbol_name()`         -> {kind: "symbol", symbol, file?}
+      - `path/to/file.c:42`     -> {kind: "file",   file, line?}
+      - [label](path/to/file.c) -> {kind: "file",   file}
+
+    Symbol refs gain an optional `file` set to the FIRST file ref in the
+    SAME item (Codex design review F2: pair within-item file+symbol refs
+    so lint Check 7 can resolve symbol-only stamps deterministically).
+    Items with no recognizable code refs land with refs: [].
+
+    Refs are deduplicated by full semantic key (Codex Q2). The
+    section_n / item_idx pair is stable as long as the section's `[x]`
+    item ordering is preserved (1-based section_n, 0-based item_idx).
+    """
+    _scan = scan_body(body)
+    return _walk_stamped_items(_scan.views, _scan.leaf_views, _scan.mask,
+                               todo_rel, _scan.in_blockquote)
+
+
+def _walk_stamped_items(views, leaf_views, masked, todo_rel: str, in_bq) -> list:
+    """Shared by `extract_stamped_items` and `build_node`; see that docstring
+    and the closure note above `_walk_section_headings`.
+
+    Fence-aware: a `## N.` heading or a `- [x]` line inside a fenced block is
+    documentation, not a section or a shipped item. Indexing one emitted a fake
+    symbol into `stamped_items` under a section that does not exist.
+
+    THE BLOCKQUOTE REJECTION IS NOW PUBLISHED RATHER THAN INFERRED. It used to
+    fall out of the `>` surviving in the text `item_re` matched against; on the
+    container-stripped view the marker is gone, so `> - [x] shipped` inside a
+    stamp continuation would read as a real item, and a quoted `> ## 2.` would
+    open a section that re-parents the UNQUOTED item after it. `in_bq(i)` is
+    that fact taken from the scan's own container stack, and it guards the top
+    of the loop rather than the item match, because the heading decision needs
+    it too -- which the per-item test could not give it."""
+    out = []
+    cur_section = None
+    cur_item_idx = 0
+    classify = _cs.classify_heading
+    # Match a `[x]` checklist line. Allow `-` or `*` bullets at any
+    # indent; reject blockquoted (`>`) lines because stamp continuations
+    # never carry `[x]`.
+    item_re = re.compile(r"^\s*[-*]\s*\[x\]\s+(.+?)\s*$")
+    for i, (ln, fenced) in enumerate(zip(views, masked)):
+        if fenced or in_bq(i):
+            continue
+        # HEADINGS from the leaf view, CONTENT from the marker-preserving one.
+        # The two differ on exactly one line -- `- ## 2. Nested` is a heading
+        # whose bullet `views` keeps -- and getting that wrong in either
+        # direction re-parents the item below it.
+        sec_h = classify(leaf_views[i])
+        if sec_h.kind != "none":
+            # An unusable number CLOSES the current section and opens nothing:
+            # `cur_section = None` means the items below it are not recorded at
+            # all, rather than being filed under the PREVIOUS section's number.
+            # Attributing them to the previous section is the misattribution
+            # this section exists to refuse, and it is strictly worse than the
+            # omission -- `_walk_unusable_headings` makes the node carry an
+            # error either way, so the omission is never silent.
+            cur_section = sec_h.n if sec_h.kind == "ok" else None
+            cur_item_idx = 0
+            continue
+        if cur_section is None:
+            continue
+        item_m = item_re.match(ln)
+        if not item_m:
+            continue
+        text = item_m.group(1)
+        file_refs = []
+        for fm in _ITEM_FILE_LINE_RE.finditer(text):
+            entry = {"kind": "file", "file": fm.group(1)}
+            if fm.group(2):
+                entry["line"] = int(fm.group(2))
+            file_refs.append(entry)
+        for lm in _ITEM_MD_LINK_RE.finditer(text):
+            link = lm.group(1).strip("`")
+            normalized = _normalize_md_link_path(link, todo_rel)
+            file_refs.append({"kind": "file", "file": normalized})
+        primary_file = file_refs[0]["file"] if file_refs else None
+        sym_refs = []
+        for sm in _ITEM_SYMBOL_RE.finditer(text):
+            entry = {"kind": "symbol", "symbol": sm.group(1)}
+            if primary_file:
+                entry["file"] = primary_file
+            sym_refs.append(entry)
+        seen = set()
+        merged = []
+        for ref in file_refs + sym_refs:
+            key = (ref.get("kind"), ref.get("file"), ref.get("symbol"), ref.get("line"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(ref)
+        out.append(
+            {
+                "section_n": cur_section,
+                "item_idx": cur_item_idx,
+                "item_text": text,
+                "refs": merged,
+            }
+        )
+        cur_item_idx += 1
+    return out
+
+
+# Token classes inside an Implementation Order Depends-On cell. A target
+# token names a different file (cross-file dep); a section token names a
+# section number. Parser walks tokens left-to-right and groups sections
+# under whichever target they follow (or "self" for sections at the start).
+_DEP_TARGET_RE = re.compile(
+    r"^("
+    r"D\d{1,2}T\d{1,2}|"   # cross-domain compact: D02T19 (1-digit D also ok)
+    r"D\d{1,2}\s*T\d{1,2}|"  # same with space: D02 T19
+    r"D\d{1,2}/T\d{1,2}|"    # same with slash: D02/T19 (used by some authors)
+    r"D\d{1,2}|"            # cross-domain only (rare): D14
+    r"T\d{1,2}|"            # same-domain compact: T17
+    r"TODO-\d{1,2}(?:-[a-z0-9-]+)?(?:\.md)?|"  # TODO-NN, TODO-NN-name, .md
+    r"\.\.?/\S+|"           # relative path: ./foo or ../bar
+    r"\d{2}-[a-z0-9-]+/TODO-\d{1,2}(?:-[a-z0-9-]+)?(?:\.md)?"  # full domain path
+    r")$"
+)
+_DEP_SECTION_RE = re.compile(r"^§(\d+)$")
+# Characters authors use as a range separator: ASCII hyphen-minus (0x2D),
+# Unicode en dash (U+2013), and Unicode em dash (U+2014). Assembled via
+# chr() so the source stays ASCII-dash-only per CLAUDE.md.
+_DEP_RANGE_DASHES = "-" + chr(0x2013) + chr(0x2014)
+# Range notation shorthand: `section-range` where the separator is any
+# dash character above, or a two-dot ellipsis. The second half may or may
+# not carry a leading section sign. Authors use this as compact shorthand;
+# we expand the sequence so each member passes through _DEP_SECTION_RE.
+_DEP_RANGE_RE = re.compile(
+    r"^§(\d+)\s*(?:[" + _DEP_RANGE_DASHES + r"]|\.\.)\s*§?(\d+)$"
+)
+# Squished target+section tokens: a target followed immediately by the
+# section sign then a digit, with no separating whitespace. Authors sometimes
+# omit the space between the file reference and the section indicator;
+# pre-split these so the rest of the tokenizer handles each half normally.
+_DEP_SQUISHED_RE = re.compile(
+    r"^(?P<target>D\d{1,2}(?:/?T\d{1,2})?|T\d{1,2}|TODO-\d{1,2})§(?P<sec>\d+)$"
+)
+
+
+def _parse_dep_cell(depends_cell: Optional[str]) -> list:
+    """Parse one Depends-On cell into a list of {target, sections} groups.
+    See extract_implementation_order docstring for grammar + examples."""
+    if not depends_cell or depends_cell.strip() in {"--", "-", ""}:
+        return []
+    # Split on commas first; then for each comma-piece, further split on
+    # whitespace so `TODO-08 §8` becomes ["TODO-08", "§8"]. Strip backticks
+    # and trailing sentence-level punctuation (`;`, `:`, `)`, `.`). Authors
+    # sometimes write prose-style refs like `TCP API from TODO-01;
+    # dns_resolve()...`; the trailing `;`/`)`/`.` is not part of the
+    # target token and should not reach the resolver.
+    raw_tokens: list = []
+    for chunk in depends_cell.split(","):
+        for tok in chunk.strip().strip("`").split():
+            tok = tok.strip().strip("`").strip()
+            # Strip both leading and trailing prose punctuation. Authors
+            # often write `(TODO-06 §2)` / `;TODO-01` / `TODO-03.` inline
+            # in the dep cell; none of the surrounding punctuation is
+            # part of the target token and should not reach the resolver.
+            tok = tok.lstrip("(")
+            tok = tok.rstrip(";:)").rstrip(".")
+            if tok:
+                raw_tokens.append(tok)
+    # Pre-split squished target+section tokens (D02T06 + section + 3 -->
+    # D02T06, section+3) so the range/section logic below sees the
+    # expected shape. Runs before range expansion because a squished token
+    # never contains a range separator.
+    split_squished: list = []
+    for tok in raw_tokens:
+        m = _DEP_SQUISHED_RE.match(tok)
+        if m:
+            split_squished.append(m.group("target"))
+            split_squished.append("§" + m.group("sec"))
+        else:
+            split_squished.append(tok)
+    raw_tokens = split_squished
+    # Expand range tokens (`section-range-end`) into the full consecutive
+    # list. `§1..§6` or `§1-6` or `§1--§6` all become §1 §2 §3 §4 §5 §6.
+    # Degrades gracefully if start > end: emits just the start as a single
+    # section so downstream grammar is unchanged.
+    expanded: list = []
+    for tok in raw_tokens:
+        m = _DEP_RANGE_RE.match(tok)
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2))
+            if end < start:
+                expanded.append("§" + str(start))
+            else:
+                for n in range(start, end + 1):
+                    expanded.append("§" + str(n))
+        else:
+            expanded.append(tok)
+    raw_tokens = expanded
+    # Join bare D<dom> followed by T<num> into a single D<dom>T<num> token
+    # so the space-separated form (`D02 T19 §1`) parses identically to the
+    # tight form (`D02T19 §1`); TODO-06 §1 documents both as accepted.
+    joined: list = []
+    i = 0
+    while i < len(raw_tokens):
+        cur = raw_tokens[i]
+        nxt = raw_tokens[i + 1] if i + 1 < len(raw_tokens) else None
+        if (
+            re.match(r"^D\d{1,2}$", cur)
+            and nxt is not None
+            and re.match(r"^T\d{1,2}$", nxt)
+        ):
+            joined.append(cur + nxt)
+            i += 2
+        else:
+            joined.append(cur)
+            i += 1
+    raw_tokens = joined
+    groups: list = []
+    current_target = "self"
+    current_sections: list = []
+    have_seen_anything = False
+    for tok in raw_tokens:
+        sec_match = _DEP_SECTION_RE.match(tok)
+        if sec_match:
+            current_sections.append(int(sec_match.group(1)))
+            have_seen_anything = True
+            continue
+        # Anything that looks like a target token starts a new group.
+        if _DEP_TARGET_RE.match(tok):
+            if have_seen_anything:
+                groups.append({"target": current_target, "sections": list(current_sections)})
+                current_sections = []
+            current_target = tok
+            have_seen_anything = True
+            continue
+        # Unrecognized token: if it looks like prose or a role descriptor
+        # (VFS, heap, mutex, (none), atomics, etc.) skip it silently.
+        # These are annotation, not file references, and emitting them as
+        # opaque targets produces thousands of false-positive stale-xref
+        # findings. A malformed file reference that starts with something
+        # file-ish (TODO-, D, T, digits, path prefix) will still fail
+        # _DEP_TARGET_RE but gets kept below so the validator can flag it.
+        looks_file_ish = bool(re.match(
+            r"^(?:TODO-|D\d|T\d|\d{2}-|\.{1,2}/)", tok
+        ))
+        if not looks_file_ish:
+            continue
+        if have_seen_anything:
+            groups.append({"target": current_target, "sections": list(current_sections)})
+            current_sections = []
+        current_target = tok
+        have_seen_anything = True
+    if have_seen_anything:
+        groups.append({"target": current_target, "sections": list(current_sections)})
+    return groups
+
+
+def extract_implementation_order(body: str) -> list:
+    """Walk under `## Implementation Order` and return list of section dicts:
+       {n: int|None, deliverable: str, depends_on: [DepGroup], status: str}.
+
+    Each DepGroup is `{target: "self"|"<compact-form>", sections: [int]}`. A
+    plain `§1, §2` cell yields `[{target: "self", sections: [1, 2]}]`. A
+    cross-file cell like `TODO-08 §8, §9` yields a SINGLE group `[{target:
+    "TODO-08", sections: [8, 9]}]` -- the bare `§9` rides on the preceding
+    target rather than dangling against the source file (Codex pass 6 H1:
+    parsing `TODO-08 §8, §9` as two opaque tokens loses the binding).
+    Multi-target cells like `TODO-08 §8, TODO-09 §1` yield two groups.
+
+    Tolerates both 5-column tables (icon | order | deliverable | depends |
+    status) and 6-column (icon | order | section | deliverable | depends |
+    status). The Section column, when present, names the body section
+    (`§N`) which can differ from execution Order.
+    """
+    _scan = scan_body(body)
+    return _walk_implementation_order(_scan.views, _scan.leaf_views,
+                                      _scan.mask, _scan.in_blockquote)
+
+
+def _walk_implementation_order(views, leaf_views, masked, in_bq) -> list:
+    """Shared by `extract_implementation_order` and `build_node`.
+
+    Fence-aware: a fenced `## Implementation Order` example would otherwise open
+    a second, fake scan, and a fenced `|` row inside the real table would be read
+    as a real row. Because this walk STOPS at the next `## ` heading, a fenced
+    example placed before the real table DISPLACES it rather than adding to it."""
+    out = []
+    in_io = False
+    header_cols = None
+    for i, (ln, fenced) in enumerate(zip(views, masked)):
+        if fenced or in_bq(i):
+            continue
+        # Heading boundary from the LEAF view, table rows from `views`; see
+        # `_walk_stamped_items` for why the two projections are not one.
+        _lv = leaf_views[i]
+        # THE SAME BOUNDARY RULE AS EVERY OTHER WALK (section 43 post-ship
+        # review). This hand-rolled `startswith("## ")` was invisible to the AST
+        # allowlist test, which only looked for numeric matchers -- so the "one
+        # rule" claim held for the heading walks and quietly did not here. An
+        # indented `## Implementation Order` was not a table start, and an
+        # indented heading did not end the table.
+        _io_title = _cs.h2_title(_lv)
+        if _io_title is not None and _io_title.startswith("Implementation Order"):
+            in_io = True
+            continue
+        if in_io and _cs.is_h2(_lv):
+            break
+        if not in_io:
+            continue
+        if not ln.startswith("|"):
+            continue
+        # Skip separator row (cells like `| --- | :---: | ... |`)
+        cells = [c.strip() for c in ln.strip("|").split("|")]
+        if all(re.match(r"^[:\-]+$", c) for c in cells if c):
+            continue
+        if header_cols is None:
+            header_cols = [c.lower().strip() for c in cells]
+            continue
+        # Data row
+        row = dict(zip(header_cols, cells))
+        # Find columns by fuzzy match. Order matters: more-specific keys
+        # win over generic ones via the if/elif chain.
+        section_cell = None
+        deliverable_cell = None
+        depends_cell = None
+        status_cell = None
+        order_cell = None
+        for k, v in row.items():
+            if any(key == k or key in k for key in IO_HEADER_KEYS_DELIVERABLE):
+                deliverable_cell = v
+            elif any(key == k for key in IO_HEADER_KEYS_SECTION):
+                section_cell = v
+            elif any(key == k or key in k for key in IO_HEADER_KEYS_DEPS):
+                depends_cell = v
+            elif any(key == k or key in k for key in IO_HEADER_KEYS_STATUS):
+                status_cell = v
+            elif any(key == k for key in IO_HEADER_KEYS_ORDER):
+                order_cell = v
+        # 4-col live format `| Step | Section | Tag | Dependency |` has no
+        # explicit Deliverable column; the Section cell carries both the
+        # `§N` number AND the work-item label ("Calendar App (Recurring
+        # Events + ICS Export)"). Use Section text as deliverable when no
+        # dedicated column was found.
+        if deliverable_cell is None and section_cell:
+            deliverable_cell = section_cell
+        # Determine n: prefer explicit `§N` in Section cell, else Order cell.
+        n = None
+        if section_cell:
+            m = re.match(r"§?(\d+)", section_cell)
+            if m:
+                n = int(m.group(1))
+        if n is None and order_cell:
+            try:
+                n = int(order_cell.strip("`"))
+            except ValueError:
+                pass
+        # Parse depends list into structured groups. A bare cell like
+        # `§1, §2` becomes one group `{target: self, sections: [1, 2]}`. A
+        # cross-file cell like `TODO-08 §8, §9` becomes one group `{target:
+        # TODO-08, sections: [8, 9]}` (the bare `§9` rides on the preceding
+        # target). A multi-target cell like `TODO-08 §8, TODO-09 §1` yields
+        # two groups. The ASCII `--` / `-` cell is "no deps". CLAUDE.md
+        # No-Unicode-Dashes rule means any TODO using a real em or en dash
+        # here is itself a lint violation; we detect ASCII forms only.
+        deps = _parse_dep_cell(depends_cell)
+        # Status normalization: extract `[ ]`/`[x]`/`[/]`
+        status_norm = ""
+        if status_cell:
+            m = re.search(r"\[([ x/])\]", status_cell)
+            if m:
+                status_norm = m.group(1) if m.group(1) != " " else " "
+        out.append(
+            {
+                "n": n,
+                "deliverable": deliverable_cell or "",
+                "depends_on": deps,
+                "status": status_norm,
+            }
+        )
+    return out
+
+
+def extract_inputs_xrefs(body: str) -> list:
+    """Walk under `## Inputs` and return list of XREF refs:
+       {target_path: str, target_section: str|None}.
+
+    Surface forms in the wild:
+      - bullet form:  `- -> XREF: ...`
+      - bullet form (unicode arrow):  `- -> XREF: ...` becomes legal
+      - table row:    `| -> XREF: ... | description |`
+    All three are graph edges; plain Inputs entries (path-only) are
+    consumed-file references and stay out of the graph.
+    """
+    _scan = scan_body(body)
+    return _walk_inputs_xrefs(_scan.views, _scan.leaf_views, _scan.mask,
+                              _scan.in_blockquote)
+
+
+def _walk_inputs_xrefs(views, leaf_views, masked, in_bq) -> list:
+    """Shared by `extract_inputs_xrefs` and `build_node`.
+
+    Fence-aware for the same reason as the Implementation Order walk: a fenced
+    Inputs example emits a graph EDGE to a TODO that does not exist, corrupting
+    dependency and scheduling answers rather than a count."""
+    out = []
+    in_inputs = False
+    for i, (ln, fenced) in enumerate(zip(views, masked)):
+        if fenced or in_bq(i):
+            continue
+        _lv = leaf_views[i]
+        # Shared rule, same as the Implementation Order walk above (section 43
+        # post-ship review found both).
+        _in_title = _cs.h2_title(_lv)
+        if _in_title is not None and _in_title.startswith("Inputs"):
+            in_inputs = True
+            continue
+        if in_inputs and _cs.is_h2(_lv):
+            break
+        if not in_inputs:
+            continue
+        # Normalize unicode rightwards-arrow (U+2192) to ASCII `->` for
+        # match consistency. CLAUDE.md only forbids en/em DASHES; the
+        # unicode arrow is allowed and shows up in some Inputs tables.
+        normalized = ln.replace("\u2192", "->")
+        # Bullet form. The LEAD-IN is recognised here -- this surface, unlike
+        # the stamp, requires the arrow to open the bullet -- and everything
+        # from the target rightwards is the shared parser's (TODO-06 §37).
+        #
+        # A SECOND TARGET AFTER THE FIRST MAKES THE BULLET MALFORMED, and the
+        # trailing boundary alone does not catch it -- whitespace is exactly
+        # what that boundary accepts, so `[a](x.md) [b](y.md) §1` published
+        # `x.md` as a clean edge and dropped both the second link and the
+        # section marker. Same defect and same test as the stamp-repair site
+        # (Codex adversarial, section 33 post-ship round 5, [medium]). Skipping
+        # the bullet entirely is the fail-closed answer here: unlike the repair
+        # path there is no line to rewrite, so the malformed row simply
+        # contributes no edge rather than a confidently wrong one.
+        lead = INPUTS_XREF_LEAD_RE.match(normalized)
+        m = _cs.parse_xref_clause(normalized, lead.end()) if lead else None
+        # ONE ACCEPTANCE RULE WITH THE TABLE (TODO-06 §44). The extra-destination
+        # refusal is the same `malformed` as before; what is new is that a clause
+        # cut INSIDE a markdown link is refused here too. It was caught on the
+        # table only, and emergently -- by a whole-cell anchor rather than by a
+        # decision -- so `-> XREF: [a](x.md) §1](#y)` bound a partial destination
+        # as a clean edge on this surface.
+        if m is not None and not _cs.inputs_clause_ok(normalized, m):
+            continue
+        if m is not None:
+            # UNWRAP HERE so `inputs_xrefs[].target_path` keeps meaning what it
+            # always meant -- a DESTINATION. The link arm now captures the whole
+            # link (one grammar, shared with the stamp target), and unwrapping
+            # at the point of use gets the shared label rule without changing a
+            # second subtree's field semantics on top of section 33's.
+            #
+            # FALL BACK TO THE RAW TOKEN when the unwrap yields nothing. A link
+            # that names no FILE -- `[x]()` or the same-document `[x](#anchor)`
+            # -- unwraps to the empty string by design, and the old link arm
+            # (`([^)]+)`, 1+ chars) never matched those at all, so they fell to
+            # the bare-token arm and were emitted raw. Emitting `""` instead
+            # would publish a `target_path` that violates the schema's
+            # minLength and make routed consumers reject the whole cache
+            # (Codex re-adversarial, section 33 post-ship, [medium]). Keeping
+            # the raw token preserves the prior behaviour exactly: it does not
+            # resolve, so it surfaces as an ordinary stale-XREF finding rather
+            # than as a corrupt artifact.
+            #
+            # BACKTICK STRIPPING STAYS HERE rather than moving into the parser.
+            # The bare arm of this surface excluded backticks outright before
+            # section 37, while the stamp surface keeps whatever the token
+            # carries; normalising in the parser would silently change the
+            # stamp subtree's values to fix a cosmetic difference in this one.
+            #
+            # THE SECTION FIELD WENT THE OTHER WAY, DELIBERATELY (section 40).
+            # That is not an inconsistency: the two fields differ in whether the
+            # surfaces disagreed. The stamp subtree's TARGETS are correct as they
+            # stand, so a parser-side normalisation there would be a change with
+            # no defect behind it -- whereas the closing backtick landed in the
+            # SECTION value on both subtrees alike (508 Inputs rows and 132 stamp
+            # rows), so leaving that one here would have fixed one surface and
+            # left its sibling wrong. Where a defect is shared, the rule belongs
+            # to the parser; where it is not, the caller keeps its own policy.
+            out.append({"target_path": _inputs_target(m.target),
+                        "target_section": m.section})
+            continue
+        # Table-row form: `| -> XREF: <path>[ §N] | ... |` or
+        # `| `<path>`[ §N] | ... |` (some files just put the path in a
+        # backticked cell). Detect XREF marker and extract the first
+        # path-like token.
+        if normalized.startswith("|") and "XREF:" in normalized:
+            cells = [c.strip() for c in normalized.strip("|").split("|")]
+            if cells:
+                head = cells[0]
+                # Trim arrow + XREF prefix
+                head_clean = re.sub(r"^->\s*XREF:\s*", "", head).strip()
+                # THE CELL-LEVEL UNWRAP USES THE SHARED CODE-SPAN RULE. A table
+                # cell wraps the WHOLE `path §N` construct in one span, so the
+                # unwrap has to happen here or the section marker keeps the
+                # closing backtick -- measured: dropping this step outright
+                # turned 8 live rows' `§1` into `` §1` ``. THAT HALF OF THE
+                # RATIONALE IS NOW THE PARSER'S (section 40): the marker stops at
+                # the delimiter wherever it is parsed, which is what made the
+                # BULLET surface agree with this one. The unwrap stays for the
+                # TARGET and for the whole-cell anchor below, so this branch is
+                # unchanged -- but a reader comparing the two surfaces should
+                # know the section marker no longer depends on it. It used to be a
+                # two-ended `strip("`")`, which disagreed with the token arm on
+                # a doubled delimiter and let the same token emit an
+                # unresolvable value as a bullet and a clean edge as a table row
+                # (Codex consistency, [medium]). One rule, both places.
+                # PROSE PUNCTUATION AFTER THE CLOSED SPAN COMES OFF FIRST, and
+                # it has to happen HERE because the unwrap below is what
+                # destroys the evidence: once the delimiters are gone the parser
+                # sees `path <marker>.` and cannot tell the author's full stop
+                # from marker content, so the same cell that a bullet reports as
+                # a bare marker came back with the period attached -- the exact
+                # four-surface disagreement this section exists to remove (Codex
+                # adversarial, [medium]). ONE character, and only against a
+                # closing backtick: a cell whose span is followed by anything
+                # wordier is still malformed and must still emit nothing, which
+                # is what the whole-cell anchor below decides.
+                # THE RAW CELL REACHES THE PARSER (TODO-06 §44). Two
+                # transforms used to run first and both destroyed the evidence
+                # the shared rule needs. `_CELL_SPAN_TAIL_RE` stripped ONE `.`
+                # or `:` after a closing backtick, and `_cell_code_span`
+                # unwrapped a SINGLE-backtick span; between them a cell's span
+                # boundaries were gone before the boundary rule ran, so the
+                # section marker absorbed whatever punctuation followed --
+                # measured on `` `path §7` `` cells, the table published `§7)`,
+                # `§7,`, `§7;` and `§7](#x)` where the bullet, parsing the same
+                # text raw, published `§7`.
+                #
+                # Nothing replaces them because nothing needed to: the parser
+                # already locates the marker inside a code span and stops at the
+                # delimiter (section 40), which is exactly what the unwrap was
+                # imitating by hand. Removing the imitation is what makes the
+                # two surfaces agree, rather than a third rule reconciling them.
+                # THE TABLE FORM USES THE SHARED GRAMMAR TOO. It parsed the
+                # target with a bare `(\S+?)`, so an Inputs row written as
+                # `[label with space](TODO-02.md) §1` -- or with a
+                # balanced-inner-bracket label -- produced NO edge at all,
+                # while the identical bullet form resolved correctly. This
+                # branch is inside `extract_inputs_xrefs` and appends to the
+                # same `inputs_xrefs` subtree, so the graph was silently
+                # incomplete in one of its two surface forms (Codex
+                # consistency, section 33 post-ship, [high]).
+                #
+                # A first pass at section 33 filed this as out-of-scope on the
+                # grounds that it was the Depends-On table grammar. That was
+                # simply wrong about which function it lives in, and the
+                # mistake is worth naming: the scope argument sounded right and
+                # was never checked against the enclosing def.
+                #
+                # THE ANCHOR IS NOW AN EXPLICIT WHOLE-CELL REQUIREMENT rather
+                # than a regex `$`. This branch refused a two-destination cell
+                # only because the anchor failed -- correct, but emergent, so
+                # the rule lived in punctuation instead of in a decision. It
+                # asks the shared parser now and keeps exactly the old contract
+                # locally: the clause must consume the ENTIRE cell and carry no
+                # trailing parenthetical, which is what `^TARGET( §N)?$` meant
+                # (TODO-06 §37).
+                clause = _cs.parse_xref_clause(head_clean, 0)
+                path_match = (clause if _cs.inputs_clause_ok(
+                    head_clean, clause, whole=True) else None)
+                if path_match:
+                    # STRIP BACKTICKS FROM THE TOKEN, not just the cell. The
+                    # cell-level `strip("`")` above cannot reach them when a
+                    # section marker follows -- `` `path` §7 `` ends in `7`, so
+                    # only the LEADING backtick came off and the target kept a
+                    # trailing one. Pre-existing (the old `(\S+?)` captured it
+                    # too) and cosmetic, since `resolve_xref_target` strips
+                    # backticks itself, but it made the table form disagree
+                    # with the bullet form -- whose bare arm excludes backticks
+                    # outright. Found by the surface-form parity fixture.
+                    out.append(
+                        {
+                            "target_path": _inputs_target(path_match.target),
+                            "target_section": path_match.section,
+                        }
+                    )
+    return out
+
+
+def extract_stamps_xrefs(body: str) -> list:
+    """Return every `> **Accepted:**` / `> **Deferred:**` stamp XREF ref:
+       {kind, severity, target_path, target_section, item_name?}.
+
+    Two-pass parser: first match the stamp header (kind + severity), then
+    iterate every XREF clause on the same line. Live stamps in
+    `todo/02-kernel-core/TODO-12-native-api-ssdt.md` carry up to 6 XREFs
+    on a single Accepted: line; emitting one cache entry per clause keeps
+    every deferred-work obligation in the graph instead of dropping all
+    but the first.
+    """
+    _scan = scan_body(body)
+    lines, mask = _scan.lines, _scan.mask
+    return _walk_stamps_xrefs(lines, mask)
+
+
+def _walk_stamps_xrefs(lines, masked) -> list:
+    """Shared by `extract_stamps_xrefs` and `build_node`.
+
+    Fence-aware: a documented stamp example inside a fence is not a stamp. It
+    otherwise emits a real deferred/accepted graph edge from a line whose whole
+    purpose is to show readers what a stamp looks like."""
+    out = []
+    for ln, fenced in zip(lines, masked):
+        if fenced:
+            continue
+        header_m = STAMP_HEADER_RE.match(ln)
+        if not header_m:
+            continue
+        kind = header_m.group("kind").lower()
+        severity = header_m.group("severity") or ""
+        # Iterate every XREF clause from after the header onward, through the
+        # SHARED parser (TODO-06 section 37). This site used to bind the target
+        # and its REQUIRED section marker in one regex, which meant a clause
+        # naming two destinations simply failed to match and vanished -- the
+        # right outcome, reached without ever asking the question, so the rule
+        # could not be shared and had to be rediscovered here every time
+        # section 33 found another shape.
+        #
+        # THE POLICY IS UNCHANGED AND STAYS LOCAL: a malformed clause, or one
+        # with no section marker, contributes no edge and says nothing. Adding a
+        # diagnostic here would be new output from a refactor that is supposed
+        # to be behaviour-preserving.
+        for _lead, clause in _cs.iter_xref_clauses(ln, header_m.end()):
+            if clause.malformed or clause.section is None:
+                continue
+            entry = {
+                "kind": kind,
+                "severity": severity,
+                "target_path": clause.target,
+                "target_section": clause.section,
+            }
+            if clause.item_name:
+                entry["item_name"] = clause.item_name
+            out.append(entry)
+    return out
+
+
+# --- Node assembly -------------------------------------------------------
+
+
+def build_node(file_path: Path, repo_root: Path, timestamps: dict, content: str):
+    """Construct a single cache node from a TODO file's content. Returns
+    (node, errors) where errors is a list of (category, message) tuples
+    (file:line is added by the caller). errors == [] on clean parse."""
+    try:
+        # `as_posix()`, not `str()`: the WIRE SPELLING of a cache path is
+        # POSIX-relative, and `str()` yields the host separator -- so a build on
+        # Windows would publish backslash paths that every routed reader then
+        # refuses as SHAPE, a cache the producer considers valid and no consumer
+        # will read (Codex re-adversarial round 7, section 23 review, [medium]).
+        # Fixing it here rather than relaxing the validator keeps one spelling
+        # in the artifact instead of two the readers must both accept.
+        rel = file_path.relative_to(repo_root).as_posix()
+    except ValueError:
+        rel = file_path.name
+    domain = file_path.parent.name
+    title_from_h1 = extract_title(content)
+
+    fm, body, fm_err = split_frontmatter(content)
+    errors = []
+    if fm_err:
+        errors.append(("malformed-yaml", fm_err))
+        # Continue parsing the body so we still produce a (no-frontmatter)
+        # node; the caller decides whether the malformed YAML aborts the
+        # whole build. (§2's exit-code rule says "1 on any file's frontmatter
+        # malformed"; we honor that at main() level.)
+        fm = None
+
+    if fm is not None:
+        fm_errors = validate_frontmatter(fm)
+        # Treat non-warning categories as errors.
+        for cat, msg in fm_errors:
+            if cat == "unknown-field":
+                # Surface as warning category; main() doesn't fail on these.
+                errors.append((cat, msg))
+            else:
+                errors.append((cat, msg))
+
+    _body = scan_body(body)
+    body_lines, body_mask = _body.lines, _body.mask
+    if _body.terminal is not None:
+        errors.append((_cs.terminal_category(_body.terminal),
+                       _body.unclosed_reason()))
+    # ONE projection, computed once and shared by the whole closure -- the
+    # property is exactly that these five see the same line. `_walk_stamps_xrefs`
+    # keeps the PHYSICAL line on purpose; see the closure note in this file.
+    body_views, body_leaves = _body.views, _body.leaf_views
+    _bq = _body.in_blockquote
+    errors.extend(_walk_unusable_headings(body_leaves, body_mask, _bq))
+    sections_io = _walk_implementation_order(body_views, body_leaves,
+                                             body_mask, _bq)
+    inputs_xrefs = _walk_inputs_xrefs(body_views, body_leaves, body_mask, _bq)
+    stamps_xrefs = _walk_stamps_xrefs(body_lines, body_mask)
+    section_headings = _walk_section_headings(body_leaves, body_mask, _bq)
+
+    created_at, last_active_at = timestamps.get(rel, (None, None))
+
+    if fm:
+        node = {
+            "id": fm.get("id"),
+            "schema_version": fm.get("schema_version"),
+            "domain": fm.get("domain", domain),
+            "status": fm.get("status"),
+            "title": fm.get("title", title_from_h1),
+            "file_path": rel,
+            "created_at": created_at,
+            "last_active_at": last_active_at,
+        }
+        # THE COPY LIST IS DERIVED, NOT RETYPED. `_EMITTED_OPTIONAL` is the
+        # single statement of which authored optional fields reach the cache,
+        # and the assertion below turns "a field stopped being emitted" from an
+        # invisible regression into a refusal. The producer-contract digest
+        # cannot see that class: it certifies the DECLARED field set, so a copy
+        # list that quietly drops a field still publishes under a valid
+        # identity, and the reader's default takes over -- which is exactly the
+        # read-but-never-emitted failure this whole section exists to close,
+        # reappearing one layer down (Codex adversarial, [medium]).
+        for opt in _EMITTED_OPTIONAL:
+            if opt in fm:
+                node[opt] = fm[opt]
+        dropped = sorted(k for k in _EMITTED_OPTIONAL if k in fm and k not in node)
+        if dropped:
+            errors.append(
+                ("emission-drop",
+                 f"authored optional field(s) {dropped} did not reach the "
+                 f"cache node; the copy list and _EMITTED_OPTIONAL disagree"))
+    else:
+        # TODO-06 §5 (back-fill migration) closed 2026-04-23: every
+        # TODO-*.md under todo/ now carries a frontmatter block. Missing
+        # frontmatter is FATAL -- a file without the block either means
+        # the author forgot to run the template OR the file was renamed
+        # without updating the block. Hard-fail instead of silently
+        # producing an id=None node (which would then ambush downstream
+        # stats/backlinks/orphans queries with a mysterious `None` entry).
+        errors.append((
+            "missing-frontmatter",
+            f"{rel}: TODO file has no frontmatter block. "
+            "Run `python3 scripts/todo-graph/migrate-add-frontmatter.py "
+            f"--root {Path(rel).parent}` or add the block manually -- see "
+            "docs/infrastructure/todo-metadata.md for the schema.",
+        ))
+        # Return a placeholder node so downstream code that expects a
+        # dict doesn't crash; main() sees the error and refuses to
+        # write the cache.
+        node = {
+            "id": None,
+            "schema_version": None,
+            "domain": domain,
+            "status": None,
+            "title": title_from_h1,
+            "file_path": rel,
+            "created_at": created_at,
+            "last_active_at": last_active_at,
+        }
+
+    node["sections"] = sections_io
+    node["section_headings"] = [{"n": n, "title": t} for n, t in section_headings]
+    node["inputs_xrefs"] = inputs_xrefs
+    node["stamps_xrefs"] = stamps_xrefs
+    # Per-item stamped_items (per-item cache extension): only emit when the
+    # body actually has any `[x]` items; many no-frontmatter / fully-pending
+    # TODOs still parse with zero stamped items, in which case the key is
+    # omitted to keep the cache compact and the schema's optional contract
+    # honest. Lint Check 7 reads stamped_items as the source of truth for
+    # stub-behind-stamp findings.
+    stamped_items = _walk_stamped_items(body_views, body_leaves, body_mask,
+                                        rel, _bq)
+    if stamped_items:
+        node["stamped_items"] = stamped_items
+    # A CONDITIONAL EMISSION IS STILL AN EMISSION, and this is the only place
+    # the expectation exists. `stamped_items` is excluded from the per-node
+    # presence check in `main` -- correctly, since its absence is legitimate for
+    # a TODO with no `[x]` items -- so neither that scan nor the undeclared-key
+    # scan nor the contract digest can see the assignment above being deleted:
+    # every node would simply lack the key and all three checks would pass.
+    #
+    # That failure is FAIL-OPEN rather than merely lossy, which is why it earns
+    # a check of its own. `check_stub_behind_stamp.py` reads an all-absent
+    # population as REASON_LEGACY_NO_STAMPED_ITEMS (rc 3), and
+    # `scripts/lint.sh:574` downgrades rc 3 to a WARNING -- so a producer
+    # regression here does not break the build, it silently DISABLES lint
+    # Check 7 (stub-behind-stamp) while reporting a cache that predates an
+    # extension it in fact implements (Codex re-adversarial, section 25,
+    # [medium]).
+    if stamped_items and "stamped_items" not in node:
+        errors.append(
+            ("emission-drop",
+             f"{rel}: {len(stamped_items)} stamped item(s) were extracted but "
+             f"did not reach the cache node; lint Check 7 would read the "
+             f"resulting cache as legacy and DOWNGRADE ITSELF TO A WARNING "
+             f"rather than report the producer regression"))
+
+    return node, errors
+
+
+# --- main ---------------------------------------------------------------
+
+
+def _publish_atomically(path: Path, blob: bytes) -> None:
+    """Write `blob` to `path` so no reader can ever observe a partial file.
+
+    `Path.write_text` truncates in place, so a reader that opened the cache
+    mid-write got a prefix of it, and a producer killed mid-write left a
+    permanently corrupt one. The temp file is created in the SAME directory so
+    `os.replace` is a rename within one filesystem (atomic); fsync before the
+    rename so a crash cannot leave the rename durable while the bytes are not.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(blob)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # `mkstemp` opens 0600 by design, and `os.replace` PRESERVES the source
+        # mode -- so switching from `write_text` to this silently made the cache
+        # owner-only. It is a shared build artifact read by lint checks, the
+        # snapshot, and CI, so restore the ordinary create mode under the
+        # process umask rather than inheriting the temp file's.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, path)
+        # FSYNC THE DIRECTORY, not just the file. `os.replace` durability is a
+        # property of the DIRECTORY ENTRY: without this a crash could persist
+        # the cache's rename while the binding's earlier rename is still only in
+        # the page cache, which is exactly the mismatched pair that writing the
+        # binding first is meant to make impossible (Codex adversarial, section
+        # 21, [high]).
+        _fsync_dir(path.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _fsync_dir(d: Path) -> None:
+    """Best-effort directory fsync; not every filesystem supports it."""
+    try:
+        fd = os.open(str(d), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+class _publish_lock:
+    """Serialize publish + prune against another producer writing the same cache.
+
+    NOT a repo-wide writer lock -- one advisory `flock` on one lockfile beside
+    the cache being published. Deriving the prune's keeper from the cache on
+    disk shrank the concurrent-publish race but could not close it, and the
+    mtime guard that replaced it was both clock-dependent (in the one change
+    whose entire point is removing clock dependence) and wrong on
+    coarse-timestamp filesystems (Codex re-adversarial, section 21, [medium]).
+    A lock makes "publish the pair, then drop superseded bindings" atomic with
+    respect to another build, which is the only thing that was ever needed.
+
+    Best-effort by design: a platform without `flock`, or a `build/` we cannot
+    create a lockfile in, must not turn a working build into a failure. The
+    unlocked path is exactly the behaviour that shipped before, and its worst
+    outcome is a reader REFUSAL that the next rebuild clears.
+    """
+
+    def __init__(self, cache_path: Path):
+        self._path = cache_path.with_name(f".{cache_path.name}.lock")
+        self._fd = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+            self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o666)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)     # closing the descriptor releases the lock
+            except OSError:
+                pass
+            self._fd = None
+        return False
+
+
+def _prune_stale_bindings(cache_path: Path) -> None:
+    """Drop corpus bindings for cache generations that are no longer published.
+
+    Immutable, digest-named bindings would otherwise accumulate one file per
+    build. BEST-EFFORT ON PURPOSE: a binding that cannot be removed is garbage,
+    never a correctness problem, and failing the build over it would turn a
+    successful publish into a refusal after the fact.
+
+    THE KEEPER IS DERIVED FROM THE CACHE ON DISK, NOT FROM WHAT THIS PROCESS
+    JUST WROTE (Codex adversarial, section 21, [high]). Two concurrent builds
+    interleave -- A publishes, B publishes, A prunes -- and a prune that kept
+    "my own binding" would delete B's while B's cache is the one on disk,
+    leaving the published cache unreadable until somebody rebuilt. Re-reading
+    here means A keeps whatever generation actually won. The remaining window is
+    one read plus one unlink rather than the whole publish, and its failure mode
+    is a reader REFUSAL, never a wrong answer.
+    """
+    try:
+        # The keeper is derived from the cache ON DISK, inside the same lock
+        # that published it, so no other producer can have replaced it between
+        # the read and the unlinks. No timestamp is consulted: under the lock
+        # there is exactly one live generation, and every other binding is
+        # superseded by definition.
+        live = _cs.sidecar_path(
+            cache_path, hashlib.sha256(cache_path.read_bytes()).hexdigest())
+        for p in cache_path.parent.glob(f"{cache_path.name}.corpus-*.json"):
+            if p == live:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        return
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build the TODO graph cache from todo/**/*.md frontmatter + structure."
+    )
+    parser.add_argument(
+        "--root",
+        default="todo",
+        help="Root directory to walk (default: todo/)",
+    )
+    parser.add_argument(
+        "--output",
+        default="build/todo-cache.json",
+        help="Output cache path (default: build/todo-cache.json)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-warning output; only fail-stop and final summary print",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Repo root (defaults to git toplevel of --root, or its parent)",
+    )
+    # THE NOVELTY PROBE. `producer_differential.py` asks BOTH trees this, and
+    # compares the answers to decide whether a head-side refusal of the base
+    # corpus is a check that did not exist at base. It reads no corpus and
+    # writes no cache -- deliberately, so it stays answerable by a tree whose
+    # corpus this producer cannot process, which is the only situation it is
+    # ever asked in.
+    parser.add_argument(
+        "--emitted-error-categories",
+        action="store_true",
+        help="Print the declared EMITTED_ERROR_CATEGORIES as a JSON array and exit",
+    )
+    args = parser.parse_args()
+
+    if args.emitted_error_categories:
+        json.dump(sorted(EMITTED_ERROR_CATEGORIES), sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+
+    t0 = time.monotonic()
+
+    todo_root = Path(args.root).resolve()
+    if not todo_root.is_dir():
+        sys.stderr.write(f"[build.py] FATAL: --root {todo_root} is not a directory\n")
+        return 1
+
+    if args.repo_root:
+        repo_root = Path(args.repo_root).resolve()
+    else:
+        # Try git toplevel first; fall back to todo_root.parent.
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(todo_root), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            repo_root = Path(res.stdout.strip()).resolve()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            repo_root = todo_root.parent
+
+    files = walk_todo_files(todo_root)
+    if not args.quiet:
+        sys.stderr.write(f"[build.py] discovered {len(files)} TODO files under {todo_root}\n")
+
+
+    nodes = []
+    fatal_errors = 0
+    warnings = 0
+    # THE FINGERPRINT IS TAKEN FROM THE BYTES THIS PASS ACTUALLY CONSUMES, not
+    # from a separate scan bracketing it. A pre-scan plus a post-scan proves
+    # only that the corpus looked the same at two instants: a file that changed
+    # to B, was read as B, and was restored to A before the post-scan compares
+    # EQUAL, and the cache is then published with nodes built from B and a
+    # binding claiming A (Codex design review, section 21, [high] -- the ABA
+    # race). Hashing the exact bytes handed to `build_node` makes the recorded
+    # map a statement about what was parsed, so that restoration shows up as the
+    # mismatch it is.
+    consumed = {}
+    # THE RECORDED HISTORY IS THE ONE THE TIMESTAMPS CAME FROM, taken from the
+    # walk itself rather than from a second `git log` that could observe a
+    # different generation (Codex re-adversarial, section 21, [high]). A None
+    # provenance means git could not be consulted, so no timestamp was derived
+    # and there is nothing for the history binding to protect; the readers'
+    # `corpus_history_id` is then the authority for what to record.
+    try:
+        timestamps, history_id = collect_git_timestamps(
+            repo_root, files, todo_root)
+    except _cs.CacheSchemaError as exc:
+        # The walk itself refused -- today only the section 31 shallowness
+        # check, which is a REFUSAL rather than a failed read, so it must not
+        # fall through to the provenance-rescue path below.
+        sys.stderr.write(f"[build.py] FAIL: {exc}; cache NOT written\n")
+        return 3
+    if isinstance(history_id, _Provenance):
+        # NEITHER MARKER MAY BECOME AN IDENTITY BY ITSELF. The fallback probe is
+        # allowed to answer only with a DETERMINATE fact about the tree; if it
+        # answers with a real `tip:count`, git is healthy NOW and the walk that
+        # failed a moment ago was transient -- so the timestamps in hand describe
+        # nothing, and publishing them under that id is the exact certification
+        # hole this refuses (Codex design review, section 24, [high]).
+        try:
+            probed = _cs.corpus_history_id(todo_root)
+        except _cs.CacheSchemaError as exc:
+            sys.stderr.write(f"[build.py] FAIL: {exc}; cache NOT written\n")
+            return 3
+        allowed = (_DETERMINATE_NO_GIT
+                   if history_id is PROVENANCE_INDETERMINATE
+                   else _DETERMINATE_NO_DERIVATION)
+        if probed not in allowed:
+            # THE RULE COVERS BOTH MARKERS, and gating only INDETERMINATE left
+            # the same hole one door over (Codex adversarial, section 24,
+            # [high]): point `--root` at a corpus that lives in a DIFFERENT
+            # repository than `--repo-root` and every path fails
+            # `relative_to`, so the walk derives nothing and returns
+            # NO_DERIVATION -- while this probe reads the corpus's own
+            # repository and hands back a real `tip:count`. Null
+            # created_at/last_active_at would then ship under a binding that a
+            # history-consuming reader accepts as fresh. Whichever marker came
+            # back, a REAL identity here means the corpus has a history this
+            # build did not read, and that is never publishable.
+            why = ("did not answer, but git is answering now"
+                   if history_id is PROVENANCE_INDETERMINATE
+                   else "derived no timestamp for any corpus file, yet the "
+                        "corpus has git history")
+            sys.stderr.write(
+                f"[build.py] FAIL: the git log walk that derives "
+                f"created_at/last_active_at {why} ({probed}) -- so the "
+                f"timestamps in hand describe no history and must not be "
+                f"published under it (is --root inside --repo-root?); cache "
+                f"NOT written\n")
+            return 3
+        history_id = probed
+
+    for f in files:
+        # Compute display path: relative to repo_root when possible,
+        # otherwise just the basename (test fixtures under /tmp etc.).
+        try:
+            display_rel = str(f.relative_to(repo_root))
+        except ValueError:
+            display_rel = f.name
+        try:
+            # THE SHARED RULE, not a private read: a FIFO or broken symlink named
+            # TODO-*.md must fail the BUILD, exactly as it fails every reader.
+            # Skipping it here published a cache no reader would accept.
+            raw_bytes = _cs.read_corpus_file(f)
+            content = raw_bytes.decode("utf-8")
+        except Exception as exc:
+            sys.stderr.write(f"[build.py] FAIL {display_rel}: read error: {exc}\n")
+            fatal_errors += 1
+            continue
+        rel_key = f.relative_to(todo_root).as_posix()
+        consumed[rel_key] = hashlib.sha256(raw_bytes).hexdigest()
+
+        node, errors = build_node(f, repo_root, timestamps, content)
+        rel = display_rel
+        _assert_declared_categories(errors, rel)
+        for cat, msg in errors:
+            if cat in WARNING_ERROR_CATEGORIES:
+                if not args.quiet:
+                    sys.stderr.write(f"[build.py] WARN {rel}: {cat}: {msg}\n")
+                warnings += 1
+            else:
+                sys.stderr.write(f"[build.py] FAIL {rel}: {cat}: {msg}\n")
+                fatal_errors += 1
+        nodes.append(node)
+
+    if fatal_errors > 0:
+        sys.stderr.write(
+            f"[build.py] FAIL: {fatal_errors} fatal error(s) across "
+            f"{len(files)} files; cache NOT written\n"
+        )
+        return 1
+
+    # Sort nodes by file_path for deterministic output (idempotency).
+    nodes.sort(key=lambda n: n["file_path"])
+
+    # ---------------------------------------------------------------------
+    # THE PRODUCER GENERATION WINDOW (section 21).
+    #
+    # Section 17 made both READERS generation-bound. The producer had the
+    # mirror-image hole and no reader could ever see it: this process reads a
+    # TODO, that file changes, and this process then writes a cache whose NEWER
+    # mtime made the already-stale node look FRESH. A freshness test asks "is
+    # the cache newer than the corpus?", and the answer was legitimately yes.
+    #
+    # So the refusal has to live here, at the only point that knows both what
+    # was parsed and what is on disk now. Nothing has been written yet, which is
+    # what makes "refuse" mean the previous cache survives byte-identical rather
+    # than truncated.
+    # ---------------------------------------------------------------------
+    # AN EMPTY CORPUS IS REFUSED HERE TOO. `check_freshness` already refuses to
+    # call a cache fresh against an empty corpus, so a producer that happily
+    # published `[]` would emit an artifact every reader rejects -- the two
+    # sides of one rule disagreeing (Codex adversarial, section 21, [high]).
+    if not consumed:
+        sys.stderr.write(
+            f"[build.py] FAIL: no TODO files found under {todo_root} -- "
+            f"refusing to publish a cache against an empty corpus\n")
+        return 3
+    try:
+        _cs.check_corpus_unchanged(todo_root, consumed)
+        moved = _cs.corpus_history_id(todo_root) != history_id
+    except _cs.CacheSchemaError as exc:
+        sys.stderr.write(
+            f"[build.py] FAIL: the TODO corpus moved while this build was "
+            f"reading it ({exc}); cache NOT written\n")
+        return 3
+    if moved:
+        sys.stderr.write(
+            "[build.py] FAIL: the corpus git history moved while this build "
+            "was running, so its created_at/last_active_at fields would not "
+            "describe any single generation; cache NOT written\n")
+        return 3
+
+    # LEXICAL, NOT RESOLVED, and only the final component matters. `.resolve()`
+    # follows a symlink AT `build/todo-cache.json` and `_publish_atomically`
+    # then replaces what it POINTS AT -- so `build-and-validate.sh`, the
+    # ordinary user-facing path, could overwrite a tracked TODO with cache JSON
+    # and its own cleanup would remove the symlink afterwards, hiding what
+    # happened. `validate.py` grew an ownership gate for exactly this, but the
+    # wrapper runs the producer FIRST, so that gate never saw this path (Codex
+    # re-adversarial round 8, section 23 review, [high]).
+    #
+    # Normalising lexically keeps every equivalent spelling working and still
+    # resolves symlinked PARENT directories at open time -- a `build/` symlinked
+    # onto a tmpfs is untouched by this. What changes is that `os.replace` now
+    # replaces the final directory ENTRY, so `--output X` produces a regular
+    # file at X and nothing outside X is ever written.
+    output_path = Path(os.path.abspath(os.path.normpath(args.output)))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # THE DECLARATION IS BOUND AT RUNTIME, not merely written down (section 25).
+    # `cache_schema.PRODUCER_CONTRACT_DIGEST` is derived from
+    # `EMITTED_NODE_FIELDS`, so it certifies the DECLARATION -- and a declaration
+    # nothing checks is exactly the evidence section 20 replaced when it retired
+    # "grep the emitter's source text". Without this loop a new key added to
+    # `node` above would ship under a digest that still claims the old field set,
+    # which is the one failure the identity exists to make impossible. Refusing
+    # here means the previous cache survives byte-identical, same as every other
+    # producer-side refusal.
+    undeclared = sorted({k for n in nodes for k in n} - _cs.EMITTED_NODE_FIELDS)
+    if undeclared:
+        sys.stderr.write(
+            f"[build.py] FAIL: emitted node key(s) {undeclared} are not in "
+            f"cache_schema.EMITTED_NODE_FIELDS; declare them there (which moves "
+            f"{_cs.PRODUCER_CONTRACT_DIGEST_KEY}) and add them to "
+            f"{_cs.SCHEMA_REL}; cache NOT written\n")
+        return 1
+
+    # THE OTHER DIRECTION, AND IT IS THE ONE THE DIGEST CANNOT SEE. The scan
+    # above only subtracts, so it catches an undeclared ADDITION. A key dropped
+    # from the node literal in `build_node` while `_ALWAYS_EMITTED` still
+    # declares it publishes a node the readers expect a field on, under an
+    # identity that still certifies the old field set -- so every reader takes
+    # its default and nothing reports the loss. Checked per node rather than
+    # over the union, because a field missing from ONE node is the same defect
+    # arriving on one file.
+    #
+    # `_CONDITIONAL_EMITTED` is deliberately excluded: `stamped_items` is
+    # omitted when empty by contract, so its absence is not evidence of
+    # anything. The import-time equality assert beside its declaration is what
+    # keeps it from silently leaving the contract.
+    missing = sorted({k for k in _ALWAYS_EMITTED
+                      for n in nodes if k not in n})
+    if missing:
+        offenders = sorted({n.get("file_path") or "<unknown>" for n in nodes
+                            if any(k not in n for k in _ALWAYS_EMITTED)})[:3]
+        sys.stderr.write(
+            f"[build.py] FAIL: node key(s) {missing} are declared in "
+            f"_ALWAYS_EMITTED but absent from emitted node(s) (e.g. "
+            f"{offenders}); the producer stopped writing a field the contract "
+            f"digest still certifies, so every reader would silently take its "
+            f"default; cache NOT written\n")
+        return 1
+
+    # `sort_keys=True` for byte-identical re-runs; trailing newline so the
+    # file is shell-friendly (`cat` doesn't show "no newline at end").
+    #
+    # THE ROOT STAYS A BARE ARRAY, and section 25 chose that deliberately after
+    # costing the alternative. A root envelope carrying the identity would make
+    # the cache self-describing, but the identity has to be READ, and every
+    # reader that already routes through `cache_schema` gets it either way --
+    # while the array is also parsed directly by tools this section may not
+    # rewrite (`scripts/overnight/decision-registry.py:67` and its two tests are
+    # control plane). Changing the root type would break those with no
+    # compatibility shim available in JSON, so the identity rides in the corpus
+    # binding sidecar instead: the artifact-level facts already live there
+    # (`SIDECAR_SCHEMA`, `cache_sha256`, `history_id`), the sidecar's NAME is
+    # the cache digest so it is bound to these exact bytes, and it costs no
+    # consumer a change.
+    blob = (json.dumps(nodes, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    cache_sha = hashlib.sha256(blob).hexdigest()
+
+    # BINDING FIRST, CACHE SECOND, BOTH ATOMIC -- and the binding's NAME carries
+    # the cache digest, so the pair commits without a two-file transaction
+    # (Codex design review, section 21, [medium]). Die anywhere in here and the
+    # durable state is still a cache sitting next to the binding that describes
+    # it: before the replace that is the OLD pair, after it the NEW one. A
+    # fixed-name sidecar could not do that -- it would leave new-cache with
+    # old-binding, which every reader refuses until somebody rebuilds.
+    side = _cs.sidecar_path(output_path, cache_sha)
+    binding = (json.dumps({
+        "schema": _cs.SIDECAR_SCHEMA,
+        # THE PRODUCER CONTRACT THIS CACHE WAS WRITTEN AGAINST (section 25).
+        # `SIDECAR_SCHEMA` beside it identifies the BINDING's own wire format,
+        # which is a different question and moves for different reasons; these
+        # two identify the CACHE's field contract, which is what a reader needs
+        # before it walks a node. Both are emitted unconditionally, so no
+        # migration is needed to start requiring them.
+        _cs.CACHE_FORMAT_VERSION_KEY: _cs.CACHE_FORMAT_VERSION,
+        _cs.PRODUCER_CONTRACT_DIGEST_KEY: _cs.PRODUCER_CONTRACT_DIGEST,
+        "cache_sha256": cache_sha,
+        "history_id": history_id,
+        "corpus": consumed,
+    }, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    with _publish_lock(output_path):
+        _publish_atomically(side, binding)
+        _publish_atomically(output_path, blob)
+        _prune_stale_bindings(output_path)
+
+    elapsed = time.monotonic() - t0
+    if not args.quiet:
+        try:
+            display = output_path.relative_to(Path.cwd())
+        except ValueError:
+            display = output_path
+        sys.stderr.write(
+            f"[build.py] OK: wrote {len(nodes)} nodes to {display} "
+            f"({warnings} warnings, {elapsed:.2f}s)\n"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

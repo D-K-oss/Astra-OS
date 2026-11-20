@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Desktop Design · {{name}}</title>
+<meta name="description" content="Interactive reference for the {{name}} desktop shell: taskbar, Start menu, quick settings, window chrome and system icons, generated from the design tokens.">
+<link rel="icon" type="image/png" href="../icon.png">
+<style>
+/* Generated from docs/design/tokens.json by scripts/site/build.py. */
+{{design_tokens_css}}
+
+[data-theme="dark"]  { --wallpaper: url(../wallpapers/silk-dark.jpg);  --glyph: #fff; }
+[data-theme="light"] { --wallpaper: url(../wallpapers/silk-light.jpg); --glyph: #1b1b1b; }
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { font: 400 14px/20px var(--font-ui); color: var(--text-primary); background: #000 var(--wallpaper) center / cover no-repeat;
+  overflow: hidden; user-select: none; -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: default; }
+svg.g { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---- materials ---------------------------------------------------------- */
+.acrylic { position: relative; isolation: isolate; }
+.acrylic::before { content: ""; position: absolute; inset: 0; border-radius: inherit; z-index: -2; pointer-events: none;
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(var(--sat)); backdrop-filter: blur(var(--blur)) saturate(var(--sat)); background: var(--tint);
+  /* The glass edge: a one-pixel highlight along the top inside edge, 45 percent of it on the other three. */
+  box-shadow: inset 0 1px 0 rgba(255,255,255,var(--edge)), inset 0 0 0 1px rgba(255,255,255,calc(var(--edge) * .45)); }
+.acrylic::after { content: ""; position: absolute; inset: 0; border-radius: inherit; z-index: -1; pointer-events: none; opacity: var(--noise);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 1 0'/></filter><rect width='160' height='160' filter='url(%23n)'/></svg>"); }
+.mat-taskbar { --tint: var(--mat-taskbar-tint); --blur: var(--mat-taskbar-blur); --noise: var(--mat-taskbar-noise); --sat: var(--mat-taskbar-saturate); --edge: var(--mat-taskbar-edge); }
+.mat-start   { --tint: var(--mat-start-tint);   --blur: var(--mat-start-blur);   --noise: var(--mat-start-noise);   --sat: var(--mat-start-saturate);   --edge: var(--mat-start-edge); }
+.mat-flyout  { --tint: var(--mat-flyout-tint);  --blur: var(--mat-flyout-blur);  --noise: var(--mat-flyout-noise);  --sat: var(--mat-flyout-saturate);  --edge: var(--mat-flyout-edge); }
+.mat-menu    { --tint: var(--mat-menu-tint);    --blur: var(--mat-menu-blur);    --noise: var(--mat-menu-noise);    --sat: var(--mat-menu-saturate);    --edge: var(--mat-menu-edge); }
+/* Window frames (title bar, navigation pane, dialogs, tooltips): the frame glass. Content areas stay solid. */
+.mat-frame   { --tint: var(--mat-frame-tint);   --blur: var(--mat-frame-blur);   --noise: var(--mat-frame-noise);   --sat: var(--mat-frame-saturate);   --edge: var(--mat-frame-edge); }
+
+/* ---- desktop icons ------------------------------------------------------ */
+.desk { position: fixed; top: var(--size-desktop-margin); left: var(--size-desktop-margin); display: grid; grid-auto-flow: column;
+  grid-template-rows: repeat(auto-fill, var(--size-desktop-cell-height)); height: calc(100vh - var(--size-taskbar-height) - 16px); gap: 2px; }
+.dicon { width: var(--size-desktop-cell-width); height: var(--size-desktop-cell-height); display: flex; flex-direction: column; align-items: center; gap: 4px; padding-top: 6px;
+  border-radius: var(--radius-control); border: 1px solid transparent; }
+.dicon:hover { background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.16); }
+.dicon.sel { background: var(--selection-fill); border-color: var(--selection-stroke); }
+.dicon img { width: var(--size-desktop-icon); height: var(--size-desktop-icon); filter: drop-shadow(0 1px 2px rgba(0,0,0,.35)); }
+.dicon span { font-size: 12px; line-height: 16px; text-align: center; color: var(--desktop-label); text-shadow: 0 1px 2px var(--desktop-label-shadow), 0 0 6px var(--desktop-label-shadow); padding: 0 2px; }
+
+/* ---- taskbar ------------------------------------------------------------ */
+.taskbar { position: fixed; left: 0; right: 0; bottom: 0; height: var(--size-taskbar-height); display: flex; align-items: center; z-index: 50;
+  border-top: 1px solid var(--stroke-divider); }
+.tb-center { position: absolute; left: 50%; transform: translateX(-50%); display: flex; gap: var(--size-taskbar-gap); height: 100%; align-items: center; }
+.tb-btn { position: relative; width: var(--size-taskbar-button); height: var(--size-taskbar-button); display: grid; place-items: center; border-radius: var(--radius-taskbar-button);
+  transition: background var(--motion-fast); }
+.tb-btn:hover, .tb-btn.open { background: var(--subtle-fill-hover); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.tb-btn:active img { transform: scale(.86); }
+.tb-btn img { width: var(--size-taskbar-icon); height: var(--size-taskbar-icon); transition: transform var(--motion-fast) var(--ease-standard); }
+.tb-btn .ind { position: absolute; bottom: 2px; left: 50%; transform: translateX(-50%); width: var(--size-taskbar-indicator-width-idle); height: var(--size-taskbar-indicator-height);
+  border-radius: 2px; background: var(--taskbar-indicator-idle); transition: width var(--motion-normal) var(--ease-decelerate); }
+.tb-btn.active .ind { width: var(--size-taskbar-indicator-width-active); background: var(--taskbar-indicator); }
+.tb-btn.active { background: var(--subtle-fill-hover); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.tb-search { height: 36px; width: 196px; margin: 0 4px; border-radius: var(--radius-search-box); display: flex; align-items: center; gap: 10px; padding: 0 14px;
+  background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); color: var(--text-secondary); }
+.tb-search:hover { background: var(--control-fill-hover); }
+.tb-right { margin-left: auto; display: flex; align-items: center; height: 100%; padding-right: 8px; gap: 2px; }
+.tray { height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: var(--radius-taskbar-button); }
+.tray:hover, .tray.open { background: var(--subtle-fill-hover); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.clock { height: 40px; padding: 0 10px; border-radius: var(--radius-taskbar-button); text-align: right; font-size: 12px; line-height: 16px; display: flex; align-items: center; gap: 10px; }
+.clock:hover, .clock.open { background: var(--subtle-fill-hover); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.chev { width: 28px; height: 40px; display: grid; place-items: center; border-radius: var(--radius-taskbar-button); }
+.chev:hover { background: var(--subtle-fill-hover); }
+
+/* ---- flyout panels ------------------------------------------------------ */
+.panel { position: fixed; z-index: 60; border-radius: var(--radius-overlay); box-shadow: var(--elev-flyout), inset 0 0 0 1px var(--stroke-surface);
+  opacity: 0; transform: translateY(var(--size-start-offset-bottom)); pointer-events: none;
+  transition: opacity var(--motion-start-close) var(--ease-accelerate), transform var(--motion-start-close) var(--ease-accelerate); }
+.panel.show { opacity: 1; transform: none; pointer-events: auto;
+  transition: opacity var(--motion-normal) var(--ease-decelerate), transform var(--motion-start-open) var(--ease-decelerate); }
+
+/* Start */
+.start { left: 50%; margin-left: calc(var(--size-start-width) / -2); bottom: calc(var(--size-taskbar-height) + var(--size-start-offset-bottom));
+  width: var(--size-start-width); height: min(var(--size-start-height), calc(100vh - var(--size-taskbar-height) - 24px)); box-shadow: var(--elev-start), inset 0 0 0 1px var(--stroke-surface);
+  display: flex; flex-direction: column; transform: translateY(var(--size-start-slide)); }
+.start .body { flex: 1; padding: 32px 32px 0; overflow: hidden; }
+.sm-search { height: var(--size-start-search-height); border-radius: var(--radius-search-box); display: flex; align-items: center; gap: 10px; padding: 0 14px; color: var(--text-secondary);
+  background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control), inset 0 -1px 0 var(--accent); }
+.sm-head { display: flex; justify-content: space-between; align-items: center; margin: 28px 8px 12px 20px; }
+.sm-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.pill { height: 24px; padding: 0 8px 0 10px; border-radius: var(--radius-control); font-size: 12px; display: flex; align-items: center; gap: 6px;
+  background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.pill:hover { background: var(--control-fill-hover); }
+.pinned { display: grid; grid-template-columns: repeat(var(--cols, 6), var(--size-start-tile-width)); grid-auto-rows: var(--size-start-tile-height); justify-content: center; }
+.tile { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border-radius: var(--radius-start-tile); font-size: 12px; line-height: 16px; text-align: center; }
+.tile:hover { background: var(--subtle-fill-hover); }
+.tile img { width: var(--size-start-tile-icon); height: var(--size-start-tile-icon); }
+.recs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; padding: 0 12px; }
+.rec { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: var(--radius-control); }
+.rec:hover { background: var(--subtle-fill-hover); }
+.rec img { width: 32px; height: 32px; }
+.rec small { display: block; color: var(--text-secondary); font-size: 12px; line-height: 16px; }
+.sm-foot { height: var(--size-start-footer-height); display: flex; align-items: center; justify-content: space-between; padding: 0 52px 0 48px;
+  border-top: 1px solid var(--stroke-divider); border-radius: 0 0 var(--radius-overlay) var(--radius-overlay); background: rgba(0,0,0,.08); }
+[data-theme="light"] .sm-foot { background: rgba(255,255,255,.35); }
+.user { display: flex; align-items: center; gap: 12px; padding: 6px 10px; margin-left: -10px; border-radius: var(--radius-control); }
+.user:hover, .power:hover { background: var(--subtle-fill-hover); }
+.avatar { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font-weight: 600; color: #fff;
+  background: linear-gradient(135deg, #40daf2, #155cde); }
+.power { width: 40px; height: 40px; display: grid; place-items: center; border-radius: var(--radius-control); }
+
+/* Quick settings */
+.quick { right: 12px; bottom: calc(var(--size-taskbar-height) + 12px); width: var(--size-flyout-width); }
+.qs-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px 12px; padding: 24px 24px 8px; }
+.qs { display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 12px; line-height: 16px; text-align: center; }
+.qs .t { width: 96px; height: 48px; border-radius: var(--radius-control); display: grid; place-items: center; background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.qs .t:hover { background: var(--control-fill-hover); }
+.qs.on .t { background: var(--accent); color: var(--text-on-accent); box-shadow: none; }
+.qs.on .t:hover { background: var(--accent-hover); }
+.slider { display: flex; align-items: center; gap: 14px; padding: 12px 26px; }
+.track { flex: 1; height: 4px; border-radius: 2px; background: var(--text-tertiary); position: relative; }
+.track i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; background: var(--accent); }
+.track b { position: absolute; top: 50%; width: 20px; height: 20px; margin: -10px 0 0 -10px; border-radius: 50%; background: var(--window-bg);
+  box-shadow: 0 0 0 1px var(--stroke-control), inset 0 0 0 5px var(--window-bg), inset 0 0 0 10px var(--accent); }
+.qs-foot { display: flex; align-items: center; justify-content: space-between; height: 48px; padding: 0 20px; margin-top: 12px; font-size: 12px;
+  border-top: 1px solid var(--stroke-divider); background: rgba(0,0,0,.08); border-radius: 0 0 var(--radius-overlay) var(--radius-overlay); }
+[data-theme="light"] .qs-foot { background: rgba(255,255,255,.35); }
+
+/* Calendar / notifications */
+.cal { right: 12px; bottom: calc(var(--size-taskbar-height) + 12px); width: var(--size-flyout-width); }
+.cal .note { padding: 16px 20px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--stroke-divider); font-weight: 600; }
+.cal .empty { padding: 36px 20px; text-align: center; color: var(--text-secondary); border-bottom: 1px solid var(--stroke-divider); }
+.cal .month { padding: 14px 20px 6px; display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+.days { display: grid; grid-template-columns: repeat(7, 40px); justify-content: center; padding: 0 12px 16px; }
+.days span { height: 40px; display: grid; place-items: center; border-radius: 50%; font-size: 14px; }
+.days span.h { color: var(--text-secondary); font-size: 12px; }
+.days span.o { color: var(--text-tertiary); }
+.days span.today { background: var(--accent); color: var(--text-on-accent); font-weight: 600; }
+
+/* Context menu */
+.ctx { width: var(--size-context-menu-width); padding: 4px; border-radius: var(--radius-overlay); box-shadow: var(--elev-flyout), inset 0 0 0 1px var(--stroke-surface); }
+.ctx .it { height: var(--size-context-menu-item-height); white-space: nowrap; display: flex; align-items: center; gap: 12px; padding: 0 12px; border-radius: var(--radius-control); }
+.ctx .it:hover { background: var(--subtle-fill-hover); }
+.ctx .it em { margin-left: auto; font-style: normal; color: var(--text-secondary); font-size: 12px; }
+.ctx hr { border: 0; border-top: 1px solid var(--stroke-divider); margin: 4px -4px; }
+
+/* ---- window ------------------------------------------------------------- */
+.win { position: fixed; left: 50%; top: 46%; width: min(980px, 72vw); height: min(560px, 62vh); transform: translate(-58%, -54%); z-index: 20;
+  border-radius: var(--radius-window); box-shadow: var(--elev-window-active), 0 0 0 1px var(--stroke-surface); display: flex; flex-direction: column; overflow: hidden; }
+.cap { height: 40px; display: flex; align-items: stretch; }
+.tab { margin: 8px 0 0 8px; padding: 0 12px; min-width: 220px; display: flex; align-items: center; gap: 10px; font-size: 12px; background: var(--layer-bg);
+  border-radius: var(--radius-overlay) var(--radius-overlay) 0 0; box-shadow: inset 0 1px 0 var(--stroke-control); }
+.tab img { width: 16px; height: 16px; }
+.tab .x { margin-left: auto; opacity: .75; }
+.newtab { width: 32px; margin: 8px 0 0 4px; display: grid; place-items: center; border-radius: var(--radius-control); }
+.newtab:hover { background: var(--subtle-fill-hover); }
+.cbtns { margin-left: auto; display: flex; }
+.cbtn { width: var(--size-caption-button-width); display: grid; place-items: center; }
+.cbtn:hover { background: var(--subtle-fill-hover); }
+.cbtn.close:hover { background: var(--caption-close-hover); color: #fff; }
+.cbtn svg { width: var(--size-caption-glyph); height: var(--size-caption-glyph); stroke-width: 1; }
+.chrome { background: var(--layer-bg); }
+.addr { height: 48px; display: flex; align-items: center; gap: 4px; padding: 0 8px; }
+.nb { width: 36px; height: 32px; display: grid; place-items: center; border-radius: var(--radius-control); }
+.nb:hover { background: var(--subtle-fill-hover); }
+.nb.dim { color: var(--text-disabled); }
+.crumb { flex: 1; height: 32px; margin: 0 8px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: var(--radius-control);
+  background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.crumb img { width: 16px; height: 16px; }
+.fsearch { width: 260px; height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: var(--radius-control); color: var(--text-secondary);
+  background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.cmd { height: 48px; display: flex; align-items: center; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--stroke-divider); }
+.cmd .nb { width: auto; min-width: 36px; padding: 0 8px; gap: 8px; display: flex; align-items: center; }
+.cmd .sep { width: 1px; height: 24px; background: var(--stroke-divider); margin: 0 6px; }
+.primary { background: var(--accent); color: var(--text-on-accent); border-radius: var(--radius-control); padding: 0 12px !important; height: 32px; }
+.primary:hover { background: var(--accent-hover) !important; }
+.wbody { flex: 1; display: grid; grid-template-columns: 220px 1fr; min-height: 0; }
+.nav { padding: 8px; border-right: 1px solid var(--stroke-divider); overflow: hidden; }
+.nav .it { height: 32px; display: flex; align-items: center; gap: 10px; padding: 0 10px; border-radius: var(--radius-control); position: relative; }
+.nav .it img { width: 16px; height: 16px; }
+.nav .it:hover { background: var(--subtle-fill-hover); }
+.nav .it.sel { background: var(--subtle-fill-hover); }
+.nav .it.sel::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 3px; border-radius: 2px; background: var(--accent); }
+.nav hr { border: 0; border-top: 1px solid var(--stroke-divider); margin: 6px 4px; }
+.content { padding: 12px 20px; overflow: hidden; background: var(--window-bg); }
+.content h2 { margin: 8px 0 10px; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.drives { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 4px 12px; margin-bottom: 18px; }
+.drive { display: flex; gap: 12px; align-items: center; padding: 8px; border-radius: var(--radius-control); }
+.drive:hover { background: var(--subtle-fill-hover); }
+.drive img { width: 48px; height: 48px; }
+.drive .bar { height: 6px; border-radius: 3px; background: var(--stroke-control); box-shadow: inset 0 0 0 1px var(--stroke-control); margin: 4px 0; width: 170px; }
+.drive .bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+.drive small { color: var(--text-secondary); font-size: 12px; }
+.folders { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 4px; }
+.folder { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px; border-radius: var(--radius-control); font-size: 12px; }
+.folder:hover { background: var(--subtle-fill-hover); }
+.folder img { width: 48px; height: 48px; }
+.status { height: 24px; display: flex; align-items: center; padding: 0 14px; font-size: 12px; color: var(--text-secondary); background: var(--window-bg); }
+
+/* ---- design chrome (not part of the OS) ---------------------------------- */
+.hud { position: fixed; top: 12px; right: 12px; z-index: 90; display: flex; align-items: center; gap: 4px; padding: 4px; border-radius: 999px;
+  font-size: 12px; box-shadow: var(--elev-flyout), inset 0 0 0 1px var(--stroke-surface); }
+.hud span { padding: 0 10px 0 12px; color: var(--text-secondary); }
+.hud button, .hud a { height: 28px; padding: 0 12px; border-radius: 999px; display: grid; place-items: center; color: var(--text-primary); text-decoration: none; }
+.hud button:hover, .hud a:hover { background: var(--subtle-fill-hover); }
+body.shot .hud { display: none; }
+body.shot *, body.shot *::before, body.shot *::after { transition: none !important; }
+:focus-visible { outline: 2px solid var(--focus-outer); outline-offset: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.skip-link { position: fixed; left: 8px; top: -100px; z-index: 200; padding: 8px 16px; border-radius: var(--radius-control); background: var(--control-fill-input-active); color: var(--text-primary); }
+.skip-link:focus { top: 8px; }
+main:focus { outline: none; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+@media (max-width: 760px) { .win { display: none; } .start { width: 94vw; margin-left: -47vw; } .pinned { --cols: 4; } .tb-search { display: none; }
+  .tb-center { position: static; transform: none; flex: none; } .tb-center .tb-btn:nth-of-type(n+4), .chev { display: none; } }
+
+/* ---- extra surfaces (shown by URL hash) ---------------------------------- */
+.scene { display: none; }
+.scene.show { display: block; }
+.toasts { position: fixed; right: 12px; bottom: calc(var(--size-taskbar-height) + 12px); display: flex; flex-direction: column; gap: var(--size-toast-gap); z-index: 70; }
+.toast { width: var(--size-toast-width); padding: 12px 16px 14px; border-radius: var(--radius-overlay); box-shadow: var(--elev-flyout), inset 0 0 0 1px var(--stroke-surface); }
+.toast .top { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+.toast .top img { width: 16px; height: 16px; }
+.toast b { display: block; font-weight: 600; }
+.toast .acts { display: flex; gap: 8px; margin-top: 12px; }
+.toast .acts span { flex: 1; height: 32px; display: grid; place-items: center; border-radius: var(--radius-control); background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.alttab { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 24px; display: flex; gap: 16px; border-radius: var(--radius-overlay); box-shadow: var(--elev-start), inset 0 0 0 1px var(--stroke-surface); z-index: 80; }
+.alttab .w { display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.alttab .w div:first-child { display: flex; gap: 8px; align-items: center; }
+.alttab .w img { width: 16px; height: 16px; }
+.alttab .th { height: var(--size-alt-tab-thumb-height); border-radius: var(--radius-control); background: var(--window-bg); box-shadow: 0 0 0 1px var(--stroke-surface); }
+.alttab .w.sel .th { outline: 2px solid var(--focus-outer); outline-offset: 4px; }
+.snapfly { position: fixed; z-index: 80; padding: 8px; display: grid; grid-template-columns: repeat(3, var(--size-snap-flyout-tile)); gap: 8px; border-radius: var(--radius-overlay); box-shadow: var(--elev-flyout), inset 0 0 0 1px var(--stroke-surface); }
+.lay { height: 48px; display: grid; gap: 2px; padding: 2px; border-radius: var(--radius-control); }
+.lay i { border-radius: 3px; background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.lay i.hot { background: var(--accent); }
+.taskview { position: fixed; inset: 0 0 var(--size-taskbar-height); z-index: 60; background: var(--smoke); -webkit-backdrop-filter: blur(60px); backdrop-filter: blur(60px); }
+.taskview .grid { position: absolute; top: 14%; left: 50%; transform: translateX(-50%); display: flex; gap: 32px; }
+.taskview .desks { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); display: flex; gap: 16px; }
+.taskview .vd { width: 176px; font-size: 12px; text-align: center; }
+.taskview .vd div { height: 99px; margin-bottom: 6px; border-radius: var(--radius-control); background: #000 var(--wallpaper) center / cover; }
+.taskview .vd.cur div { outline: 2px solid var(--accent); outline-offset: 3px; }
+.full { position: fixed; inset: 0; z-index: 90; color: #fff; }
+.lock { background: var(--wallpaper) center / cover; text-align: center; }
+.lock .time { margin-top: 12vh; font-size: var(--size-lock-clock); line-height: 1; font-weight: 600; text-shadow: 0 2px 12px rgba(0,0,0,.35); }
+.lock .date { margin-top: 12px; font-size: 20px; line-height: 28px; font-weight: 600; text-shadow: 0 2px 8px rgba(0,0,0,.35); }
+.signin { background: var(--wallpaper) center / cover; }
+.signin::before { content: ""; position: absolute; inset: 0; -webkit-backdrop-filter: blur(60px) saturate(120%); backdrop-filter: blur(60px) saturate(120%); background: rgba(0,0,0,.2); }
+.signin .c { position: relative; margin-top: 18vh; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.signin .av { width: var(--size-login-avatar); height: var(--size-login-avatar); border-radius: 50%; display: grid; place-items: center; font-size: 72px; font-weight: 600; background: linear-gradient(135deg, #40daf2, #155cde); }
+.signin .name { font-size: 28px; line-height: 36px; font-weight: 600; }
+.signin .pw { width: var(--size-login-field-width); height: 32px; display: flex; align-items: center; padding: 0 4px 0 10px; border-radius: var(--radius-control); background: rgba(255,255,255,.7); color: #5d5d5d; }
+.signin .pw b { margin-left: auto; width: 28px; height: 24px; border-radius: 3px; display: grid; place-items: center; background: var(--accent); color: var(--text-on-accent); }
+.corner { position: absolute; bottom: 24px; display: flex; gap: 16px; }
+.boot { background: #000; }
+.boot img { position: absolute; left: 50%; top: 40%; width: var(--size-boot-logo); transform: translate(-50%, -50%); }
+.boot .spin { position: absolute; left: 50%; top: 70%; width: var(--size-boot-spinner); height: var(--size-boot-spinner); margin: -20px 0 0 -20px; border-radius: 50%; border: 3px dotted #fff; animation: rot 1.4s linear infinite; }
+@keyframes rot { to { transform: rotate(360deg); } }
+.oobe { background: #000 url(../wallpapers/silk-dark.jpg) center / cover; color: var(--text-primary); }
+.oobe .card { position: absolute; left: 50%; top: 50%; width: 800px; height: 600px; max-width: 94vw; max-height: 90vh; transform: translate(-50%, -50%); display: grid; grid-template-columns: 1fr 2fr;
+  border-radius: var(--radius-overlay); background: var(--window-bg); box-shadow: var(--elev-start), 0 0 0 1px var(--stroke-surface); overflow: hidden; }
+.oobe .art { display: grid; place-items: center; background: var(--layer-bg); }
+.oobe .art img { width: 128px; }
+.oobe .step { padding: 48px 40px; display: flex; flex-direction: column; gap: 12px; }
+.oobe h2 { margin: 0; font-size: 28px; line-height: 36px; font-weight: 600; }
+.oobe .it { height: 32px; display: flex; align-items: center; padding: 0 12px; border-radius: var(--radius-control); position: relative; }
+.oobe .it.sel::before { content: ""; position: absolute; left: 0; top: 8px; width: 3px; height: 16px; border-radius: 2px; background: var(--accent); }
+.oobe .next { margin-top: auto; display: flex; justify-content: flex-end; gap: 8px; }
+.oobe .next span { min-width: 96px; height: 32px; padding: 0 12px; display: grid; place-items: center; border-radius: var(--radius-control); background: var(--control-fill); box-shadow: inset 0 0 0 1px var(--stroke-control); }
+.oobe .next span.a { background: var(--accent); color: var(--text-on-accent); box-shadow: none; }
+.settings .wbody { grid-template-columns: var(--size-nav-pane-width) 1fr; }
+.settings .navi { height: var(--size-nav-item-height); }
+.settings .page { padding: 20px 32px; overflow: hidden; }
+.settings h2 { margin: 0 0 20px; font-size: 28px; line-height: 36px; font-weight: 600; }
+.srow { min-height: var(--size-settings-card-min-height); display: flex; align-items: center; gap: 16px; padding: 0 16px; background: var(--card-bg); border: 1px solid var(--stroke-card); border-radius: var(--radius-control); margin-bottom: 4px; }
+.srow .t { flex: 1; } .srow .t div:last-child { font-size: 12px; color: var(--text-secondary); }
+.tgl { width: 40px; height: 20px; border-radius: 10px; background: var(--accent); position: relative; }
+.tgl::after { content: ""; position: absolute; right: 4px; top: 4px; width: 12px; height: 12px; border-radius: 50%; background: var(--text-on-accent); }
+.osd { position: fixed; left: 50%; bottom: calc(var(--size-taskbar-height) + 24px); width: var(--size-osd-width); height: var(--size-osd-height); margin-left: calc(var(--size-osd-width) / -2); z-index: 70;
+  display: flex; align-items: center; gap: 12px; padding: 0 16px; border-radius: 24px; box-shadow: var(--elev-flyout), inset 0 0 0 1px var(--stroke-surface); }
+.osd .tr { flex: 1; height: 4px; border-radius: 2px; background: var(--control-strong-stroke); position: relative; }
+.osd .tr i { position: absolute; left: 0; top: 0; bottom: 0; width: 62%; border-radius: 2px; background: var(--accent); }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to the design</a>
+<main id="content" tabindex="-1">
+<h1 class="sr-only">{{name}} desktop design</h1>
+
+<div class="desk" id="desk">
+  <div class="dicon"><img src="../icons/computer.svg" alt=""><span>This PC</span></div>
+  <div class="dicon"><img src="../icons/recycle_bin_full.svg" alt=""><span>Recycle Bin</span></div>
+  <div class="dicon"><img src="../icons/user_folder.svg" alt=""><span>Impossible User</span></div>
+  <div class="dicon"><img src="../icons/network.svg" alt=""><span>Network</span></div>
+  <div class="dicon"><img src="../icons/control_panel.svg" alt=""><span>Control Panel</span></div>
+</div>
+
+<!-- File Explorer -->
+<section class="win acrylic mat-frame" id="win" aria-label="File Explorer">
+  <div class="cap">
+    <div class="tab"><img src="../icons/computer.svg" alt="">This PC<span class="x"><svg class="g" viewBox="0 0 16 16" style="width:10px;height:10px"><path d="M3 3l10 10M13 3L3 13"/></svg></span></div>
+    <button class="newtab" aria-label="New tab"><svg class="g" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button>
+    <div class="cbtns">
+      <button class="cbtn" aria-label="Minimize"><svg class="g" viewBox="0 0 10 10"><path d="M0 5h10"/></svg></button>
+      <button class="cbtn" aria-label="Maximize"><svg class="g" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" rx="1.5"/></svg></button>
+      <button class="cbtn close" aria-label="Close"><svg class="g" viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10"/></svg></button>
+    </div>
+  </div>
+  <div class="chrome">
+    <div class="addr">
+      <button class="nb" aria-label="Back"><svg class="g" viewBox="0 0 16 16"><path d="M13 8H3M7 4L3 8l4 4"/></svg></button>
+      <button class="nb dim" aria-label="Forward"><svg class="g" viewBox="0 0 16 16"><path d="M3 8h10M9 4l4 4-4 4"/></svg></button>
+      <button class="nb" aria-label="Up"><svg class="g" viewBox="0 0 16 16"><path d="M8 13V3M4 7l4-4 4 4"/></svg></button>
+      <button class="nb" aria-label="Refresh"><svg class="g" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 3v3h-3"/></svg></button>
+      <div class="crumb"><img src="../icons/computer.svg" alt=""><svg class="g" viewBox="0 0 16 16" style="width:10px"><path d="M6 4l4 4-4 4"/></svg>This PC<svg class="g" viewBox="0 0 16 16" style="width:10px"><path d="M6 4l4 4-4 4"/></svg></div>
+      <div class="fsearch"><svg class="g" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search This PC</div>
+    </div>
+    <div class="cmd">
+      <button class="nb primary"><svg class="g" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg>New</button>
+      <span class="sep"></span>
+      <button class="nb" aria-label="Cut"><svg class="g" viewBox="0 0 16 16"><circle cx="4.5" cy="11.5" r="2"/><circle cx="11.5" cy="11.5" r="2"/><path d="M6 10L12 2M10 10L4 2"/></svg></button>
+      <button class="nb" aria-label="Copy"><svg class="g" viewBox="0 0 16 16"><rect x="5" y="5" width="8" height="9" rx="1.5"/><path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H10"/></svg></button>
+      <button class="nb" aria-label="Paste"><svg class="g" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="11" rx="1.5"/><path d="M6 3V2h4v1"/></svg></button>
+      <button class="nb" aria-label="Rename"><svg class="g" viewBox="0 0 16 16"><path d="M3 13h2l7-7-2-2-7 7zM9.5 4.5l2 2"/></svg></button>
+      <button class="nb" aria-label="Share"><svg class="g" viewBox="0 0 16 16"><path d="M9 3l4 4-4 4M13 7H7a4 4 0 0 0-4 4v1"/></svg></button>
+      <button class="nb" aria-label="Delete"><svg class="g" viewBox="0 0 16 16"><path d="M3 4h10M6 4V2.5h4V4M4.5 4l.7 9.5h5.6l.7-9.5"/></svg></button>
+      <span class="sep"></span>
+      <button class="nb"><svg class="g" viewBox="0 0 16 16"><path d="M5 3v10M3 11l2 2 2-2M11 13V3M9 5l2-2 2 2"/></svg>Sort<svg class="g" viewBox="0 0 16 16" style="width:10px"><path d="M4 6l4 4 4-4"/></svg></button>
+      <button class="nb"><svg class="g" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/></svg>View<svg class="g" viewBox="0 0 16 16" style="width:10px"><path d="M4 6l4 4 4-4"/></svg></button>
+      <button class="nb" aria-label="More"><svg class="g" viewBox="0 0 16 16"><circle cx="3" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="13" cy="8" r=".6"/></svg></button>
+    </div>
+  </div>
+  <div class="wbody">
+    <nav class="nav">
+      <div class="it"><img src="../icons/folder_desktop.svg" alt="">Desktop</div>
+      <div class="it"><img src="../icons/folder_downloads.svg" alt="">Downloads</div>
+      <div class="it"><img src="../icons/folder_documents.svg" alt="">Documents</div>
+      <div class="it"><img src="../icons/folder_pictures.svg" alt="">Pictures</div>
+      <div class="it"><img src="../icons/folder_music.svg" alt="">Music</div>
+      <div class="it"><img src="../icons/folder_videos.svg" alt="">Videos</div>
+      <hr>
+      <div class="it sel"><img src="../icons/computer.svg" alt="">This PC</div>
+      <div class="it"><img src="../icons/drive_removable.svg" alt="">USB Drive (E:)</div>
+      <div class="it"><img src="../icons/network.svg" alt="">Network</div>
+    </nav>
+    <div class="content">
+      <h2><svg class="g" viewBox="0 0 16 16" style="width:12px"><path d="M4 6l4 4 4-4"/></svg>Devices and drives</h2>
+      <div class="drives">
+        <div class="drive"><img src="../icons/drive_system.svg" alt=""><div>Local Disk (C:)<div class="bar"><i style="width:44%"></i></div><small>264 GB free of 476 GB</small></div></div>
+        <div class="drive"><img src="../icons/drive_removable.svg" alt=""><div>USB Drive (E:)<div class="bar"><i style="width:18%"></i></div><small>52.4 GB free of 64 GB</small></div></div>
+      </div>
+      <h2><svg class="g" viewBox="0 0 16 16" style="width:12px"><path d="M4 6l4 4 4-4"/></svg>Folders</h2>
+      <div class="folders">
+        <div class="folder"><img src="../icons/folder_desktop.svg" alt="">Desktop</div>
+        <div class="folder"><img src="../icons/folder_documents.svg" alt="">Documents</div>
+        <div class="folder"><img src="../icons/folder_downloads.svg" alt="">Downloads</div>
+        <div class="folder"><img src="../icons/folder_music.svg" alt="">Music</div>
+        <div class="folder"><img src="../icons/folder_pictures.svg" alt="">Pictures</div>
+        <div class="folder"><img src="../icons/folder_videos.svg" alt="">Videos</div>
+      </div>
+    </div>
+  </div>
+  <div class="status">8 items</div>
+</section>
+
+<!-- Start -->
+<section class="panel start acrylic mat-start" id="start" inert aria-label="Start">
+  <div class="body">
+    <div class="sm-search"><svg class="g" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search for apps, settings, and documents</div>
+    <div class="sm-head"><h3>Pinned</h3><button class="pill">All<svg class="g" viewBox="0 0 16 16" style="width:10px"><path d="M6 4l4 4-4 4"/></svg></button></div>
+    <div class="pinned">
+      <div class="tile"><img src="../icons/file_explorer.svg" alt="">File Explorer</div>
+      <div class="tile"><img src="../icons/settings.svg" alt="">Settings</div>
+      <div class="tile"><img src="../icons/terminal.svg" alt="">Terminal</div>
+      <div class="tile"><img src="../icons/text_file.svg" alt="">Notepad</div>
+      <div class="tile"><img src="../icons/file_image.svg" alt="">Photos</div>
+      <div class="tile"><img src="../icons/control_panel.svg" alt="">Control Panel</div>
+      <div class="tile"><img src="../icons/computer.svg" alt="">This PC</div>
+      <div class="tile"><img src="../icons/folder_documents.svg" alt="">Documents</div>
+      <div class="tile"><img src="../icons/folder_downloads.svg" alt="">Downloads</div>
+      <div class="tile"><img src="../icons/folder_pictures.svg" alt="">Pictures</div>
+      <div class="tile"><img src="../icons/folder_music.svg" alt="">Music</div>
+      <div class="tile"><img src="../icons/folder_videos.svg" alt="">Videos</div>
+      <div class="tile"><img src="../icons/network.svg" alt="">Network</div>
+      <div class="tile"><img src="../icons/recycle_bin_empty.svg" alt="">Recycle Bin</div>
+      <div class="tile"><img src="../icons/file_archive.svg" alt="">Archives</div>
+      <div class="tile"><img src="../icons/exe_default.svg" alt="">Task Manager</div>
+      <div class="tile"><img src="../icons/drive_system.svg" alt="">Disk Management</div>
+      <div class="tile"><img src="../icons/user_folder.svg" alt="">Impossible User</div>
+    </div>
+    <div class="sm-head"><h3>Recommended</h3><button class="pill">More<svg class="g" viewBox="0 0 16 16" style="width:10px"><path d="M6 4l4 4-4 4"/></svg></button></div>
+    <div class="recs">
+      <div class="rec"><img src="../icons/text_file.svg" alt=""><div>boot.conf<small>17m ago</small></div></div>
+      <div class="rec"><img src="../icons/file_image.svg" alt=""><div>silk-dark.jpg<small>1h ago</small></div></div>
+      <div class="rec"><img src="../icons/file_archive.svg" alt=""><div>system-disk.zip<small>Yesterday at 21:14</small></div></div>
+      <div class="rec"><img src="../icons/text_file.svg" alt=""><div>release-notes.txt<small>Sep 24</small></div></div>
+      <div class="rec"><img src="../icons/terminal.svg" alt=""><div>build.ps1<small>Sep 22</small></div></div>
+      <div class="rec"><img src="../icons/folder_pictures.svg" alt=""><div>Screenshots<small>Sep 20</small></div></div>
+    </div>
+  </div>
+  <div class="sm-foot">
+    <div class="user"><div class="avatar">I</div>Impossible User</div>
+    <button class="power" aria-label="Power"><svg class="g" viewBox="0 0 16 16"><path d="M8 2v6M4.5 4.2a5 5 0 1 0 7 0"/></svg></button>
+  </div>
+</section>
+
+<!-- Quick settings -->
+<section class="panel quick acrylic mat-flyout" id="quick" inert aria-label="Quick settings">
+  <div class="qs-grid">
+    <div class="qs on"><div class="t"><svg class="g" viewBox="0 0 16 16"><path d="M1.5 6a9.5 9.5 0 0 1 13 0M3.5 8.3a6.5 6.5 0 0 1 9 0M5.6 10.6a3.4 3.4 0 0 1 4.8 0"/><circle cx="8" cy="12.8" r=".6"/></svg></div>Impossible-5G</div>
+    <div class="qs on"><div class="t"><svg class="g" viewBox="0 0 16 16"><path d="M4.5 5l7 6-3.5 3V2l3.5 3-7 6"/></svg></div>Bluetooth</div>
+    <div class="qs"><div class="t"><svg class="g" viewBox="0 0 16 16"><path d="M8 1.5c.8 0 1.2.8 1.2 1.8V6l5 3v1.5l-5-1.5V12l1.5 1.2V14.5L8 13.7l-2.7.8V13.2L6.8 12V9l-5 1.5V9l5-3V3.3c0-1 .4-1.8 1.2-1.8z"/></svg></div>Airplane mode</div>
+    <div class="qs"><div class="t"><svg class="g" viewBox="0 0 16 16"><rect x="2" y="5" width="11" height="7" rx="1.5"/><path d="M14.5 7.5v2M7 6.5l-1.5 2.5h3L7 11.5"/></svg></div>Energy saver</div>
+    <div class="qs"><div class="t"><svg class="g" viewBox="0 0 16 16"><path d="M13 9.5A5.5 5.5 0 1 1 6.5 3a4.5 4.5 0 0 0 6.5 6.5z"/></svg></div>Night light</div>
+    <div class="qs"><div class="t"><svg class="g" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.3"/><path d="M3 5.5l5 1 5-1M8 6.5v3l-2.5 5M8 9.5l2.5 5"/></svg></div>Accessibility</div>
+  </div>
+  <div class="slider"><svg class="g" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/></svg><div class="track"><i style="width:72%"></i><b style="left:72%"></b></div></div>
+  <div class="slider"><svg class="g" viewBox="0 0 16 16"><path d="M2 6h2.5L8 3v10l-3.5-3H2zM10.5 5.5a3.5 3.5 0 0 1 0 5M12.3 3.7a6 6 0 0 1 0 8.6"/></svg><div class="track"><i style="width:48%"></i><b style="left:48%"></b></div></div>
+  <div class="qs-foot"><span style="display:flex;align-items:center;gap:8px"><svg class="g" viewBox="0 0 16 16"><rect x="1.5" y="5" width="11.5" height="7" rx="1.5"/><rect x="3" y="6.5" width="7" height="4" rx=".5" fill="currentColor" stroke="none"/><path d="M14.5 7.5v2"/></svg>84%</span><span style="display:flex;gap:18px"><svg class="g" viewBox="0 0 16 16"><path d="M3 13h2l7-7-2-2-7 7z"/></svg><svg class="g" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></svg></span></div>
+</section>
+
+<!-- Notifications and calendar -->
+<section class="panel cal acrylic mat-flyout" id="cal" inert aria-label="Notifications and calendar">
+  <div class="note">Notifications<span style="color:var(--text-secondary);font-weight:400">Clear all</span></div>
+  <div class="empty">No new notifications</div>
+  <div class="month"><span id="mname">September 2026</span><span style="display:flex;gap:18px"><svg class="g" viewBox="0 0 16 16"><path d="M4 10l4-4 4 4"/></svg><svg class="g" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4"/></svg></span></div>
+  <div class="days" id="days"></div>
+</section>
+
+<!-- Desktop context menu -->
+<section class="panel ctx acrylic mat-menu" id="ctx" inert aria-label="Desktop menu" style="left:0;top:0;transform:none">
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>View<em>›</em></div>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><path d="M5 3v10M3 11l2 2 2-2M11 13V3M9 5l2-2 2 2"/></svg>Sort by<em>›</em></div>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 3v3h-3"/></svg>Refresh</div>
+  <hr>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg>New<em>›</em></div>
+  <hr>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="9" rx="1.5"/><path d="M6 14h4M8 11.5V14"/></svg>Display settings</div>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><path d="M3 13c1.5 0 2.5-1 2.5-2.5S7 8 8 8M8 8l5.5-5.5M9.5 6.5l-2-2"/></svg>Personalize</div>
+  <hr>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6.5l2 1.5-2 1.5M8 10h3"/></svg>Open in Terminal</div>
+  <div class="it"><svg class="g" viewBox="0 0 16 16"><rect x="2" y="4" width="12" height="9" rx="1.5"/><path d="M5 2h6"/></svg>Show more options<em>Shift+F10</em></div>
+</section>
+
+
+<!-- Extra surfaces, opened by URL hash: #toast #alttab #snap #taskview #lock #signin #boot #oobe #settings #osd -->
+<div class="scene" id="s-toast"><div class="toasts">
+  <div class="toast acrylic mat-flyout"><div class="top"><img src="../icons/settings.svg" alt="">Settings</div><b>Updates are ready</b>Restart now or schedule a time that suits you.<div class="acts"><span>Schedule</span><span>Restart now</span></div></div>
+  <div class="toast acrylic mat-flyout"><div class="top"><img src="../icons/terminal.svg" alt="">Terminal</div><b>Build finished</b>=== BUILD OK === in 41 seconds.</div>
+</div></div>
+<div class="scene" id="s-alttab"><div class="alttab acrylic mat-menu">
+  <div class="w sel"><div><img src="../icons/file_explorer.svg" alt="">File Explorer</div><div class="th" style="width:260px"></div></div>
+  <div class="w"><div><img src="../icons/terminal.svg" alt="">Terminal</div><div class="th" style="width:240px;background:#0c0c0c"></div></div>
+  <div class="w"><div><img src="../icons/settings.svg" alt="">Settings</div><div class="th" style="width:220px"></div></div>
+</div></div>
+<div class="scene" id="s-snap"><div class="snapfly acrylic mat-menu" style="right:calc(50% - 360px);top:calc(46% - 250px)">
+  <div class="lay" style="grid-template-columns:1fr 1fr"><i class="hot"></i><i></i></div>
+  <div class="lay" style="grid-template-columns:2fr 1fr"><i></i><i></i></div>
+  <div class="lay" style="grid-template-columns:1fr 1fr 1fr"><i></i><i></i><i></i></div>
+  <div class="lay" style="grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr"><i></i><i></i><i></i><i></i></div>
+  <div class="lay" style="grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr"><i style="grid-row:span 2"></i><i></i><i></i></div>
+  <div class="lay" style="grid-template-columns:1fr 2fr 1fr"><i></i><i></i><i></i></div>
+</div></div>
+<div class="scene" id="s-taskview"><div class="taskview">
+  <div class="grid alttab" style="position:absolute;transform:translateX(-50%);top:14%;left:50%;background:none;box-shadow:none">
+    <div class="w sel"><div><img src="../icons/file_explorer.svg" alt="">File Explorer</div><div class="th" style="width:320px;height:200px"></div></div>
+    <div class="w"><div><img src="../icons/terminal.svg" alt="">Terminal</div><div class="th" style="width:300px;height:200px;background:#0c0c0c"></div></div>
+  </div>
+  <div class="desks"><div class="vd cur"><div></div>Desktop 1</div><div class="vd"><div></div>Desktop 2</div><div class="vd"><div style="background:var(--control-fill);display:grid;place-items:center;font-size:28px">+</div>New desktop</div></div>
+</div></div>
+<div class="scene" id="s-lock"><div class="full lock"><div class="time">16:02</div><div class="date">Sunday, 27 September</div>
+  <div class="corner" style="right:32px"><svg class="g" viewBox="0 0 16 16"><path d="M1.5 6a9.5 9.5 0 0 1 13 0M3.5 8.3a6.5 6.5 0 0 1 9 0M5.6 10.6a3.4 3.4 0 0 1 4.8 0"/></svg><svg class="g" viewBox="0 0 16 16"><rect x="1.5" y="5" width="11.5" height="7" rx="1.5"/><path d="M14.5 7.5v2"/></svg></div></div></div>
+<div class="scene" id="s-signin"><div class="full signin"><div class="c"><div class="av">I</div><div class="name">Impossible User</div><div class="pw">Password<b>→</b></div></div>
+  <div class="corner" style="left:32px;flex-direction:column;gap:12px;font-size:14px"><span>Impossible User</span><span>Guest</span></div>
+  <div class="corner" style="right:32px"><svg class="g" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.3"/><path d="M3 5.5l5 1 5-1M8 6.5v3l-2.5 5M8 9.5l2.5 5"/></svg><svg class="g" viewBox="0 0 16 16"><path d="M1.5 6a9.5 9.5 0 0 1 13 0M3.5 8.3a6.5 6.5 0 0 1 9 0"/></svg><svg class="g" viewBox="0 0 16 16"><path d="M8 2v6M4.5 4.2a5 5 0 1 0 7 0"/></svg></div></div></div>
+<div class="scene" id="s-boot"><div class="full boot"><img src="../brand/logo.svg" alt=""><div class="spin"></div></div></div>
+<div class="scene" id="s-oobe"><div class="full oobe"><div class="card"><div class="art"><img src="../brand/logo.svg" alt=""></div>
+  <div class="step"><h2>Is this the right country or region?</h2><div style="color:var(--text-secondary)">Choose where you are. You can change this later in Settings.</div>
+  <div style="margin-top:12px"><div class="it">South Africa</div><div class="it sel" style="background:var(--subtle-fill-hover)">United Kingdom</div><div class="it">United States</div></div>
+  <div class="next"><span>Back</span><span class="a">Yes</span></div></div></div></div></div>
+<div class="scene" id="s-osd"><div class="osd acrylic mat-flyout"><svg class="g" viewBox="0 0 16 16"><path d="M2 6h2.5L8 3v10l-3.5-3H2zM10.5 5.5a3.5 3.5 0 0 1 0 5"/></svg><div class="tr"><i></i></div>62</div></div>
+
+<!-- Taskbar -->
+</main>
+<footer class="taskbar acrylic mat-taskbar" aria-label="Taskbar">
+  <div class="tb-center">
+    <button class="tb-btn" id="startbtn" aria-label="Start"><img src="../icons/start.svg" alt=""></button>
+    <div class="tb-search"><svg class="g" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search</div>
+    <button class="tb-btn" aria-label="Task view"><svg class="g" viewBox="0 0 16 16" style="width:20px;height:20px"><rect x="2" y="3" width="8" height="10" rx="1.5"/><path d="M12.5 4.5v7M14.5 6v4"/></svg></button>
+    <button class="tb-btn active" aria-label="File Explorer"><img src="../icons/file_explorer.svg" alt=""><span class="ind"></span></button>
+    <button class="tb-btn" aria-label="Terminal"><img src="../icons/terminal.svg" alt=""><span class="ind"></span></button>
+    <button class="tb-btn" aria-label="Settings"><img src="../icons/settings.svg" alt=""></button>
+    <button class="tb-btn" aria-label="Notepad"><img src="../icons/text_file.svg" alt=""></button>
+    <button class="tb-btn" aria-label="Photos"><img src="../icons/file_image.svg" alt=""></button>
+  </div>
+  <div class="tb-right">
+    <button class="chev" aria-label="Show hidden icons"><svg class="g" viewBox="0 0 16 16"><path d="M4 10l4-4 4 4"/></svg></button>
+    <button class="tray" id="traybtn" aria-label="Network, volume, battery">
+      <svg class="g" viewBox="0 0 16 16"><path d="M1.5 6a9.5 9.5 0 0 1 13 0M3.5 8.3a6.5 6.5 0 0 1 9 0M5.6 10.6a3.4 3.4 0 0 1 4.8 0"/><circle cx="8" cy="12.8" r=".6"/></svg>
+      <svg class="g" viewBox="0 0 16 16"><path d="M2 6h2.5L8 3v10l-3.5-3H2zM10.5 5.5a3.5 3.5 0 0 1 0 5M12.3 3.7a6 6 0 0 1 0 8.6"/></svg>
+      <svg class="g" viewBox="0 0 16 16"><rect x="1.5" y="5" width="11.5" height="7" rx="1.5"/><rect x="3" y="6.5" width="7" height="4" rx=".5" fill="currentColor" stroke="none"/><path d="M14.5 7.5v2"/></svg>
+    </button>
+    <button class="clock" id="clockbtn" aria-label="Clock and notifications"><div><div id="t">16:02</div><div id="d">2026/09/27</div></div>
+      <svg class="g" viewBox="0 0 16 16"><path d="M4 11V7a4 4 0 0 1 8 0v4l1.5 1.5h-11zM6.5 13.5a1.5 1.5 0 0 0 3 0"/></svg></button>
+  </div>
+</footer>
+
+<nav class="hud acrylic mat-menu" aria-label="Design pages"><span>{{name}} desktop design</span><button id="theme">Light theme</button><button id="glass" title="Glass strength, the Personalization setting">Glass: Balanced</button><a href="controls.html">Controls</a><a href="../docs/design/">Spec</a><a href="{{repo_url}}/tree/main/docs/design">Source</a></nav>
+
+<script>
+(function () {
+  var html = document.documentElement, body = document.body;
+  var q = new URLSearchParams(location.search);
+  if (q.get('theme')) html.dataset.theme = q.get('theme');
+  if (q.has('shot')) body.classList.add('shot');
+  var panels = { start: 'startbtn', quick: 'traybtn', cal: 'clockbtn' };
+  // A closed panel is invisible, so it must not take focus either.
+  function setPanel(id, on) {
+    var el = document.getElementById(id);
+    el.classList.toggle('show', on);
+    el.inert = !on;
+  }
+  function closeAll(except) {
+    Object.keys(panels).forEach(function (id) {
+      if (id === except) return;
+      setPanel(id, false);
+      document.getElementById(panels[id]).classList.remove('open');
+    });
+    setPanel('ctx', false);
+  }
+  function toggle(id) {
+    var el = document.getElementById(id), on = !el.classList.contains('show');
+    closeAll(id);
+    setPanel(id, on);
+    document.getElementById(panels[id]).classList.toggle('open', on);
+  }
+  Object.keys(panels).forEach(function (id) {
+    document.getElementById(panels[id]).addEventListener('click', function (e) { e.stopPropagation(); toggle(id); });
+    document.getElementById(id).addEventListener('click', function (e) { e.stopPropagation(); });
+  });
+  document.addEventListener('click', function () { closeAll(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeAll();
+    if (e.key === 'Meta' || (e.ctrlKey && e.key === 'Escape')) toggle('start');
+  });
+  document.addEventListener('contextmenu', function (e) {
+    if (e.target.closest('.win, .panel, .taskbar, .hud')) return;
+    e.preventDefault(); closeAll();
+    var m = document.getElementById('ctx');
+    m.style.left = Math.min(e.clientX, innerWidth - m.offsetWidth - 8) + 'px';
+    m.style.top = Math.min(e.clientY, innerHeight - m.offsetHeight - 56) + 'px';
+    setPanel('ctx', true);
+  });
+  document.querySelectorAll('.dicon').forEach(function (d) {
+    d.addEventListener('click', function (e) {
+      e.stopPropagation();
+      document.querySelectorAll('.dicon').forEach(function (x) { x.classList.remove('sel'); });
+      d.classList.add('sel');
+    });
+  });
+  var tbtn = document.getElementById('theme');
+  function label() { tbtn.textContent = html.dataset.theme === 'dark' ? 'Light theme' : 'Dark theme'; }
+  tbtn.addEventListener('click', function (e) { e.stopPropagation(); html.dataset.theme = html.dataset.theme === 'dark' ? 'light' : 'dark'; label(); });
+  // Glass strength: the three recipes of tokens.json; balanced is the default and sets no attribute.
+  var gbtn = document.getElementById('glass'), glass = ['balanced', 'rich', 'light'];
+  function setGlass(g) { if (g === 'balanced') delete html.dataset.glass; else html.dataset.glass = g; gbtn.textContent = 'Glass: ' + g.charAt(0).toUpperCase() + g.slice(1); }
+  if (glass.indexOf(q.get('glass')) > 0) setGlass(q.get('glass'));
+  gbtn.addEventListener('click', function (e) { e.stopPropagation(); setGlass(glass[(glass.indexOf(html.dataset.glass || 'balanced') + 1) % 3]); });
+  label();
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function tick() {
+    var n = q.has('shot') ? new Date(2026, 8, 27, 16, 2) : new Date();
+    document.getElementById('t').textContent = pad(n.getHours()) + ':' + pad(n.getMinutes());
+    document.getElementById('d').textContent = n.getFullYear() + '/' + pad(n.getMonth() + 1) + '/' + pad(n.getDate());
+    return n;
+  }
+  var now = tick(); setInterval(tick, 15000);
+  var days = document.getElementById('days'), names = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+  var first = new Date(now.getFullYear(), now.getMonth(), 1), start = new Date(first); start.setDate(1 - first.getDay());
+  document.getElementById('mname').textContent = first.toLocaleString('en', { month: 'long', year: 'numeric' });
+  var h = names.map(function (n) { return '<span class="h">' + n + '</span>'; }).join('');
+  for (var i = 0; i < 42; i++) {
+    var d = new Date(start); d.setDate(start.getDate() + i);
+    var cls = d.getMonth() !== now.getMonth() ? 'o' : (d.getDate() === now.getDate() ? 'today' : '');
+    h += '<span class="' + cls + '">' + d.getDate() + '</span>';
+  }
+  days.innerHTML = h;
+  var open = (location.hash || '').slice(1);
+  var scene = document.getElementById('s-' + open);
+  if (scene) {
+    scene.classList.add('show');
+  }
+  if (open === 'settings') {
+    var w = document.getElementById('win');
+    w.classList.add('settings');
+    w.querySelector('.tab').innerHTML = '<img src="../icons/settings.svg" alt="">Settings';
+    w.querySelector('.chrome').style.display = 'none';
+    w.querySelector('.nav').innerHTML = '<div class="it sel navi"><img src="../icons/computer.svg" alt="">System</div><div class="it navi"><img src="../icons/network.svg" alt="">Network &amp; internet</div><div class="it navi"><img src="../icons/folder_pictures.svg" alt="">Personalisation</div><div class="it navi"><img src="../icons/user_folder.svg" alt="">Accounts</div><div class="it navi"><img src="../icons/control_panel.svg" alt="">Apps</div>';
+    w.querySelector('.content').outerHTML = '<div class="page"><h2>Personalisation</h2><div class="srow"><div class="t"><div>Background</div><div>Picture, solid colour or slideshow</div></div>Impossible silk</div><div class="srow"><div class="t"><div>Transparency effects</div><div>Frosted glass on the taskbar, Start and flyouts</div></div><div class="tgl"></div></div><div class="srow"><div class="t"><div>Accent colour</div><div>Buttons, toggles and selection</div></div>Automatic</div></div>';
+    w.querySelector('.status').style.display = 'none';
+  }
+  if (open === 'ctx') {
+    var m = document.getElementById('ctx'); m.style.left = (innerWidth - 300) + 'px'; m.style.top = '140px'; setPanel('ctx', true);
+  } else if (panels[open]) { toggle(open); }
+})();
+</script>
+</body>
+</html>

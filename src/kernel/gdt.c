@@ -1,0 +1,514 @@
+/* ============================================================================
+ * gdt.c -- Global Descriptor Table (x86-64 Long Mode)
+ *
+ * Sets up the GDT with:
+ *   [0] Null descriptor
+ *   [1] Kernel code  (Ring 0, 64-bit)
+ *   [2] Kernel data  (Ring 0)
+ *   [3] User code    (Ring 3, 64-bit)
+ *   [4] User data    (Ring 3)
+ *   [5-6] TSS        (16-byte descriptor in Long Mode), BSP
+ *   [7..] TSS        one more 16-byte descriptor per AP (TODO-09-boot S10)
+ *
+ * Then loads the GDT and TSS via assembly helpers.
+ * ============================================================================ */
+
+#include "kernel/gdt.h"
+#include "kernel/klog.h"
+#include "kernel/mm/pmm.h"
+#include "kernel/mm/vmm.h"
+#include "kernel/boot_init.h"
+#include "kernel/boot_halt.h"
+#include "kernel/smp.h"
+/* A single GDT entry (8 bytes) */
+struct gdt_entry {
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t  base_mid;
+    uint8_t  access;
+    uint8_t  granularity;   /* flags (4 bits) + limit_high (4 bits) */
+    uint8_t  base_high;
+} __attribute__((packed));
+
+/* GDT pointer (loaded by lgdt) */
+struct gdt_pointer {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
+
+/* The GDT: null + 4 segments + 2 slots per CPU TSS (GDT_NUM_ENTRIES) */
+static struct gdt_entry gdt[GDT_NUM_ENTRIES];
+
+/* The GDTR value */
+static struct gdt_pointer gdtr;
+
+/* The BSP's TSS */
+static struct tss kernel_tss;
+
+/* AP TSSs (index = logical CPU; index 0 unused, the BSP uses kernel_tss) and
+ * the per-CPU lookup. s_cpu_tss[c] is written once by the BSP: [0] in
+ * gdt_init, [c] in gdt_install_ap_tss before AP c's SIPI, both before any
+ * reader can run on that CPU; the release store pairs with the acquire loads
+ * in the readers, so a reader that sees the pointer sees a filled TSS. */
+static struct tss ap_tss[MAX_CPUS];
+static struct tss *s_cpu_tss[MAX_CPUS];
+
+/* External assembly: reload segment registers after loading new GDT */
+extern void gdt_flush(uint64_t gdtr_addr);
+
+/* External assembly: load the TSS */
+extern void tss_flush(uint16_t selector);
+
+/* --- Helper: set a standard GDT entry --- */
+static void gdt_set_entry(uint32_t index, uint32_t base, uint32_t limit,
+                           uint8_t access, uint8_t flags)
+{
+    gdt[index].limit_low   = (uint16_t)(limit & 0xFFFF);
+    gdt[index].base_low    = (uint16_t)(base & 0xFFFF);
+    gdt[index].base_mid    = (uint8_t)((base >> 16) & 0xFF);
+    gdt[index].access      = access;
+    gdt[index].granularity  = (uint8_t)(((flags & 0x0F) << 4) | ((limit >> 16) & 0x0F));
+    gdt[index].base_high   = (uint8_t)((base >> 24) & 0xFF);
+}
+
+/* --- Helper: set the 64-bit TSS descriptor (spans 2 GDT slots) --- */
+static void gdt_set_tss(uint32_t index, uint64_t base, uint32_t limit)
+{
+    /* First 8 bytes -- standard descriptor format */
+    gdt[index].limit_low   = (uint16_t)(limit & 0xFFFF);
+    gdt[index].base_low    = (uint16_t)(base & 0xFFFF);
+    gdt[index].base_mid    = (uint8_t)((base >> 16) & 0xFF);
+    gdt[index].access      = 0x89;   /* Present=1, DPL=0, Type=9 (available 64-bit TSS) */
+    gdt[index].granularity  = (uint8_t)(((limit >> 16) & 0x0F));
+    gdt[index].base_high   = (uint8_t)((base >> 24) & 0xFF);
+
+    /* Second 8 bytes -- upper 32 bits of base address + reserved */
+    /* We treat gdt[index+1] as raw bytes for the upper base */
+    uint32_t *upper = (uint32_t *)&gdt[index + 1];
+    upper[0] = (uint32_t)(base >> 32);  /* base[63:32] */
+    upper[1] = 0;                        /* reserved */
+}
+
+/* IST stacks for critical exceptions. Each IST = 1 guard page (bottom) +
+ * IST_STACK_PAGES usable pages. 4 KiB was too tight: the #DF/NMI/MCE path
+ * falls through to panic_screen() -> write_crash_dump(), which puts a 2 KiB
+ * buffer on the stack before the VFS/NVRAM/framebuffer render chain.
+ *
+ * The panic path's stack consumers, kept current because overflowing IST1 while
+ * already handling #DF hits the guard page and triple-faults -- the exact
+ * failure IST exists to prevent. panic_screen_impl holds the caller-string
+ * snapshot desc_snap[256] + file_snap[64] and the shared frame capture
+ * frames[PANIC_MAX_STACK_DEPTH] (128 B) live across its whole body; below it
+ * write_crash_dump adds char buf[2048]. klog_emit -- reachable from these paths
+ * and treated as panic-context by its own clock choice -- adds a klog_entry_t
+ * snapshot (288 B) plus the line[512] serial buffer, ~800 B whenever anything
+ * on the path logs. That is ~3.3 KiB of named locals inside 8 KiB, before the
+ * VFS chain. Anything that adds a large panic-path local belongs in this
+ * list. */
+#define IST_STACK_PAGES 2   /* usable pages above the guard (8 KiB) */
+
+/* Allocate one IST stack with a guard page at the bottom; return the stack
+ * top. IST is critical boot infrastructure: without a valid, guarded stack a
+ * #DF/NMI/MCE triple-faults instead of showing a BSOD, so any allocation or
+ * guard failure is fatal, not degraded. */
+static uint64_t ist_alloc(const char *guard_label)
+{
+    uintptr_t base = pmm_alloc_contiguous(IST_STACK_PAGES + 1);
+    if (!base)
+        boot_halt("IST stack allocation failed (out of physical memory)");
+    if (vmm_install_guard_page(base, guard_label) != 0)
+        boot_halt("IST guard page install failed");
+    return (uint64_t)(base + (uint64_t)(IST_STACK_PAGES + 1) * VMM_PAGE_SIZE);
+}
+
+/* AP variant: an AP that cannot get a guarded IST stack is not started (one
+ * CPU lost, said so) rather than halting a boot the BSP can finish alone.
+ * Returns the stack top or 0. Same frame policy as the AP kernel stack in
+ * smp_init: an unusable identity VA is quarantined, never handed back. */
+static uint64_t ist_try_alloc(const char *guard_label)
+{
+    uintptr_t base = pmm_alloc_contiguous(IST_STACK_PAGES + 1);
+    int rc;
+
+    if (!base)
+        return 0;
+    rc = vmm_install_guard_page(base, guard_label);
+    if (rc != VMM_GUARD_OK) {
+        if (rc != VMM_GUARD_VA_UNSAFE)
+            pmm_free_contiguous(base, IST_STACK_PAGES + 1);
+        return 0;
+    }
+    return (uint64_t)(base + (uint64_t)(IST_STACK_PAGES + 1) * VMM_PAGE_SIZE);
+}
+
+/* Undo ist_try_alloc for a stack that will never be used. The frame goes back
+ * only when the guard uninstall confirms the identity mapping is restored
+ * (vmm.h contract); otherwise the run stays quarantined. */
+static void ist_release(uint64_t top)
+{
+    uintptr_t base;
+
+    if (!top)
+        return;
+    base = (uintptr_t)(top - (uint64_t)(IST_STACK_PAGES + 1) * VMM_PAGE_SIZE);
+    if (vmm_uninstall_guard_page(base) == 0)
+        pmm_free_contiguous(base, IST_STACK_PAGES + 1);
+}
+
+/* --- BSP ring-0 entry stack (bare-metal hardening: BSP entry-stack guard) -------------------------
+ *
+ * TSS.rsp0 is the stack the CPU switches to on a ring-3 -> ring-0 transition.
+ * It was a bare 16 KiB BSS array in boot_hw.c: the ONE stack in the kernel
+ * with no guard page under it, while task, thread, AP and IST stacks all
+ * carry one. An overflow therefore wrote into neighbouring BSS and the
+ * machine continued into a wrong state.
+ *
+ * It could not simply be page-aligned with a guard prepended in place: the
+ * kernel image already ends at 0x7ff000 against the 0x800000 firmware floor
+ * scripts/build.sh enforces (the bootloader refuses a PT_LOAD into the
+ * ACPIMemoryNVS region that begins there), and the alignment plus guard needed
+ * ~7.4 KiB against ~4 KiB of headroom. Moving it to PMM frees 16 KiB of image
+ * instead.
+ *
+ * SCOPE, stated because the obvious reading is wrong: this is NOT the Phase-0
+ * or Phase-1 execution stack. src/boot/uefi/bootx64.c jump_to_kernel() loads
+ * CR3 and CALLS the kernel entry without writing RSP, so early boot runs on
+ * the UEFI loader's own stack and never touches this one. This stack goes live
+ * at the first ring-3 -> ring-0 entry and stays live only until the scheduler
+ * installs an incoming thread's kernel_rsp over TSS.rsp0 (task.c
+ * context_switch). Guarding the Phase-0/1 stack is a separate question that
+ * needs an RSP handoff in the boot path; it is filed, not done here. */
+#define BSP_ENTRY_STACK_PAGES 4                  /* 16 KiB usable, matches AP_STACK_SIZE */
+#define BSP_ENTRY_STACK_POISON 0xB5B5B5B5B5B5B5B5ULL
+
+_Static_assert(BSP_ENTRY_STACK_PAGES * 4096u == BSP_ENTRY_STACK_SIZE,
+    "BSP_ENTRY_STACK_PAGES must describe BSP_ENTRY_STACK_SIZE (gdt.h)");
+
+static uintptr_t bsp_entry_stack_guard_base;   /* the guard page itself */
+static uintptr_t bsp_entry_stack_lo;           /* first usable byte */
+static uint64_t  bsp_entry_stack_hi;           /* stack top (RSP starts here) */
+static int       bsp_entry_stack_is_guarded;
+static int       bsp_entry_stack_is_poisoned;
+
+/* Allocate the BSP ring-0 entry stack: one guard page plus the usable run.
+ * Failure policy differs per VMM result, which the guard contract in vmm.h
+ * requires and a flat "warn and carry on" would erase:
+ *
+ *   - allocation failure    -> fatal. Every ring-3 -> ring-0 entry needs a
+ *                              valid RSP0, and some bare-metal Intel parts
+ *                              validate it at interrupt delivery.
+ *   - VMM_GUARD_VA_UNSAFE   -> fatal. The frame's identity VA is absent,
+ *                              aliased, or read-only, so it is not safe to run
+ *                              a stack on and not safe to hand back to the PMM.
+ *   - VMM_GUARD_UNAVAILABLE -> degraded. The mapping is intact and the run is
+ *                              usable; only the diagnostic net is missing,
+ *                              which is exactly the state this section found.
+ *                              Say so and continue rather than refusing a boot
+ *                              that worked yesterday. */
+static void bsp_entry_stack_alloc(void)
+{
+    uintptr_t base = pmm_alloc_contiguous(BSP_ENTRY_STACK_PAGES + 1);
+    int guard_rc;
+
+    if (!base)
+        boot_halt("BSP entry stack allocation failed (out of physical memory)");
+
+    guard_rc = vmm_install_guard_page(base, "GUARD: BSP kernel entry stack overflow");
+    if (guard_rc == VMM_GUARD_VA_UNSAFE)
+        boot_halt("BSP entry stack: identity mapping is not usable for a stack");
+
+    bsp_entry_stack_guard_base = base;
+    bsp_entry_stack_lo         = base + VMM_PAGE_SIZE;
+    bsp_entry_stack_hi         = (uint64_t)(bsp_entry_stack_lo + BSP_ENTRY_STACK_SIZE);
+    bsp_entry_stack_is_guarded = (guard_rc == VMM_GUARD_OK);
+
+    /* Poison AFTER the install, never before: the fill writes through the very
+     * identity mapping vmm_install_guard_page is there to validate, so filling
+     * first would scribble on an unrelated frame in exactly the aliased case
+     * VMM_GUARD_VA_UNSAFE exists to catch. Safe to do at all only because
+     * nothing has run on this stack yet -- TSS.rsp0 is written below, and no
+     * ring-3 code exists until Phase 2.
+     *
+     * The fill is what turns the 16 KiB size from an assumption into a
+     * measurement: bsp_entry_stack_peak_used() reports the deepest byte ever
+     * disturbed. */
+    if (bsp_entry_stack_is_guarded) {
+        uint64_t *p = (uint64_t *)bsp_entry_stack_lo;
+        uint32_t i;
+        for (i = 0; i < BSP_ENTRY_STACK_SIZE / sizeof(uint64_t); i++)
+            p[i] = BSP_ENTRY_STACK_POISON;
+        bsp_entry_stack_is_poisoned = 1;
+    }
+}
+
+uintptr_t bsp_entry_stack_guard(void)  { return bsp_entry_stack_guard_base; }
+uintptr_t bsp_entry_stack_base(void)   { return bsp_entry_stack_lo; }
+uint64_t  bsp_entry_stack_top(void)    { return bsp_entry_stack_hi; }
+int       bsp_entry_stack_guarded(void){ return bsp_entry_stack_is_guarded; }
+
+/* High-water mark in bytes: scan up from the lowest usable qword for the first
+ * one still holding the poison. Everything below that has been written at some
+ * point, so the answer is (top - first_intact).
+ *
+ * Reports 0 when the run was never poisoned (guard install degraded), and it
+ * is a LOWER bound in principle -- a frame that leaves a hole, or writes the
+ * poison value itself, reads as untouched. Both are diagnostics-grade
+ * imprecision, not correctness. */
+uint32_t bsp_entry_stack_peak_used(void)
+{
+    const uint64_t *p = (const uint64_t *)bsp_entry_stack_lo;
+    uint32_t n = BSP_ENTRY_STACK_SIZE / sizeof(uint64_t);
+    uint32_t i;
+
+    if (!bsp_entry_stack_is_poisoned)
+        return 0;
+
+    for (i = 0; i < n; i++)
+        if (p[i] != BSP_ENTRY_STACK_POISON)
+            break;
+
+    return (uint32_t)((n - i) * sizeof(uint64_t));
+}
+
+void gdt_init(void)
+{
+    uint64_t tss_base = (uint64_t)(uintptr_t)&kernel_tss;
+    uint32_t tss_limit = sizeof(struct tss) - 1;
+    uint32_t i;
+
+    /* Zero the TSS */
+    uint8_t *tss_ptr = (uint8_t *)&kernel_tss;
+    for (i = 0; i < sizeof(struct tss); i++)
+        tss_ptr[i] = 0;
+
+    /* Set RSP0 so ring 3→0 transitions have a valid kernel stack.  Also
+     * required on some bare-metal Intel CPUs that check RSP0 validity on
+     * interrupt delivery.  PMM-backed with a guard page beneath it, so an
+     * overflow of this stack faults with a label instead of corrupting
+     * whatever sits below (bare-metal hardening: BSP entry-stack guard). */
+    POST16(0xD1F0);
+    bsp_entry_stack_alloc();
+    kernel_tss.rsp0 = bsp_entry_stack_top();
+    if (!bsp_entry_stack_guarded())
+        klog(LOG_WARN, "cpu",
+             "BSP entry stack at %p is UNGUARDED (guard table full or split "
+             "failed) -- an overflow will corrupt memory below it silently",
+             (uint64_t)bsp_entry_stack_base());
+    POST16(0xD1F1);
+
+    /* IST stacks for critical exceptions: #DF, NMI, MCE. Allocated from PMM
+     * (identity-mapped, phys = virt). PMM is up in Phase 0, GDT in Phase 1.
+     * Failure is fatal (see ist_alloc). This is the BSP's TSS; each AP gets
+     * its own from gdt_install_ap_tss() before smp_init() starts it. */
+    POST16(0xD200);
+    kernel_tss.ist1 = ist_alloc("GUARD: IST #DF stack overflow");
+    kernel_tss.ist2 = ist_alloc("GUARD: IST NMI stack overflow");
+    kernel_tss.ist3 = ist_alloc("GUARD: IST MCE stack overflow");
+    klog(LOG_INFO, "cpu",
+         "IST stacks: DF=%p NMI=%p MCE=%p (%u KiB each + guard page)",
+         kernel_tss.ist1, kernel_tss.ist2, kernel_tss.ist3,
+         (uint64_t)(IST_STACK_PAGES * 4));
+    klog(LOG_INFO, "cpu",
+         "BSP entry stack: %p..%p (%u KiB usable, guard %p %s)",
+         (uint64_t)bsp_entry_stack_base(), bsp_entry_stack_top(),
+         (uint64_t)(BSP_ENTRY_STACK_SIZE / 1024),
+         (uint64_t)bsp_entry_stack_guard(),
+         bsp_entry_stack_guarded() ? "installed" : "UNAVAILABLE");
+    POST16(0xD201);
+
+    /* Set the I/O Permission Bitmap offset to beyond the TSS (no IOPB) */
+    kernel_tss.iopb_offset = sizeof(struct tss);
+
+    /* --- Populate GDT entries --- */
+
+    /* [0] Null descriptor */
+    gdt_set_entry(0, 0, 0, 0, 0);
+
+    /* [1] Kernel code segment (Ring 0, 64-bit)
+     * Access: Present=1, DPL=00, S=1, Type=Execute/Read = 0x9A
+     * Flags:  L=1 (Long Mode), D=0, G=0 = 0x02 */
+    gdt_set_entry(1, 0, 0xFFFFF, 0x9A, 0x0A);
+
+    /* [2] Kernel data segment (Ring 0)
+     * Access: Present=1, DPL=00, S=1, Type=Read/Write = 0x92
+     * Flags:  L=0, D=1, G=1 = 0x0C */
+    gdt_set_entry(2, 0, 0xFFFFF, 0x92, 0x0C);
+
+    /* [3] User data segment (Ring 3) -- MUST be before user code for SYSRET
+     * Access: Present=1, DPL=11, S=1, Type=Read/Write = 0xF2
+     * Flags:  L=0, D=1, G=1 = 0x0C */
+    gdt_set_entry(3, 0, 0xFFFFF, 0xF2, 0x0C);
+
+    /* [4] User code segment (Ring 3, 64-bit)
+     * Access: Present=1, DPL=11, S=1, Type=Execute/Read = 0xFA
+     * Flags:  L=1 (Long Mode), D=0, G=0 = 0x02 */
+    gdt_set_entry(4, 0, 0xFFFFF, 0xFA, 0x0A);
+
+    /* [5-6] TSS descriptor (16 bytes in Long Mode) */
+    gdt_set_tss(5, tss_base, tss_limit);
+
+    /* AP TSS slots stay zero (not present) until gdt_install_ap_tss() fills
+     * one; the limit below already covers them, so the GDTR the APs load from
+     * AP_DATA is this same value. */
+    __atomic_store_n(&s_cpu_tss[0], &kernel_tss, __ATOMIC_RELEASE);
+
+    /* --- Load the GDT --- */
+    gdtr.limit = (uint16_t)(sizeof(gdt) - 1);
+    gdtr.base  = (uint64_t)(uintptr_t)&gdt;
+
+    gdt_flush((uint64_t)(uintptr_t)&gdtr);
+    tss_flush(GDT_TSS_SEG);
+
+    /* --- Runtime verification of SYSRET-critical GDT ordering ---
+     * Read back the access bytes from the populated entries and verify
+     * user data is at index 3 (0x18) and user code is at index 4 (0x20).
+     * A mismatch here means gdt_set_entry() calls are in the wrong order. */
+    {
+        uint8_t udata_access = gdt[GDT_USER_DATA / 8].access;
+        uint8_t ucode_access = gdt[GDT_USER_CODE / 8].access;
+
+        /* User data: Present=1, DPL=11, S=1, Type=Read/Write = 0xF2 */
+        if (udata_access != 0xF2) {
+            klog(LOG_FATAL, "GDT",
+                 "FATAL: GDT[0x%x] access=0x%x, expected 0xF2 (user data). "
+                 "SYSRET will triple-fault!",
+                 (uint32_t)GDT_USER_DATA, (uint32_t)udata_access);
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+
+        /* User code: Present=1, DPL=11, S=1, Type=Execute/Read = 0xFA */
+        if (ucode_access != 0xFA) {
+            klog(LOG_FATAL, "GDT",
+                 "FATAL: GDT[0x%x] access=0x%x, expected 0xFA (user code). "
+                 "SYSRET will triple-fault!",
+                 (uint32_t)GDT_USER_CODE, (uint32_t)ucode_access);
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+    }
+
+    klog(LOG_INFO, "cpu", "GDT loaded (%u entries, TSS at %p)",
+           (uint64_t)GDT_NUM_ENTRIES, tss_base);
+}
+
+void tss_set_kernel_stack(uint64_t stack_top)
+{
+    /* The calling CPU's own TSS. Only that CPU reads its rsp0 (the hardware,
+     * on its own ring-3 -> ring-0 entries), so the write needs no lock. */
+    uint32_t cpu = smp_this_cpu()->cpu_id;
+    struct tss *t = (cpu < MAX_CPUS) ? __atomic_load_n(&s_cpu_tss[cpu], __ATOMIC_ACQUIRE) : NULL;
+
+    /* Only CPU 0 may fall back to the BSP TSS (gdt_init publishes it). An AP
+     * with no TSS of its own must never write another CPU's rsp0: every AP is
+     * started only after its TSS is published, so this is a broken invariant. */
+    if (!t) {
+        if (cpu != 0)
+            boot_halt("tss_set_kernel_stack: CPU has no published TSS");
+        t = &kernel_tss;
+    }
+    t->rsp0 = stack_top;
+}
+
+uint16_t gdt_tss_selector(uint32_t cpu)
+{
+    return (cpu < MAX_CPUS) ? GDT_TSS_SEL_FOR(cpu) : 0;
+}
+
+uint16_t gdt_install_ap_tss(uint32_t cpu, uint64_t rsp0)
+{
+    struct tss *t;
+    uint32_t i;
+
+    if (cpu == 0 || cpu >= MAX_CPUS || rsp0 == 0)
+        return 0;
+    if (__atomic_load_n(&s_cpu_tss[cpu], __ATOMIC_ACQUIRE))
+        return 0;   /* published once; a second install would rewrite a live TSS */
+
+    t = &ap_tss[cpu];
+    for (i = 0; i < sizeof(*t); i++)
+        ((uint8_t *)t)[i] = 0;
+
+    t->rsp0 = rsp0;
+    t->ist1 = ist_try_alloc("GUARD: AP IST #DF stack overflow");
+    t->ist2 = t->ist1 ? ist_try_alloc("GUARD: AP IST NMI stack overflow") : 0;
+    t->ist3 = t->ist2 ? ist_try_alloc("GUARD: AP IST MCE stack overflow") : 0;
+    if (!t->ist3) {
+        ist_release(t->ist1);
+        ist_release(t->ist2);
+        t->ist1 = t->ist2 = 0;
+        klog(LOG_ERROR, "cpu", "AP %u: no guarded IST stacks -- not starting it",
+             (uint64_t)cpu);
+        return 0;
+    }
+    t->iopb_offset = sizeof(struct tss);
+
+    gdt_set_tss(GDT_TSS_FIRST_INDEX + 2u * cpu, (uint64_t)(uintptr_t)t, sizeof(struct tss) - 1);
+    __atomic_store_n(&s_cpu_tss[cpu], t, __ATOMIC_RELEASE);
+    return GDT_TSS_SEL_FOR(cpu);
+}
+
+void gdt_release_ap_tss(uint32_t cpu)
+{
+    struct tss *t;
+    uint32_t idx;
+    uint64_t *desc;
+
+    if (cpu == 0 || cpu >= MAX_CPUS)
+        return;
+    /* Unpublish first: from here no lookup can return this TSS. */
+    t = __atomic_exchange_n(&s_cpu_tss[cpu], (struct tss *)0, __ATOMIC_ACQ_REL);
+    if (!t)
+        return;
+
+    idx = GDT_TSS_FIRST_INDEX + 2u * cpu;
+    desc = (uint64_t *)&gdt[idx];
+    desc[0] = 0;   /* not present: an ltr of this selector now faults */
+    desc[1] = 0;
+
+    ist_release(t->ist1);
+    ist_release(t->ist2);
+    ist_release(t->ist3);
+    t->ist1 = t->ist2 = t->ist3 = 0;
+    t->rsp0 = 0;
+}
+
+uint64_t gdt_get_cpu_ist(uint32_t cpu, unsigned index)
+{
+    const struct tss *t = (cpu < MAX_CPUS) ? __atomic_load_n(&s_cpu_tss[cpu], __ATOMIC_ACQUIRE) : NULL;
+
+    return tss_get_ist(t, index);
+}
+
+uint64_t tss_get_ist(const struct tss *tss, unsigned index)
+{
+    /* Contract in gdt.h: `index` is the 1-based IST number an IDT descriptor
+     * encodes, so 0 ("no IST") and anything past ist7 are not slots and read
+     * as 0 rather than walking off the struct. */
+    if (!tss)
+        return 0;
+
+    switch (index) {
+    case 1:  return tss->ist1;
+    case 2:  return tss->ist2;
+    case 3:  return tss->ist3;
+    case 4:  return tss->ist4;
+    case 5:  return tss->ist5;
+    case 6:  return tss->ist6;
+    case 7:  return tss->ist7;
+    default: return 0;
+    }
+}
+
+uint64_t gdt_get_ist(unsigned index)
+{
+    /* Lock-free by design -- see the SMP note on the declaration in gdt.h. */
+    return tss_get_ist(&kernel_tss, index);
+}
+
+void gdt_get_gdtr(void *out_gdtr)
+{
+    uint8_t *dst = (uint8_t *)out_gdtr;
+    const uint8_t *src = (const uint8_t *)&gdtr;
+    uint32_t i;
+    for (i = 0; i < 10; i++)
+        dst[i] = src[i];
+}

@@ -1,0 +1,75 @@
+name: Live site drift
+
+# Detect AND repair drift between the deployed site (impossibleos.co) and main.
+# pages.yml verifies right after each deploy; this catches what happens later or
+# without a push: a failed deploy nobody noticed, a stale CDN edge, a Pages
+# outage that restored an old build. On drift it redeploys main and fails, so
+# the red run is the report and the redeploy is the repair; the redeploy's own
+# verify job then proves the repair worked. It never redeploys from a
+# workflow_run, so a build that cannot match the live site cannot loop.
+# The comparison includes every retained release tree on the docs-releases
+# branch (scripts/site/releases.py), and the redeploy puts them back.
+
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  verify:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet PyYAML
+
+      # A deploy still running means the live site is the previous build, and comparing
+      # it to main reads that as drift. Two of the last three failures were exactly this
+      # (2026-11-07 06:33 and 22:16 UTC, each while pages.yml deployed the commit being
+      # checked). Not a shared concurrency group: GitHub keeps one pending run per group,
+      # so a queued check would cancel a pending deploy. Bounded at 30 minutes.
+      - name: Wait for any Pages deploy to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 31
+        # A running deploy always counts. A QUEUED run counts unless a deploy created after
+        # it has since succeeded, which leaves it nothing to change: run 43096022843 sat
+        # queued for 16 hours behind three successful deploys and held this step to its
+        # timeout. A cancelled or failed run proves nothing about the site, so only a
+        # success supersedes. The wait is bounded by elapsed time with each query capped
+        # (counting only the sleeps let slow queries overrun it), so the fallback below
+        # runs well inside the step's timeout.
+        run: |
+          deadline=$(( $(date +%s) + 25 * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            busy="$(timeout 60 gh run list --repo "$GITHUB_REPOSITORY" --workflow pages.yml --limit 20 \
+                      --json status,conclusion,createdAt --jq '
+                        ([.[] | select(.conclusion == "success") | .createdAt] | max) as $ok
+                        | [.[] | select(.status != "completed"
+                                        and (.status == "in_progress" or $ok == null or .createdAt > $ok))]
+                        | length')" || busy=unknown
+            [ "$busy" = 0 ] && exit 0
+            echo "a Pages deploy is still running ($busy); waiting"
+            sleep 30
+          done
+          echo "Pages still deploying after 25 minutes; verifying anyway"
+
+      - name: Live site is byte-identical to main and the retained releases
+        id: verify
+        run: python3 scripts/site/verify_live.py --retries 3 --wait 60 --releases remote
+
+      - name: Repair -- redeploy main
+        if: failure() && steps.verify.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main --repo "$GITHUB_REPOSITORY"

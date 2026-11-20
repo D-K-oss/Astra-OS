@@ -1,0 +1,96 @@
+# Overnight-runner control-plane manifest -- SINGLE SOURCE OF TRUTH.
+#
+# Every path prefix below names code whose breakage breaks the UNATTENDED
+# overnight run (arm / launch / phase-machine / watchdog / circuit-breaker /
+# review dispatch). A commit or push touching ANY of them must pass the runner
+# test suite (scripts/overnight/tests/run-all.sh).
+#
+# Canary tiering (P0.0, 2026-07-12): the ATTENDED-canary requirement now applies
+# ALLOWLIST of files whose failure mode is fully caught by the deterministic
+# suite (metrics / receipts / reporting, all test-backed); a change limited to
+# those is proven by the suite, NOT a watched canary. Everything NOT on that
+# allowlist stays flow-critical (re-arms the canary) -- default-flow-critical, so
+# a new/unclassified control-plane file is always conservative. The FULL-manifest
+# suite gate below is unchanged; only the canary gate reads the subset.
+#
+# Consumed by (keep them all reading THIS file, never a private copy):
+#   - .githooks/pre-commit           (commit gate: run the suite -- FULL manifest)
+#   - .githooks/pre-push             (push gate: suite + runner-doctor -- FULL)
+#       the FLOW-CRITICAL subset via control-plane-match.sh --flow-critical)
+#   - scripts/lint.sh Check (architectural lint: no bespoke lifecycle code)
+#   - scripts/overnight/control-plane-match.sh  (the shared matcher; --flow-critical
+#
+# Format: one path or path-prefix per line; blank lines and #-comments ignored.
+# A candidate file MATCHES if it equals a line or begins with a line that ends
+# in "/". Keep entries repo-relative with forward slashes.
+
+# Arm / disarm / launch / watchdog
+.claude/skills/overnight-sequencer/
+scripts/overnight/
+
+# The file that WIRES every hook below. Added 2026-07-28 after verifying it was
+# in NEITHER manifest: `printf '.claude/settings.json' | control-plane-match.sh`
+# returned nothing, with or without --flow-critical. The manifest listed ten
+# individual hook FILES but not the wiring, so an edit that neuters any of them
+# ran the runner suite zero times and left the canary stamp valid.
+#
+# Not hypothetical: commit a1c3802b disabled a live PreToolUse BLOCK hook by
+# deleting five lines from this file. It happened to also touch the hook itself,
+# which is the only reason the hook audit saw it -- a settings-only change, the
+# natural shape for "turn this gate off", would have passed silently. The same
+# shape can raise a timeout, swap a matcher, or reorder a gate chain.
+#
+# already catches an undocumented hook, but "a gate was silently unwired" is
+# precisely the failure an attended canary exists to notice, so this stays
+# flow-critical by the default-conservative rule above.
+.claude/settings.json
+
+# Phase machine, oracle, status brief, edit preflight (guard hooks the run relies on)
+.claude/hooks/run_phase_guard.py
+.claude/hooks/sequencer_triage.py
+.claude/hooks/runner_status.py
+.claude/hooks/edit_preflight.py
+
+# Commit-time gate the runner's own section commits must pass
+.claude/hooks/section_commit_gate.py
+
+# The machinery that runs this suite at commit (2026-11-17): the staged-tree
+# helper exports the commit's index, isolates git and stops every process the
+# suite starts. Outside the manifest, a change to it alone never ran the tests
+# that exercise it (test_staged_tree.py, test_hook_git_env.py).
+.githooks/lib/staged-tree.sh
+.githooks/lib/isolate-git-env.sh
+
+# SHARED GATE MACHINERY (2026-07-28). The manifest listed the gate FILES but
+# not the helpers that decide whether a gate applies, so a one-line change here
+# could alter the effective behaviour of every gate importing it with the suite
+# and the canary requirement both unarmed. That is not hypothetical: a single
+# `shlex.split()` over a whole command in _skip_env.py silently dropped the
+# SKIP_* opt-out for any command carrying a heredoc with an apostrophe, and
+# nothing in the control plane would have caught it. Importer counts at filing:
+# _skip_env 8, _review_kind 5, _codex_dispatch 5, _advisory_budget 4,
+# _heuristic_misses 3.
+# Same hole, same shape, as `.claude/settings.json` earlier the same day: the
+# wiring is as load-bearing as the thing wired. All flow-critical by the
+# default-conservative rule -- "an opt-out stopped working" is precisely the
+# failure an attended canary exists to notice, and none of these is covered by
+# the deterministic allowlist.
+.claude/hooks/_skip_env.py
+.claude/hooks/_review_kind.py
+.claude/hooks/_codex_dispatch.py
+.claude/hooks/_advisory_budget.py
+.claude/hooks/_heuristic_misses.py
+
+scripts/overnight/stale_parks.py
+scripts/overnight/skill_denies.py
+scripts/overnight/supervisor.py
+.claude/hooks/gate.py
+scripts/overnight/heartbeat.sh
+scripts/overnight/run-common.sh
+scripts/run.sh
+scripts/review_pin.py
+scripts/overnight/ship_count.py
+# CI install steps and their helper: test_ci_toolchain_install.py pins them, and
+# on 2026-11-10 a workflow edit broke that test with no gate running it.
+.github/workflows/
+scripts/ci/

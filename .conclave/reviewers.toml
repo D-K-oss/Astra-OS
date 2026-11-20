@@ -1,0 +1,86 @@
+# Reviewer pin and review schedule for Impossible OS. Same format as RasterFold's pin (schema_version 1).
+#
+# Operator decision 2026-11-10: when Claude is the writer, the reviewer is always GPT-6.2 Astra (moved from GPT-6 on 2026-11-17) through the Codex CLI.
+# One route, one reviewer, no fallback. An outage is never an approval.
+# Operator decision 2026-11-14: an outage is a delay, and it does not stop the run. A section built while the
+# reviewer is down is recorded as owed (scripts/overnight/review_owed.py), nothing is pushed while a debt is
+# open, and the owed sections are reviewed in full, first, when the reviewer answers.
+# Operator decision 2026-11-11: the review shape follows RasterFold's three passes. It is four here, on evidence:
+# replayed on shipped sections the same day, one combined round found one of four known performance defects that
+# the dedicated performance review had found, so performance stays a pass of its own
+# (docs/specs/2026-11-11-three-pass-review-design.md, Replay).
+#   - before the build, one plan review (kind plan);
+#   - after the build and its gates, one round carrying every defect lens (kind round);
+#   - one performance review (kind performance);
+#   - on the final candidate, one completion review (kind completion).
+# The round and the performance pass are dispatched again after their findings are fixed. A section is stamped when
+# the round, the performance pass and the completion pass each ended below a blocking level on the candidate being
+# stamped.
+# A completion that returns gaps is repaired and followed by a reconciliation pass (kind reconciliation), up to
+# pass_cap returned passes per section in all. no_progress_cap ends a loop whose passes stop finding anything new.
+# Each lens has one owner: the round hunts defects, the completion pass checks delivery and the record.
+# Findings are tagged P1, P2 or P3. Only the levels in `blocking` hold the stamp; the rest are filed as tracked
+# items and spend no further passes. A [[schedule.conditional]] entry adds its lenses to the named passes only
+# when the section's changed files fall under one of its paths.
+# A section keeps the schedule it started under, so sections already under review finish on the earlier rules.
+# Operator decision 2026-11-17: GPT-6.2 Astra was released and replaces GPT-6 Astra (`gpt-6.2-astra` through the
+# Codex CLI). The dispatcher holds every pass to the model in ~/.codex/config.toml, so sections already under review
+# continue on GPT-6.2 Astra.
+#
+# `model` is a declaration, never a flag: the dispatcher refuses when ~/.codex/config.toml names a different model.
+# There is no `effort` key here. Reasoning effort is the operator's dial in the Codex config.
+
+schema_version = 1
+
+[reviewers.astra]
+cli = "codex"
+model = "gpt-6.2-astra"
+
+[routes]
+claude = ["astra"]
+
+[schedule]
+policy = "four-pass"
+pass_cap = 33
+no_progress_cap = 3
+# Operator decision 2026-11-19: a round is progress only when its worst finding is less severe than the last
+# round's, so a review that finds a fresh edge case on every fix stalls instead of running to the cap. A
+# section touching one of deep_paths keeps the earlier rule (any new finding is progress): boot and kernel
+# bugs are found late and cost most to find afterwards, and the file manager's copy, move and delete code
+# (todo/09-desktop-shell/TODO-09-file-manager.md) can lose the user's files. pass_cap went from 55 to 33 the
+# same day.
+deep_paths = ["src/boot/", "src/kernel/", "include/kernel/", "src/apps/filemgr/filemgr_ops"]
+blocking = ["P1", "P2"]
+
+[schedule.plan]
+lenses = ["plan"]
+
+[[schedule.rounds]]
+lenses = ["adversarial", "integration", "source-defect", "consistency", "quality", "test-coverage"]
+
+[schedule.performance]
+lenses = ["optimization"]
+
+[schedule.completion]
+lenses = ["plan-delivery", "record"]
+
+# Operator decision 2026-11-19: a reconciliation verifies that the named gaps are closed and the repair broke
+# nothing. Edge cases are hunted in the round; only kernel and boot repairs get the adversarial lenses again
+# (the conditional entry below). no_progress_cap went from 5 to 3 the same day.
+[schedule.reconciliation]
+lenses = ["plan-delivery", "record"]
+
+[[schedule.conditional]]
+lenses = ["adversarial", "integration"]
+passes = ["reconciliation"]
+paths = ["src/kernel/", "include/kernel/", "src/boot/"]
+
+[[schedule.conditional]]
+lenses = ["concurrency", "bare-metal"]
+passes = ["round", "reconciliation"]
+paths = ["src/kernel/", "include/kernel/", "src/boot/"]
+
+[[schedule.conditional]]
+lenses = ["design"]
+passes = ["plan", "round"]
+paths = ["src/desktop/", "src/shell/", "src/apps/", "user/", "gh-pages/"]

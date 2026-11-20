@@ -1,0 +1,128 @@
+name: GitHub Pages
+
+# The published site is GENERATED, never committed: scripts/site/build.py
+# renders the landing templates in gh-pages/ (with project.json facts) and every
+# docs/**/*.md page into build/site/. The --check pass runs first so a drifted
+# source (dead doc link, stale project region, stale coverage baseline) fails
+# the deploy instead of publishing.
+
+# Every push to main, not a path list: the freshness table on the coverage page
+# depends on source files anywhere in the tree, and a filter that misses one
+# would publish "up to date" for a page whose code has since changed.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Node 20 runtime removed from runners 2026-09-16; opt in to Node 24 now.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    outputs:
+      store: ${{ steps.releases.outputs.store }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: the baseline compares against the previous commit, freshness against each page's last change
+
+      - name: Install PyYAML (the todo-graph producer computes feature-card roadmap status)
+        run: python3 -m pip install --quiet PyYAML
+
+      - name: Check published sources for drift
+        run: python3 scripts/site/build.py --check
+
+      - name: Build site
+        run: python3 scripts/site/build.py --out _site
+
+      # Retained release docs trees live frozen on the docs-releases branch
+      # (docs-release.yml writes them). Every deploy puts them all back, or the
+      # upload below would drop them from the site. The store commit used is
+      # pinned for the verify job, so a release frozen meanwhile cannot make a
+      # correct deploy read as drift.
+      - name: Add retained release docs trees
+        id: releases
+        run: python3 scripts/site/releases.py assemble --site _site --releases remote --github-output "$GITHUB_OUTPUT"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  # Every page, docs and landing, in Chromium in seven variants (desktop and phone,
+  # light and dark, forced colours, reduced motion): axe-core (WCAG 2.2 A/AA plus best
+  # practice) and the skip-link, pixel focus, aria-current and motion checks axe lacks, plus the search states. The control run first
+  # proves the audit reports planted defects. Runs beside the build; the deploy
+  # waits for both. Versions are pinned by scripts/site/a11y/package-lock.json.
+  a11y:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet PyYAML
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: scripts/site/a11y/package-lock.json
+
+      - name: Install the audit (axe-core, playwright-core and its Chromium)
+        run: |
+          npm ci --prefix scripts/site/a11y --no-audit --no-fund
+          node scripts/site/a11y/node_modules/playwright-core/cli.js install --with-deps chromium
+
+      - name: Build site
+        run: python3 scripts/site/build.py --out _site
+
+      - name: The audit reports planted defects (control)
+        run: node scripts/site/a11y/audit.mjs _site control
+
+      - name: Accessibility audit of every docs page
+        run: node scripts/site/a11y/audit.mjs _site
+
+  deploy:
+    needs: [build, a11y]
+    runs-on: ubuntu-26.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # The deploy step reporting success is not proof the site people load is this
+  # commit's build. Fetch every built file back from the live site and compare
+  # bytes (the build is reproducible); retries cover CDN propagation.
+  verify:
+    needs: [build, deploy]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet PyYAML
+
+      - name: Live site is byte-identical to this commit's build
+        run: python3 scripts/site/verify_live.py --retries 6 --wait 30 --releases "${{ needs.build.outputs.store }}"

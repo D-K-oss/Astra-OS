@@ -1,0 +1,848 @@
+/* ============================================================================
+ * quota_owner.c -- Who owns a charge: process, user, and job
+ *
+ * quota.c owns the accounting MECHANISM (blocks, counters, limits). This file
+ * owns the OWNERSHIP MODEL layered on top: which blocks a process charges
+ * against, how they are inherited at process creation, how they are released
+ * at death, and how a single charge is admitted by all of them or by none.
+ *
+ * Split from quota.c on purpose. The block internals stay private to quota.c
+ * (the opaque-struct rule that makes the no-nested-lock contract enforceable),
+ * so everything here is written against the same public API any other
+ * subsystem uses -- the ownership model gets no special access to counters.
+ *
+ * Three principals own every charge:
+ *   PROCESS  one block per live task, created with the task.
+ *   USER     the canonical per-SID block behind the task's primary token,
+ *            shared by every token for that SID so a user's budget cannot be
+ *            multiplied by opening another token lineage.
+ *   JOB      the block on the Job Object the task belongs to, if any.
+ *
+ * Both the process and user block pointers live in the task and are published
+ * and cleared under task->quota_lock. That lock is the whole lifetime
+ * protocol: a reader takes it, loads the pointer, and acquires a reference
+ * before releasing it, so teardown (which clears and dereferences under the
+ * same lock) can never free a block out from under a charge in flight. A
+ * release-store would NOT be sufficient here -- publication order does not
+ * stop a reader that already loaded the pointer from referencing it after the
+ * final dereference has freed it.
+ * ========================================================================== */
+
+#include "kernel/quota/quota.h"
+#include "kernel/quota/quota_ledger.h"  /* the per-task charge gate */
+#include "kernel/sched/task.h"
+#include "kernel/ob/ob.h"
+#include "kernel/ob/ob_job.h"
+#include "kernel/security/token.h"
+#include "kernel/sched/irql.h"   /* KeGetCurrentIrql for the diagnostic gate */
+#include "kernel/boot_init.h"    /* kernel_subsystem_ready for the boot exemption */
+#include "kernel/klog.h"
+
+
+/* Owner-side critical sections are part of a chain charge's real cost, so they
+ * funnel through this helper and land in the same test-only total as the block
+ * locks in quota.c. A budget that counted only block locks would be blind to
+ * the three snapshot sections a chain charge needs -- which dominate a shallow
+ * chain -- and owner-side locking could grow without a test noticing. */
+static inline void quota_owner_lock(spinlock_t *lock, uint64_t *flags)
+{
+    spin_lock_irqsave(lock, flags);
+}
+
+/* Counted on the unlock side, after interrupts are restored, for the same
+ * reason quota.c does it there: KERNEL_TESTS is on by default, so no
+ * instrumentation may run inside an IRQ-disabled window. */
+static inline void quota_owner_unlock(spinlock_t *lock, uint64_t flags)
+{
+    spin_unlock_irqrestore(lock, flags);
+#ifdef KERNEL_TESTS
+    quota_test_count_lock_section();
+#endif
+}
+
+/* --- Task block attach / detach ------------------------------------------ */
+
+NTSTATUS quota_task_init(struct task *task, struct access_token *token)
+{
+    quota_block_t *proc = NULL;
+    quota_block_t *user = NULL;
+    ACCESS_TOKEN  *tok  = (ACCESS_TOKEN *)token;
+
+    uint64_t       flags;
+
+    if (!task)
+        return STATUS_INVALID_PARAMETER;
+
+    /* A task with no token is normal: early kernel threads run before the SRM
+     * assigns one, and they get an ownerless process block (still fully
+     * chargeable -- only the per-user aggregate needs a SID). The caller holds
+     * the token's reference across this call, so UserSid is stable here. */
+    if (tok && tok->UserSid) {
+        uint32_t sid_len = RtlLengthSid(tok->UserSid);
+        proc = quota_block_create(QUOTA_PRINCIPAL_PROCESS, tok->UserSid, sid_len);
+        if (proc) {
+            /* The user block is SHARED, not created per process: that is what
+             * makes the per-user budget an aggregate rather than a fresh
+             * allowance handed out once per token.
+             *
+             * Take it from the TOKEN, which already resolved it. Re-resolving
+             * by SID here would put a registry walk -- with interrupts disabled
+             * -- on every single process creation, to re-find the exact block
+             * the token is holding a reference to. Only a tokenless or
+             * degraded token (acquisition failed at creation) falls back to a
+             * lookup. */
+            if (tok->QuotaBlock) {
+                user = tok->QuotaBlock;
+                quota_block_ref(user);
+            } else {
+                user = quota_user_block_acquire(tok->UserSid, sid_len);
+            }
+            if (!user) {
+                quota_block_deref(proc);
+                proc = NULL;
+            }
+        }
+    } else {
+        proc = quota_block_create(QUOTA_PRINCIPAL_PROCESS, NULL, 0);
+    }
+
+    if (!proc)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    quota_owner_lock(&task->quota_lock, &flags);
+    if (task->quota) {
+        /* Already initialized (idempotent by contract -- a re-created task slot
+         * or a doubled create path must not leak the first block). */
+        quota_owner_unlock(&task->quota_lock, flags);
+        quota_block_deref(proc);
+        if (user)
+            quota_block_deref(user);
+        return STATUS_SUCCESS;
+    }
+    task->quota      = proc;
+    task->quota_user = user;
+    quota_owner_unlock(&task->quota_lock, flags);
+    return STATUS_SUCCESS;
+}
+
+void quota_task_teardown(struct task *task)
+{
+    quota_block_t *proc;
+    quota_block_t *user;
+    uint64_t       flags;
+
+    if (!task)
+        return;
+
+    /* Clear under the lock, dereference outside it. Dropping the last
+     * reference can free the block and take the registry lock; neither belongs
+     * inside a task lock, and holding one across the free would nest two lock
+     * classes for no benefit. */
+    quota_owner_lock(&task->quota_lock, &flags);
+    proc = task->quota;
+    user = task->quota_user;
+    task->quota      = NULL;
+    task->quota_user = NULL;
+    quota_owner_unlock(&task->quota_lock, flags);
+
+    quota_block_deref(proc);
+    quota_block_deref(user);
+}
+
+/* --- Chain snapshot ------------------------------------------------------ */
+
+/* Append `block` to the receipt, taking a reference, unless it is NULL or
+ * already present. Returns 0 when the chain is full.
+ *
+ * Deduplication is not cosmetic. If the same block appeared twice the charge
+ * would be applied twice for one resource, and the limit would bite at half
+ * the configured value. It is reachable in practice: a process whose job block
+ * is its own owner block, or a future ancestor walk that revisits a shared
+ * parent job. */
+static int quota_chain_append(quota_charge_receipt_t *receipt, quota_block_t *block)
+{
+    if (!block)
+        return 1;
+    for (uint32_t i = 0; i < receipt->count; i++) {
+        if (receipt->blocks[i] == block)
+            return 1;
+    }
+    if (receipt->count >= QUOTA_CHAIN_MAX)
+        return 0;
+    quota_block_ref(block);
+    receipt->blocks[receipt->count++] = block;
+    return 1;
+}
+
+/* Release every reference the receipt holds and empty it. */
+static void quota_chain_release(quota_charge_receipt_t *receipt)
+{
+    for (uint32_t i = 0; i < receipt->count; i++) {
+        quota_block_deref(receipt->blocks[i]);
+        receipt->blocks[i] = NULL;
+    }
+    receipt->count = 0;
+}
+
+/* Collect the process and user blocks a task charges against.
+ *
+ * Returns 0 if the chain is full, -1 if the task has no process block. */
+static int quota_chain_add_task_blocks(quota_charge_receipt_t *receipt,
+                                       struct task *task,
+                                       quota_block_t **seen_process)
+{
+    uint64_t flags;
+    int      ok;
+
+    /* One critical section for both pointers: the pair is replaced together at
+     * init and cleared together at teardown, so reading them apart could mix a
+     * live block with a stale one. */
+    quota_owner_lock(&task->quota_lock, &flags);
+    *seen_process = task->quota;
+    ok = quota_chain_append(receipt, task->quota);
+    if (ok)
+        ok = quota_chain_append(receipt, task->quota_user);
+    quota_owner_unlock(&task->quota_lock, flags);
+
+    if (!*seen_process)
+        return -1;
+    return ok;
+}
+
+/* Confirm the task's quota identity did not change while the chain was being
+ * collected.
+ *
+ * The process/user blocks and the job block are captured in SEPARATE critical
+ * sections, and death teardown detaches the job BEFORE it clears the quota
+ * pointers. Re-reading the process pointer catches the case where teardown
+ * COMPLETED in between (the pointer is cleared), which is the reachable one:
+ * task_death_teardown runs both steps back to back.
+ *
+ * It NARROWS the window rather than closing it -- a charge can still land
+ * between the detach and the pointer clear, observe no job, and commit. That
+ * residual case is benign: the receipt then names no job block, so its return
+ * is symmetric and nothing is stranded; the charge simply escapes a job limit
+ * for a process that is already dying. Closing it entirely needs a membership
+ * generation under job_lock, owned by section 4's live-assignment item.
+ *
+ * Returns 0 when the task's process block changed or went away mid-snapshot. */
+static int quota_chain_still_live(struct task *task, quota_block_t *seen_process)
+{
+    uint64_t flags;
+    int      live;
+
+    quota_owner_lock(&task->quota_lock, &flags);
+    live = (task->quota == seen_process);
+    quota_owner_unlock(&task->quota_lock, flags);
+    return live;
+}
+
+/* Collect the block of every job owning the task.
+ *
+ * Nested jobs do not exist yet: ob_job_assign refuses a second job and
+ * JOB_OBJECT has no parent link, so the chain is at most one job deep. The
+ * walk is written as a collection step rather than a single fetch so adding
+ * ancestors later is a change here and nowhere else. */
+static int quota_chain_add_job_blocks(quota_charge_receipt_t *receipt,
+                                      struct task *task)
+{
+    JOB_OBJECT *job;
+    uint64_t    flags;
+    int         ok;
+
+    /* Pin the job under job_lock before releasing it -- the same discipline
+     * ob_job_fork_inherit uses -- so a concurrent detach cannot drop the last
+     * membership reference and free the body while its block is read. The job
+     * holds its block for its whole life, so the block is live while the job
+     * is pinned. */
+    quota_owner_lock(&task->job_lock, &flags);
+    job = task->job;
+    if (job)
+        ObReferenceObject(job);
+    quota_owner_unlock(&task->job_lock, flags);
+
+    if (!job)
+        return 1;
+
+    ok = quota_chain_append(receipt, (quota_block_t *)job->quota);
+    ObDereferenceObject(job);
+    return ok;
+}
+
+/* --- Live job assignment ------------------------------------------------- */
+
+NTSTATUS quota_job_absorb_task(struct quota_block *job_block, struct task *task,
+                               quota_absorb_record_t *rec)
+{
+    quota_block_t *proc;
+    uint64_t       flags;
+    uint32_t       i;
+    NTSTATUS       st = STATUS_SUCCESS;
+
+    if (!job_block || !task || !rec)
+        return STATUS_INVALID_PARAMETER;
+
+    for (i = 0; i < QUOTA_RESOURCE_TYPE_COUNT; i++)
+        rec->taken[i] = 0;
+    rec->active = 0;
+
+    /* Pin the process block: the absorb runs before membership is published,
+     * so nothing else keeps it alive for us. */
+    quota_owner_lock(&task->quota_lock, &flags);
+    proc = task->quota;
+    if (proc)
+        quota_block_ref(proc);
+    quota_owner_unlock(&task->quota_lock, flags);
+
+    if (!proc)
+        return STATUS_SUCCESS;    /* nothing charged yet; nothing to absorb */
+
+    /* Fold the joiner's CURRENT usage into the job so its aggregate limit
+     * covers what the process already holds. Without this a process could
+     * allocate freely, then join a capped job, and its existing usage would
+     * count against nothing -- an escape hatch out of every job limit. */
+    for (i = 0; i < QUOTA_RESOURCE_TYPE_COUNT; i++) {
+        uint64_t taken = quota_usage(proc, (quota_resource_type_t)i);
+        if (taken == 0)
+            continue;
+        st = quota_charge(job_block, (quota_resource_type_t)i, taken);
+        if (st != STATUS_SUCCESS)
+            break;
+        rec->taken[i] = taken;
+        rec->active = 1;
+    }
+
+    if (st != STATUS_SUCCESS) {
+        /* All-or-nothing: give back what this absorb already folded in, so a
+         * refused assignment leaves the job's accounting untouched. */
+        quota_job_unabsorb(job_block, rec);
+    }
+
+    quota_block_deref(proc);
+    return st;
+}
+
+void quota_job_unabsorb(struct quota_block *job_block, quota_absorb_record_t *rec)
+{
+    if (!job_block || !rec || !rec->active)
+        return;
+    for (uint32_t i = 0; i < QUOTA_RESOURCE_TYPE_COUNT; i++) {
+        if (rec->taken[i]) {
+            NTSTATUS st = quota_return(job_block, (quota_resource_type_t)i,
+                                       rec->taken[i]);
+            if (st != STATUS_SUCCESS) {
+                /* Refused only if the job's counter no longer holds what this
+                 * record folded in -- the accounting has already drifted.
+                 * Counted, NOT klog'd: this runs from ob_job_detach_task on
+                 * the task_death_teardown path, which is log-free by contract
+                 * and reachable at elevated IRQL, where klog's live-disk flush
+                 * would turn a recoverable accounting diagnostic into a stall.
+                 * quota_return has already recorded the underflow through the
+                 * IRQL-gated diagnostic path. */
+                quota_note_unabsorb_refused();
+            }
+            rec->taken[i] = 0;
+        }
+    }
+    rec->active = 0;
+}
+
+/* --- Chain charge / return ----------------------------------------------- */
+
+NTSTATUS quota_charge_chain(struct task *task, quota_resource_type_t type,
+                            uint64_t amount, uint32_t flags,
+                            quota_charge_receipt_t *receipt,
+                            uint64_t *out_token)
+{
+    NTSTATUS st;
+    int      chain;
+
+    /* `out_token` is MANDATORY: the token is the only key that returns the
+     * charge, so admitting a charge with nowhere to put it would strand the
+     * usage and every block reference the receipt holds, permanently. Rejected
+     * up front, before the receipt is claimed, so a NULL argument cannot even
+     * disturb a receipt someone else is using.
+     *
+     * `*out_token` is left UNTOUCHED by every refusal raised BEFORE the receipt
+     * is claimed, and CLEARED by every one raised after. That split is what
+     * makes the header's "an unconditional quota_return_chain on the error path
+     * is safe" promise true without destroying a live token:
+     *
+     *   - Before the claim, the receipt may be holding the caller's own live
+     *     charge (that is exactly why the claim fails), so zeroing the token
+     *     would strand that charge with nothing able to return it.
+     *   - After a successful claim the receipt provably holds nothing: it was
+     *     IDLE and this call owns it, so whatever the caller's variable holds is
+     *     stale by definition. Leaving it is NOT harmless. A stale value equal
+     *     to gen+1 is precisely the token the NEXT charge on this receipt
+     *     publishes, so an error-path return made exactly as the header
+     *     documents would win that charge's {token, ACTIVE} CAS and credit back
+     *     a charge it never made. This is the same identity hole the zero-amount
+     *     path closes below, closed here for the same reason. */
+    if (!receipt || !task || !out_token || (flags & ~QUOTA_CHARGE_FLAG_MASK) != 0)
+        return STATUS_INVALID_PARAMETER;
+
+    /* The source rides in a slice of `flags`, so it is validated HERE with the
+     * rest of them and before the receipt is claimed. Refusing an undefined
+     * source rather than folding it to UNKNOWN is deliberate: a caller passing a
+     * value this build does not define has a taxonomy mismatch (a stale
+     * enumerator, a truncated cast), and silently relabelling its charges
+     * "unattributed" would hide exactly the drift the refusal reports. */
+    const quota_charge_source_t source = QUOTA_CHARGE_SOURCE_OF(flags);
+
+    if (!quota_source_valid(source))
+        return STATUS_INVALID_PARAMETER;
+
+    /* Client charging is REFUSED, not approximated. Billing the impersonated
+     * client requires reading the executing thread's impersonation token, and
+     * neither piece of infrastructure that makes that safe on SMP exists yet:
+     * thread_current() resolves through process-global scheduler cursors (so it
+     * can sample a sibling thread of the same task), and the token slot has no
+     * teardown-safe pin (so a concurrent RevertToSelf can free the token
+     * between the load and the reference). Approximating it would silently bill
+     * the wrong user, which is worse than refusing. The flag and its contract
+     * stay so callers can be written against the final shape.
+     * Owned by the security reference monitor's teardown-safe token pin. */
+    if (flags & QUOTA_CHARGE_CLIENT)
+        return STATUS_NOT_SUPPORTED;
+
+    /* Claim the receipt EXCLUSIVELY before touching a single field, CASing the
+     * WHOLE tag so the claim carries the generation it was made against. Losing
+     * this CAS means the receipt already holds a live charge (or another CPU is
+     * mid-operation on it); overwriting it would drop the references that charge
+     * is holding and strand its usage permanently. The generation is preserved
+     * across the BUSY claim and only advances at publication, so a stale
+     * returner cannot match a receipt that is merely being rebuilt. */
+    int64_t  claim = atomic64_read(&receipt->tag);
+    uint64_t gen   = QUOTA_RECEIPT_TAG_GEN(claim);
+
+    if (QUOTA_RECEIPT_TAG_STATE(claim) != QUOTA_RECEIPT_IDLE)
+        return STATUS_INVALID_PARAMETER;
+    /* Refuse at the ceiling rather than wrap: a wrapped generation reissues a
+     * token that a stalled returner may still be holding, which is exactly the
+     * stale-token identity the tag exists to prevent. */
+    if (gen >= QUOTA_RECEIPT_GEN_MAX)
+        return STATUS_INTEGER_OVERFLOW;
+    if (atomic64_cmpxchg(&receipt->tag, claim,
+                         QUOTA_RECEIPT_TAG(gen, QUOTA_RECEIPT_BUSY)) != claim)
+        return STATUS_INVALID_PARAMETER;
+
+    /* The claim is held for every early return below; each releases it back to
+     * the SAME generation with QUOTA_RECEIPT_IDLE, leaving the receipt reusable
+     * and no token issued. */
+    const int64_t idle_tag = QUOTA_RECEIPT_TAG(gen, QUOTA_RECEIPT_IDLE);
+
+    /* Retire the caller's stale token NOW, under the claim, so every failure
+     * path below leaves 0 -- the one value quota_return_chain always refuses.
+     * Done here rather than per-path because the claim is exactly the point at
+     * which the receipt is proven to hold nothing, and a path that forgot the
+     * clear would reopen the aliasing hole silently. The success paths overwrite
+     * it with the real token before releasing the claim. */
+    *out_token = 0;
+
+    receipt->count  = 0;
+    receipt->type   = type;
+    receipt->amount = amount;
+    /* Recorded under the claim, alongside the type and amount it describes, so
+     * the return can credit the right subsystem without the caller restating it.
+     * Written on every path including the failures below: a receipt released
+     * back to IDLE holds no charge, so the field is inert there, and leaving a
+     * PREVIOUS charge's source visible on an idle receipt would be worse than
+     * inert -- it would be wrong. */
+    receipt->source = (uint16_t)source;
+
+    /* Validate the TYPE before the zero-amount shortcut, and check liveness
+     * too. A zero charge that skipped both would report success for an
+     * out-of-range type and for an already-dead task, masking exactly the
+     * taxonomy mistakes and teardown races the non-zero path reports -- the
+     * same reason quota_charge validates its type before its own zero fast
+     * path. */
+    if (!quota_resource_desc(type)) {
+        atomic64_set(&receipt->tag, idle_tag);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (amount == 0) {
+        /* No-op: nothing charged, nothing owed -- but still only for a task
+         * that could have been charged. Release the claim so the receipt stays
+         * reusable.
+         *
+         * This is a SUCCESS, so the mandatory out-token is written like any
+         * other success, and the value meaning "no obligation" is 0 -- the one
+         * token quota_return_chain always refuses. Leaving it untouched would
+         * be an identity hole, not a harmless omission: a caller is entitled to
+         * capture the token of a successful charge, and because this path does
+         * NOT advance the generation, a value already sitting in that variable
+         * can equal the token the next non-zero charge on this receipt
+         * publishes. A delayed cleanup holding it would then win the
+         * {token, ACTIVE} CAS and return a charge it never made. */
+        int live;
+        uint64_t qflags;
+        quota_owner_lock(&task->quota_lock, &qflags);
+        live = (task->quota != NULL);
+        quota_owner_unlock(&task->quota_lock, qflags);
+
+        /* A dying task is refused here exactly as the non-zero path refuses it,
+         * and BOTH conditions are load-bearing: task_death_teardown SEALS the
+         * charge gate before it clears task->quota, so between those two steps a
+         * block is still attached to a task that can no longer be charged.
+         * Testing only the block would report success in that window, and the
+         * documented contract for a SEALED task is STATUS_PROCESS_IS_TERMINATING
+         * -- a caller probing chargeability with a zero charge would otherwise
+         * conclude a terminating task is still live. The non-zero path gets this
+         * from quota_gate_enter; the zero path skips the gate, so it asks
+         * directly. */
+        if (!live || quota_gate_state_of(task) == QUOTA_GATE_SEALED) {
+            atomic64_set(&receipt->tag, idle_tag);
+            return STATUS_PROCESS_IS_TERMINATING;
+        }
+
+        /* Order matters: the token is written while the receipt is still BUSY,
+         * and releasing to IDLE is the LAST thing this path does. Releasing
+         * first would end this operation's exclusivity early -- another CPU
+         * could claim the receipt, complete a real charge, and write its live
+         * generation to the same token slot, which this CPU would then
+         * overwrite with 0. The receipt would stay ACTIVE with its only key
+         * destroyed, stranding the usage and every block reference it holds. */
+        *out_token = 0;
+        atomic64_set(&receipt->tag, idle_tag);
+        return STATUS_SUCCESS;
+    }
+
+    /* ENTER THE TASK'S CHARGE GATE. This is the single funnel every chain charge
+     * passes through -- including the ones whose receipt lives in the caller's
+     * own structure rather than in a ledger -- so gating HERE is what makes the
+     * membership barrier complete for charges. A gate hosted anywhere else would
+     * be routed around by exactly those callers.
+     *
+     * Placed after the zero-amount path on purpose: a zero charge moves no
+     * counter, so a membership transition has nothing to serialize against, and
+     * making it wait would add a refusal to a call that cannot affect anything.
+     *
+     * Costs no lock section (two atomic RMWs on one word), which is why the
+     * charge-path cost contract in quota.h is unchanged by it. */
+    uint32_t gate_state = QUOTA_GATE_OPEN;
+
+    /* ONE attempt, and the refusal is propagated rather than retried. An earlier
+     * version probed the gate several times to hide a transient close from
+     * callers, and that was wrong twice over: the gate stays closed across the
+     * whole absorb-and-migrate transition, so back-to-back probes cannot span it
+     * anyway, and each failed probe costs a locked read-modify-write on a global
+     * counter -- turning one refusal into several, on the hot charge path, at
+     * exactly the moment concurrent charging is already stressing that cache
+     * line, and inflating the refusal telemetry by the same factor.
+     *
+     * The right fix was the one already applied at the other end: STATUS_RETRY is
+     * documented as transient in quota.h and its consumers propagate it instead
+     * of flattening it into a permanent quota refusal. */
+    if (!quota_gate_enter(task, &gate_state)) {
+        atomic64_set(&receipt->tag, idle_tag);
+        /* A transient close is a RETRY the caller may repeat; a seal means the
+         * task is dying and no retry will ever succeed. Reporting them as the
+         * same status would make a caller spin against a dead process. */
+        return (gate_state == QUOTA_GATE_SEALED) ? STATUS_PROCESS_IS_TERMINATING
+                                                 : STATUS_RETRY;
+    }
+
+    /* Snapshot the whole chain FIRST, holding a reference on every block, and
+     * take no owner lock past this point. Charging while holding job_lock or a
+     * job's lock would violate the no-nested-call contract in quota.h and put
+     * two lock classes in a cycle. */
+    quota_block_t *seen_process = NULL;
+    chain = quota_chain_add_task_blocks(receipt, task, &seen_process);
+    if (chain == 1) {
+        chain = quota_chain_add_job_blocks(receipt, task) ? 1 : 0;
+        /* Re-validate AFTER the job step: the task may have died between the
+         * two snapshots, in which case its job was already detached and this
+         * chain is missing it. Fail closed rather than admit a charge no job
+         * limit ever saw. */
+        if (chain == 1 && !quota_chain_still_live(task, seen_process))
+            chain = -1;
+    }
+
+    if (chain != 1) {
+        quota_chain_release(receipt);
+        atomic64_set(&receipt->tag, idle_tag);
+        quota_gate_exit(task);
+        if (chain < 0) {
+            /* No process block: the task is dead (teardown cleared it) or not
+             * yet fully built. Admitting an empty chain here would report
+             * success having charged nothing, so a process racing its own
+             * death could allocate completely unaccounted. Fail closed. */
+            return STATUS_PROCESS_IS_TERMINATING;
+        }
+        /* Chain deeper than QUOTA_CHAIN_MAX. Refuse rather than charge a
+         * truncated chain: a link left out is a limit left unenforced.
+         * IRQL-gated like every other diagnostic in this subsystem -- charging
+         * is documented as callable at DISPATCH_LEVEL, where klog's live-disk
+         * flush re-enters the VFS and can stall the caller. */
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL)
+            klog(LOG_ERROR, "quota", "charge chain exceeds %u blocks for pid=%u",
+                 (uint64_t)QUOTA_CHAIN_MAX, (uint64_t)task->pid);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Charge one block at a time, each under its own lock -- never two at
+     * once, so no ordering hazard exists between chains that share a job. */
+    for (uint32_t i = 0; i < receipt->count; i++) {
+        st = quota_charge(receipt->blocks[i], type, amount);
+        if (st != STATUS_SUCCESS) {
+            /* Unwind exactly the prefix that was charged. quota_return does
+             * not consult limits, so a limit lowered concurrently cannot block
+             * the unwind and strand usage. */
+            for (uint32_t j = 0; j < i; j++)
+                (void)quota_return(receipt->blocks[j], type, amount);
+            quota_chain_release(receipt);
+            atomic64_set(&receipt->tag, idle_tag);
+            quota_gate_exit(task);
+            return st;
+        }
+    }
+
+    /* Publish the receipt as returnable only now that every block is charged: a
+     * returner must never see a half-built block set. Advancing the generation
+     * here is what makes the token unique to THIS charge, so a returner still
+     * holding a previous token cannot claim it. The token is written BEFORE the
+     * release-publish so the key exists the instant the charge becomes
+     * returnable. */
+    /* ONE attribution update per OBLIGATION, not one per block. The loop above
+     * billed up to three principals for the same resource, so noting it per
+     * block would treble the figure and put a globally shared cache line inside
+     * the charge path's lock sections. Only the committed path records -- every
+     * refusal above returns before here, having charged nothing.
+     *
+     * RECORDED BEFORE THE RECEIPT GOES ACTIVE, and that ordering is load-bearing
+     * rather than tidy. Publishing first makes the charge RETURNABLE, so another
+     * CPU holding the token can complete a return -- and record its own -amount
+     * -- before this line runs. The cells are clamped at 0, so that credit would
+     * be absorbed against a row that has not been debited yet, and then this
+     * line would add an amount nothing will ever credit back: a permanent
+     * phantom in the row, from an interleaving that is otherwise entirely legal.
+     * Doing it under the BUSY claim removes the window instead of narrowing it.
+     * No lock is held here (each block was charged and released in the loop
+     * above), so the bounded CAS is legal. */
+    quota_source_note(source, type, (int64_t)amount);
+
+    gen++;
+    *out_token = gen;
+    atomic64_set(&receipt->tag, QUOTA_RECEIPT_TAG(gen, QUOTA_RECEIPT_ACTIVE));
+    /* Leave the gate only after the charge is PUBLISHED. Exiting earlier would
+     * let a quiesce observe an empty gate while this charge was still being made
+     * visible, which is the precise window the gate exists to close. */
+    quota_gate_exit(task);
+
+    /* The cumulative count comes AFTER the publication boundary, deliberately.
+     * It has no ordering requirement -- nothing reconciles it against the primary
+     * counters -- so it does not belong in the exclusive window where the
+     * linearization-sensitive update has to live. */
+    quota_source_count_charge(source, type);
+    return STATUS_SUCCESS;
+}
+
+void quota_return_chain(quota_charge_receipt_t *receipt, uint64_t token)
+{
+    /* A token outside the generation field is NOT merely invalid, it is
+     * dangerous: QUOTA_RECEIPT_TAG shifts the token past the state bits, so
+     * bits at or above the generation width are discarded and a fabricated
+     * `live_token | (1 << 62)` would build the SAME tag as the live token and
+     * win the CAS. Reject non-canonical tokens instead of letting them alias. */
+    if (!receipt || token == 0 || token > QUOTA_RECEIPT_GEN_MAX)
+        return;
+
+    /* EXACTLY ONE caller may return a given charge, and only the caller holding
+     * THAT charge's token. CASing the whole {generation, state} word in one
+     * step is what makes both true at once: two cleanup paths sharing an
+     * embedded receipt cannot both credit the amount back (the second would
+     * erase charges made since and double-drop the block references), and a
+     * stale returner whose charge was already returned cannot claim a LATER
+     * charge that reused the same storage -- its token no longer matches, so it
+     * is a no-op. A losing caller (wrong token, IDLE, or BUSY on another CPU)
+     * does nothing, which is what makes the documented idempotence true on SMP.
+     *
+     * Splitting this into a generation check beside a state CAS breaks in both
+     * orders: check-first lets the stale returner resume between the two and
+     * take the newer charge; CAS-first makes the rightful returner see BUSY and
+     * abandon a charge nobody else will return. */
+    const int64_t active_tag = QUOTA_RECEIPT_TAG(token, QUOTA_RECEIPT_ACTIVE);
+    const int64_t busy_tag   = QUOTA_RECEIPT_TAG(token, QUOTA_RECEIPT_BUSY);
+
+    /* RETRY on BUSY AT OUR OWN GENERATION rather than give up. Since
+     * quota_charge_adjust exists, a live charge can be briefly BUSY while its
+     * amount is resized -- and this returner is the only agent that will ever
+     * return it, so treating that as a no-op would silently leak the charge.
+     *
+     * The retry is safe against the case it must not break: a returner whose
+     * charge is already gone sees a MOVED generation, so its {token, ACTIVE} CAS
+     * can never match again and the loop stops at the bound rather than waiting
+     * for something that will not happen. It is bounded for the same reason the
+     * rate-limit reader is: this path is reachable with interrupts disabled,
+     * where an unbounded retry is a hang rather than a slowdown. An adjust holds
+     * the claim across a bounded, non-blocking block-lock transaction, so the
+     * bound is generous by orders of magnitude. */
+    int64_t observed = atomic64_cmpxchg(&receipt->tag, active_tag, busy_tag);
+    if (observed != active_tag) {
+        int won = 0;
+        for (uint32_t spin = 0; spin < QUOTA_RETURN_BUSY_TRIES; spin++) {
+            int64_t  now   = atomic64_read(&receipt->tag);
+            uint64_t gen   = QUOTA_RECEIPT_TAG_GEN(now);
+            uint32_t state = QUOTA_RECEIPT_TAG_STATE(now);
+
+            /* A MOVED generation is the only thing that proves this token names
+             * no live charge. Stop only for that, or for IDLE at our own
+             * generation (already returned -- nothing left to do). Both are
+             * documented no-ops that leak nothing -- a stale token, or the loser
+             * of a duplicate return -- so they leave WITHOUT counting an
+             * abandonment. Counting them would make the leak metric fire on the
+             * idempotence this function promises. */
+            if (gen != token || state == QUOTA_RECEIPT_IDLE)
+                return;
+
+            /* Our generation, not IDLE: the charge is LIVE. Either it is ACTIVE
+             * again because the adjust republished it -- claim it -- or it is
+             * still BUSY, in which case re-read rather than CAS. CASing against
+             * a state the load just proved to be BUSY costs a bus-locked RMW
+             * that is guaranteed to fail, and it drags the tag's cache line
+             * Exclusive away from the CPU trying to finish that very adjust,
+             * lengthening the window this loop is waiting out. Breaking out on
+             * ACTIVE (as this loop first did) abandoned a live charge the
+             * instant an adjust finished at the wrong moment, and for a direct
+             * caller of this function there is no ledger backstop to reclaim
+             * it. */
+            if (state == QUOTA_RECEIPT_ACTIVE
+                && atomic64_cmpxchg(&receipt->tag, active_tag, busy_tag)
+                       == active_tag) {
+                won = 1;
+                break;
+            }
+        }
+        /* ONE unconditional attempt before giving up. The loop skips the CAS on a
+         * snapshot that read BUSY, which is right for every iteration but the
+         * last: on the last one the owner can republish ACTIVE immediately after
+         * that read, and leaving without trying would abandon a charge the
+         * older unconditional-CAS loop would have claimed. This costs a single
+         * locked RMW on the give-up path -- not the 64 the guard removed -- so
+         * it closes the boundary race without restoring the contention cost. */
+        if (!won) {
+            int64_t final = atomic64_cmpxchg(&receipt->tag, active_tag, busy_tag);
+            if (final != active_tag) {
+                /* CLASSIFY what that final attempt saw rather than counting
+                 * every non-win. A MOVED generation or IDLE means the charge is
+                 * already gone -- the winner of a duplicate return finished it
+                 * between our last read and this CAS -- and nothing was
+                 * stranded. Only a receipt still BUSY at OUR generation is a
+                 * wait that ran out with the charge unreturned. */
+                if (QUOTA_RECEIPT_TAG_GEN(final) == token
+                    && QUOTA_RECEIPT_TAG_STATE(final) == QUOTA_RECEIPT_BUSY) {
+                    /* A direct caller has no backstop, so this is a leak; a
+                     * ledger return wraps this call in its own retry and may
+                     * still recover, which is why the counter names the event
+                     * and not the conclusion. One ambiguity remains: the tag
+                     * cannot say whether that BUSY owner is an adjust (the wait
+                     * really did run out) or the winner of a duplicate return
+                     * still crediting (nothing stranded). Telling them apart
+                     * needs owner metadata in the tag, which belongs with the
+                     * pending-return handoff. */
+                    quota_note_return_wait_exhausted();
+                }
+                return;
+            }
+        }
+    }
+
+    /* Captured BEFORE the loop clears the receipt, because the loop zeroes the
+     * amount this credit is computed from. */
+    const quota_charge_source_t source = (quota_charge_source_t)receipt->source;
+    const quota_resource_type_t rtype  = receipt->type;
+    const uint64_t              given  = receipt->amount;
+
+    for (uint32_t i = 0; i < receipt->count; i++)
+        (void)quota_return(receipt->blocks[i], receipt->type, receipt->amount);
+    quota_chain_release(receipt);
+    receipt->amount = 0;
+
+    /* Credit the SAME subsystem the charge debited, and do it while this return
+     * still holds the receipt BUSY -- for the same reason the charge records
+     * before publishing ACTIVE. Releasing to IDLE first would let another CPU
+     * claim the storage and complete a whole new charge, recording ITS debit
+     * before this credit lands; the credit would then be applied against a row
+     * that already reflects the newer charge, and the clamp at 0 could swallow
+     * it. Ordering the two removes that interleaving rather than relying on the
+     * mismatch counter to notice it afterwards.
+     *
+     * That the source travels ON THE RECEIPT is what makes the pairing symmetric
+     * by construction: no caller can return a charge under a label different from
+     * the one it was made with. */
+    quota_source_note(source, rtype, -(int64_t)given);
+
+    /* Release at the SAME generation the charge published. The next charge
+     * advances it, so this token can never open a future charge. */
+    atomic64_set(&receipt->tag, QUOTA_RECEIPT_TAG(token, QUOTA_RECEIPT_IDLE));
+}
+
+/* ==========================================================================
+ * The one charge entry point for subsystems (section 6)
+ *
+ * Every charging subsystem -- notifications, ALPC, and the ones that follow --
+ * calls THIS, not quota_charge_chain directly, and none of them inspects
+ * task->quota. That is a security boundary, not tidiness.
+ *
+ * The problem it solves: these charge points also run during boot, before any
+ * task owns a quota block. The obvious per-subsystem workaround ("if the task
+ * has no block, skip the charge") pushes a fail-open decision into every
+ * consumer and, worse, makes it UNCONDITIONAL -- a user-reachable request that
+ * races its own process teardown finds the block already cleared and inherits
+ * the boot exemption, allocating entirely unaccounted. quota_charge_chain
+ * deliberately refuses that case with STATUS_PROCESS_IS_TERMINATING; a
+ * consumer-side skip would quietly repeal it.
+ *
+ * So the exemption is bound to a MILESTONE rather than to the absence of a
+ * block. Before the scheduler is ready there is provably no principal to bill
+ * and nothing user-reachable to bill it for; from that point on a missing
+ * block means a dying or half-built task and the refusal stands.
+ * ========================================================================== */
+NTSTATUS quota_charge_current(quota_resource_type_t type, uint64_t amount,
+                              quota_charge_receipt_t *receipt,
+                              uint64_t *out_token)
+{
+    return quota_charge_current_from(type, amount, QUOTA_SOURCE_UNKNOWN,
+                                     receipt, out_token);
+}
+
+NTSTATUS quota_charge_current_from(quota_resource_type_t type, uint64_t amount,
+                                   quota_charge_source_t source,
+                                   quota_charge_receipt_t *receipt,
+                                   uint64_t *out_token)
+{
+    struct task *task;
+
+    if (!receipt || !out_token || !quota_source_valid(source))
+        return STATUS_INVALID_PARAMETER;
+
+    /* Validate the TYPE before the boot exemption, for the same reason
+     * quota_charge_chain validates it before its zero-amount shortcut: an
+     * exempted charge that skipped this would report SUCCESS for an
+     * out-of-range type, and a subsystem wired up with the wrong
+     * quota_resource_type_t charges during Phase 1/2 -- so the taxonomy mistake
+     * would survive unnoticed until the first call made after SUBSYS_SCHED is
+     * ready, which is exactly the boot-first, discovered-late shape the
+     * in-function validation exists to prevent. This is a pure range check
+     * against the static taxonomy table, so it is valid before the registry is
+     * populated. */
+    if (!quota_resource_desc(type))
+        return STATUS_INVALID_PARAMETER;
+
+    /* Boot exemption. Both conditions are milestones, not per-caller state:
+     * the taxonomy must be validated before any limit means anything, and the
+     * scheduler must be publishing tasks before one can be billed. */
+    if (!quota_registry_ready() || !kernel_subsystem_ready(SUBSYS_SCHED)) {
+        *out_token = 0;                  /* canonical no-obligation token */
+        return STATUS_SUCCESS;
+    }
+
+    task = task_current();
+    if (!task)
+        return STATUS_PROCESS_IS_TERMINATING;
+
+    return quota_charge_chain(task, type, amount, QUOTA_CHARGE_SOURCE(source),
+                              receipt, out_token);
+}

@@ -1,0 +1,110 @@
+---
+schema_version: 1
+id: compositor-optimization
+domain: 06-desktop-foundation
+status: active
+title: "TODO-02 -- Compositor Optimization"
+---
+
+# TODO-02 -- Compositor Optimization
+
+> **Goal:** Dirty-rect compositing is owned by `08-graphics-ui/TODO-08-window-manager.md` §8; sections 1-4 here are superseded pointers with only their unique leftovers, and §5 (terminal boot bleed) stays owned here. Original aim: replace the full-screen redraw compositor with dirty-rect tracking so only changed regions are redrawn. Target: 60fps compositing on 1280x720, <5ms per frame on idle desktop (only clock ticks).
+
+> [!IMPORTANT]
+> The existing compositor (`wm_composite()`) redraws the entire screen whenever anything is dirty. The only partial path is the drag rectangle (`drag_dirty_*`, `wm_get_drag_dirty_rect()`), which narrows the copy to video memory but not the repaint; `desktop_draw_wallpaper_rect()` exists with no callers, and frame timing (`wm_frame_stats`) already ships. This TODO makes the compositor production-grade.
+
+## Inputs
+
+- [`src/desktop/wm.c`](../../src/desktop/wm.c) -- `wm_composite()`, `needs_redraw` flag
+- [`src/kernel/gfx/`](../../src/kernel/gfx/) -- framebuffer blit, double buffering
+
+## Outcome
+
+- Compositor tracks per-window and per-region dirty rects
+- Only dirty regions are reblitted to the screen framebuffer
+- Idle desktop (no window movement): <1ms per frame (only clock update)
+- Window drag: only old and new positions redrawn
+- Window content change: only that window's rect redrawn
+
+## Implementation Order
+
+| ⭐  | Order | Deliverable                               | Depends On | Status |
+| --- | :---: | ----------------------------------------- | ---------- | :----: |
+| 💎  |   1   | Dirty rect tracking infrastructure        | --         |  [/]   |
+| 💎  |   2   | Partial wallpaper restore                 | §1         |  [/]   |
+| 💎  |   3   | Per-window damage and compositor loop     | §1, §2     |  [/]   |
+| ⭐  |   4   | Frame timing and VSync                    | §3         |  [/]   |
+| 💎  |   5   | Terminal render clipping (boot bleed fix) | §3         |  [ ]   |
+
+---
+
+## 1. Dirty Rect Tracking Infrastructure
+Add a dirty rect list that accumulates regions needing redraw each frame.
+
+**Files:** `src/desktop/wm.c`, `include/desktop/wm.h`
+
+> **Deferred:** [L] superseded: owned by `08-graphics-ui/TODO-08-window-manager.md` -> XREF: 08-graphics-ui/TODO-08 §8 (item: "static int32_t g_dirty_x" at line 240)
+
+- [/] Superseded: implemented by `todo/08-graphics-ui/TODO-08-window-manager.md §8`, which follows `docs/design/shell.md#materials`; do not build a second dirty-rect tracker here
+
+**Test checkpoint:** Add logging: `compositor: N dirty rects this frame`. Idle desktop should show 0-1 rects (clock only). Dragging a window should show 2 rects.
+
+## 2. Partial Wallpaper Restore
+
+**Design:** [`shell.md#desktop`](../../docs/design/shell.md#desktop)
+Redraw only the wallpaper pixels under dirty rects, not the entire screen.
+
+**Files:** `src/desktop/desktop.c`, `src/desktop/wm.c`
+
+- [/] Superseded: implemented by `todo/08-graphics-ui/TODO-08-window-manager.md §8`, which follows `docs/design/shell.md#desktop`; do not build a second partial-composite path here
+- [ ] On the canonical partial-composite path, restore only the dirty wallpaper region via `desktop_draw_wallpaper_rect(x, y, w, h)`; verify it handles rects that cross the 48 px taskbar (`THEME_SIZE_TASKBAR_HEIGHT`)
+
+**Test checkpoint:** Move a window -- wallpaper behind old position is restored without full-screen redraw.
+
+## 3. Per-Window Damage and Compositor Loop
+Replace full-screen `wm_composite()` with dirty-rect-driven compositing.
+
+**Files:** `src/desktop/wm.c`
+
+- [/] Superseded: implemented by `todo/08-graphics-ui/TODO-08-window-manager.md §8`, which follows `docs/design/shell.md#materials`; do not build a second compositor loop here
+- [ ] Per-window `content_dirty` flag: an app write to a window framebuffer calls `wm_mark_window_dirty()` (08 TODO-08 §8) for that window only
+- [ ] Cursor moves mark the old and new cursor rects through the same `wm_mark_window_dirty()` union, not a full redraw
+
+**Test checkpoint:** Idle desktop with clock: compositor redraws only the clock region (~60x20px). Open terminal, type -- only terminal rect redrawn.
+
+## 4. Frame Timing and VSync
+Measure frame times and optionally sync to display refresh.
+
+**Files:** `src/desktop/wm.c`
+
+- [/] Superseded: implemented by `todo/08-graphics-ui/TODO-08-window-manager.md §8`, which follows `docs/design/shell.md#materials`; do not build a second frame-time instrumentation here
+- [ ] VSync: on adapters that expose vblank (Bochs VGA), wait for vblank before the page flip; the 16 ms frame-time warning itself is 08 TODO-08 §8
+
+**Test checkpoint:** Serial log shows frame timing. Idle: <1ms. Drag: <5ms. No visual tearing.
+
+## 5. Terminal Render Clipping (Boot Bleed Fix)
+Prevent terminal text from rendering outside its window bounds during compositor startup.
+
+> [!NOTE]
+> **Root cause:** `sys_write()` / `NtWriteFile()` on stdout calls `terminal_putchar()` which writes to the terminal back buffer. During the transition between splash screen and compositor, the terminal window may not yet have a valid screen position, so the compositor renders the terminal content at an incorrect location (top-left). The text disappears on the next compositor repaint.
+>
+> This is a cosmetic timing issue, not a data corruption bug. The terminal content is correct; it's just briefly visible at the wrong screen position.
+
+**Files:** `src/desktop/terminal.c`, `src/desktop/wm.c`
+
+- [ ] Gate `terminal_putchar()` writes: reject until the terminal's parent window has been fully composited at least once (add `terminal_ready` flag set by compositor after first paint)
+- [ ] Alternative: defer terminal rendering until compositor's first full frame is complete -- `wm_first_frame_done` flag checked in `terminal_render()`
+- [ ] Clip all window content rendering to the window's screen rect in `wm_composite()` -- no pixels outside window bounds should be written to the framebuffer
+- [ ] Commit: `"desktop: fix terminal text bleed during compositor startup"`
+
+**Test checkpoint:** Boot with `test=1` -- no text visible at top-left of screen before windows appear. Terminal content only appears inside the terminal window frame. Serial output unchanged (klog still writes to serial regardless).
+
+---
+
+## OS Comparison
+
+| ⭐  | Feature            | 🪟 Win11     | 🐧 Linux (Wayland) | 🚀 Impossible OS     |
+| --- | ------------------ | ------------ | ------------------ | -------------------- |
+| 💎  | Dirty rect compose | ✅ DWM       | ✅ Compositor      | ⬜ §1-§3             |
+| ⭐  | VSync              | ✅ D3D       | ✅ DRM             | ⬜ §4 Bochs VGA      |
+| ⭐  | <16ms frames       | ✅ GPU accel | ✅ GPU accel       | ⬜ §3 CPU compositor |

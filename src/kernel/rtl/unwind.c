@@ -1,0 +1,1666 @@
+/* ============================================================================
+ * rtl/unwind.c -- x64 table-based unwind engine (RtlVirtualUnwind et al.)
+ *
+ * Implements the AMD64 PE/COFF unwind EXECUTION engine (TODO-23 s6). Consumes
+ * RUNTIME_FUNCTION/UNWIND_INFO records from loaded-module .pdata (parsed by the
+ * PE loader into loaded_module_t) or from the dynamic function-table registry
+ * (JIT / no-backing-image code) and steps a CONTEXT from a frame to its caller.
+ *
+ * ARCH: x86-64. Reference: Microsoft "x64 exception handling"
+ * (learn.microsoft.com/cpp/build/exception-handling-x64), Windows Internals 7e.
+ *
+ * SMP / lifetime:
+ *  - The dynamic-table registry is a spinlock-protected sorted singly-linked
+ *    list. It owns a PRIVATE COPY of each RtlAddFunctionTable array, so a caller
+ *    freeing its own array cannot dangle a returned entry pointer.
+ *  - A whole static-table lookup runs under the registry spinlock, so it is
+ *    consistent against a concurrent delete (delete also unlinks under the
+ *    lock). A callback lookup snapshots the callback fn + context + base into
+ *    locals UNDER the lock and invokes the callback OUTSIDE the lock touching
+ *    only those locals -- the node is never dereferenced after unlock, so delete
+ *    is a plain unlink-under-lock + free with no teardown wait, and a callback
+ *    that unregisters its OWN table does not self-deadlock.
+ *  - Caller contract: the pointer RtlLookupFunctionEntry returns (into the
+ *    registry copy for a static table, or into caller storage for a callback),
+ *    and a callback table's callback code + context, stay valid only while no
+ *    delete races the unwind. Per the Windows RtlDeleteFunctionTable contract a
+ *    caller MUST NOT delete a table (nor free a callback's code/context) while a
+ *    thread is still unwinding through it; the stateless lookup/unwind ABI cannot
+ *    pin across the separate RtlVirtualUnwind call, and the snapshot of cb/cx
+ *    protects the registry node but not the objects they point to. An epoch/RCU-
+ *    backed lookup that would close this window is a tracked follow-up.
+ *
+ * Bounds safety: metadata reached from a LOADED MODULE is fully bounds-checked
+ * against [image_base, image_base+size_of_image) -- that is the untrusted attack
+ * surface (malformed PE .pdata). Dynamic tables are validated at registration
+ * (sorted, non-overlapping, in-range) and are in-kernel/trusted.
+ *
+ * Frame trust: RtlVirtualUnwind reads saved registers/return addresses through
+ * the establisher frame, which it TRUSTS to be a valid stack (kernel-mode
+ * Windows RtlVirtualUnwind does the same). The metadata STRUCTURE (opcodes,
+ * slot counts, chaining, OpInfo domains) is fully validated and a malformed
+ * record fails safe transactionally; but SAVE_NONVOL/SAVE_XMM apply a
+ * metadata-controlled offset to the (trusted) frame base and READ the result,
+ * and the terminal pop reads [RSP] -- those are STACK reads, not metadata
+ * reads, so a huge-but-structurally-valid offset can still address outside the
+ * frame. Arithmetic on RSP/frame base is overflow/underflow-checked, but a
+ * consumer that unwinds an UNTRUSTED user frame from kernel mode (the
+ * user-exception-delivery, kernel-stack-walking, and crash-reporting paths)
+ * must supply fault-safe stack reads + stack-range validation at its boundary.
+ * ============================================================================ */
+
+/* ARCH: x86-64 -- table-based unwind is the PE/COFF AMD64 mechanism. */
+
+#include "kernel/rtl/unwind.h"
+#include "kernel/exec.h"
+#include "kernel/mm/heap.h"
+#include "kernel/sched/spinlock.h"
+#include "kernel/sched/task.h"      /* thread_current / task_current + stack fields */
+#include "kernel/cpu_security.h"    /* __kstack_read_u64 (fault-safe kernel read) */
+#include "kernel/mm/memmap.h"       /* MM_IS_CANONICAL_4LVL (reject non-canonical RBP) */
+#include "kernel/klog.h"
+#include "kernel/nt/ntstatus.h"     /* NTSTATUS, NT_SUCCESS, STATUS_* for RtlUnwindEx */
+#include "kernel/bugcheck.h"        /* KeBugCheckEx -- terminal on post-cleanup unwind failure */
+
+extern void *memcpy(void *dst, const void *src, uint64_t n);
+
+/* rtl_restore_context (unwind_asm.asm) hardcodes these CONTEXT byte offsets and
+ * reads EVERY GPR + EFlags + Rip. except.h pins the endpoints + sizeof; re-pinning
+ * every offset the asm consumes here fails the C build the moment ANY field moves
+ * (including a mid-block reorder that preserves the endpoints and sizeof), before
+ * the asm can silently restore the wrong register (5-layer defense, Layer 1). */
+_Static_assert(__builtin_offsetof(CONTEXT, EFlags) == 0x44, "asm CTX_EFlags");
+_Static_assert(__builtin_offsetof(CONTEXT, Rax)    == 0x78, "asm CTX_Rax");
+_Static_assert(__builtin_offsetof(CONTEXT, Rcx)    == 0x80, "asm CTX_Rcx");
+_Static_assert(__builtin_offsetof(CONTEXT, Rdx)    == 0x88, "asm CTX_Rdx");
+_Static_assert(__builtin_offsetof(CONTEXT, Rbx)    == 0x90, "asm CTX_Rbx");
+_Static_assert(__builtin_offsetof(CONTEXT, Rsp)    == 0x98, "asm CTX_Rsp");
+_Static_assert(__builtin_offsetof(CONTEXT, Rbp)    == 0xA0, "asm CTX_Rbp");
+_Static_assert(__builtin_offsetof(CONTEXT, Rsi)    == 0xA8, "asm CTX_Rsi");
+_Static_assert(__builtin_offsetof(CONTEXT, Rdi)    == 0xB0, "asm CTX_Rdi");
+_Static_assert(__builtin_offsetof(CONTEXT, R8)     == 0xB8, "asm CTX_R8");
+_Static_assert(__builtin_offsetof(CONTEXT, R9)     == 0xC0, "asm CTX_R9");
+_Static_assert(__builtin_offsetof(CONTEXT, R10)    == 0xC8, "asm CTX_R10");
+_Static_assert(__builtin_offsetof(CONTEXT, R11)    == 0xD0, "asm CTX_R11");
+_Static_assert(__builtin_offsetof(CONTEXT, R12)    == 0xD8, "asm CTX_R12");
+_Static_assert(__builtin_offsetof(CONTEXT, R13)    == 0xE0, "asm CTX_R13");
+_Static_assert(__builtin_offsetof(CONTEXT, R14)    == 0xE8, "asm CTX_R14");
+_Static_assert(__builtin_offsetof(CONTEXT, R15)    == 0xF0, "asm CTX_R15");
+_Static_assert(__builtin_offsetof(CONTEXT, Rip)    == 0xF8, "asm CTX_Rip");
+
+/* Maximum chained-info depth before we treat the chain as malformed (cycle /
+ * runaway). Real toolchains emit at most a handful of chain levels. */
+#define UNWIND_MAX_CHAIN   32
+
+/* Cap on entries in one dynamic function table: 256 * 12 bytes = 3072 <= the
+ * kmalloc 4 KB ceiling, and the bound makes `entry_count * sizeof(...)` unable
+ * to wrap. JIT tables larger than this must use the (deferred) growable API. */
+#define UNWIND_MAX_DYNAMIC_ENTRIES   256
+
+/* Cap on the number of registered dynamic tables. dft_lookup walks the sorted
+ * list under s_dft_lock (IRQs off); the cap bounds that critical section until
+ * an indexed/RCU-backed lookup lands (SMP-epoch follow-up). */
+#define UNWIND_MAX_DYNAMIC_TABLES    512
+
+/* --- Dynamic function-table registry node -------------------------------- */
+
+typedef struct dyn_func_table {
+    struct dyn_func_table *next;
+    uint64_t          base_address;   /* image base the entries' RVAs are relative to */
+    uint64_t          min_address;    /* base + lowest BeginAddress (inclusive) */
+    uint64_t          max_address;    /* base + highest EndAddress (exclusive) */
+    RUNTIME_FUNCTION *functions;      /* registry-owned COPY (NULL for callback tables) */
+    uint32_t          entry_count;
+    uint64_t          identity;       /* (uintptr_t)caller table ptr, or table_identifier */
+    PGET_RUNTIME_FUNCTION_CALLBACK callback;  /* non-NULL for callback tables */
+    void             *context;
+} dyn_func_table_t;
+
+static spinlock_t         s_dft_lock = SPINLOCK_INIT;
+static dyn_func_table_t   *s_dft_head;          /* sorted by min_address, ascending */
+static uint32_t            s_dft_count;
+static int                 s_unwind_ready;
+
+/* ==========================================================================
+ * Small helpers
+ * ========================================================================== */
+
+/* CONTEXT integer registers are laid out Rax..R15 in AMD64 ABI order, so
+ * register number n (0..15) is &ctx->Rax + n. */
+static inline uint64_t *ctx_int_reg(CONTEXT *ctx, unsigned n)
+{
+    return &(&ctx->Rax)[n];
+}
+
+/* XMM register n is a 16-byte slice of the FXSAVE XmmRegisters area. */
+static inline M128A *ctx_xmm_reg(CONTEXT *ctx, unsigned n)
+{
+    return (M128A *)&ctx->FltSave.XmmRegisters[n * 16u];
+}
+
+/* Read helpers with explicit little-endian semantics (freestanding, no
+ * unaligned-access assumptions beyond x86 tolerance). */
+static inline uint32_t rd_u32(const void *p)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+/* Number of UNWIND_CODE slots a given opcode consumes (including its own). */
+static uint32_t unwind_op_slots(uint8_t op, uint8_t info)
+{
+    switch (op) {
+    case UWOP_PUSH_NONVOL:     return 1;
+    case UWOP_ALLOC_LARGE:     return (info == 0) ? 2 : 3;
+    case UWOP_ALLOC_SMALL:     return 1;
+    case UWOP_SET_FPREG:       return 1;
+    case UWOP_SAVE_NONVOL:     return 2;
+    case UWOP_SAVE_NONVOL_FAR: return 3;
+    case UWOP_EPILOG:          return 1;   /* v2 descriptor: skip its slots */
+    case UWOP_SPARE_CODE:      return 3;
+    case UWOP_SAVE_XMM128:     return 2;
+    case UWOP_SAVE_XMM128_FAR: return 3;
+    case UWOP_PUSH_MACHFRAME:  return 1;
+    default:                   return 0;   /* unknown -> caller bails out */
+    }
+}
+
+/* Derive the safe read window for image-based metadata reached from control_pc.
+ * Returns 1 and sets [*lo,*hi) when control_pc belongs to a loaded module whose
+ * base matches image_base (fully bounded, untrusted surface). Returns 0 when no
+ * module owns it (dynamic/trusted table -- structural checks only). */
+static int unwind_module_extent(uint64_t control_pc, uint64_t image_base,
+                                uint64_t *lo, uint64_t *hi)
+{
+    loaded_module_t mod;
+    if (exec_find_module_by_pc(control_pc, &mod) != 0)
+        return 0;
+    if (mod.base_address != image_base)
+        return 0;
+    *lo = mod.base_address;
+    *hi = mod.base_address + mod.size_of_image;
+    return 1;
+}
+
+/* True when [ptr, ptr+len) is safe to dereference: either unbounded (trusted
+ * dynamic table) or fully inside [lo,hi) with no wrap. */
+static int in_bounds(uint64_t ptr, uint64_t len, uint64_t lo, uint64_t hi, int bounded)
+{
+    if (!bounded)
+        return 1;
+    uint64_t end = ptr + len;
+    return (ptr >= lo) && (end >= ptr) && (end <= hi);
+}
+
+/* Checked 64-bit add: *out = a + b, returns 0 (and leaves *out untouched) if the
+ * sum wraps. Every stack/frame address computed from metadata-controlled offsets
+ * routes through this so malformed unwind data cannot wrap into an unrelated
+ * address that is then dereferenced. */
+static int ckadd(uint64_t a, uint64_t b, uint64_t *out)
+{
+    uint64_t s = a + b;
+    if (s < a)
+        return 0;
+    *out = s;
+    return 1;
+}
+
+/* Checked signed add for epilog RSP simulation: *out = a + b (b may be
+ * negative), returns 0 on wrap in either direction. */
+static int ckadd_s(uint64_t a, int64_t b, uint64_t *out)
+{
+    uint64_t r = a + (uint64_t)b;
+    if ((b > 0 && r < a) || (b < 0 && r > a))
+        return 0;
+    *out = r;
+    return 1;
+}
+
+/* ==========================================================================
+ * Epilog detection + simulation
+ *
+ * If control_pc sits inside a function epilog, the prolog-code unwind would
+ * double-restore the frame. Detect the epilog instruction pattern
+ *   [ add rsp,imm | lea rsp,[reg+disp] ]  (pop r64)*  ( ret | rep ret | jmp )
+ * and simulate the remaining instructions instead. Returns 1 and steps ctx to
+ * the caller frame if control_pc is an epilog, else 0 (ctx untouched).
+ * ========================================================================== */
+
+/* Total length of a legal `[optional REX] FF /4` indirect-jmp EPILOG terminator
+ * beginning at `ins`, bounded by `avail` readable bytes. The AMD64 epilog
+ * contract restricts the tail-call jmp to a mod==00 MEMORY reference (any legal
+ * mod==00 form, including scaled-index SIB); register-direct (mod==11) and the
+ * disp8/disp32 base forms (mod==01/10) are NOT legal epilog terminators. Returns
+ * 0 when the form is prohibited, is not an FF /4, or `avail` is too small. */
+static uint32_t indirect_jmp_len(const uint8_t *ins, uint32_t avail)
+{
+    uint32_t i = 0;
+    if (avail >= 1u && (ins[0] & 0xF0u) == 0x40u)
+        i = 1u;                                  /* skip a REX prefix */
+    if (avail < i + 2u || ins[i] != 0xFFu)
+        return 0;
+    uint8_t modrm = ins[i + 1u];
+    if (((modrm >> 3) & 7u) != 4u)
+        return 0;                                /* ModRM reg field must be /4 */
+    uint8_t mod = (modrm >> 6) & 3u;
+    uint8_t rm  = modrm & 7u;
+    if (mod != 0u)
+        return 0;                                /* only mod==00 memory refs */
+    uint32_t len = i + 2u;                        /* [REX] FF modrm */
+    if (rm == 4u) {                              /* SIB byte follows (any index) */
+        if (avail < len + 1u)
+            return 0;
+        uint8_t sib = ins[len];
+        len += 1u;
+        if ((sib & 7u) == 5u)
+            len += 4u;                           /* SIB base 101 at mod0 => disp32 */
+    } else if (rm == 5u) {
+        len += 4u;                               /* RIP-relative disp32 */
+    }
+    /* else mod==00, rm in {0..3,6,7}: [reg] with no displacement. */
+    return len;
+}
+
+static int unwind_try_epilog(uint64_t control_pc, CONTEXT *ctx,
+                             uint64_t lo, uint64_t hi, int bounded,
+                             uint64_t func_start, uint64_t func_end,
+                             uint8_t frame_reg,
+                             KNONVOLATILE_CONTEXT_POINTERS *context_pointers)
+{
+    const uint8_t *p = (const uint8_t *)control_pc;
+    uint64_t pc = control_pc;
+    uint64_t rsp = ctx->Rsp;
+    /* Scratch register restores + their stack-slot addresses; committed only if
+     * a terminator is reached. */
+    uint64_t  regs[16];
+    uint64_t *reg_slot[16] = { 0 };
+    int       reg_touched[16] = { 0 };
+
+    /* Every epilog instruction must lie WHOLLY within [pc, func_end) AND the
+     * image bounds -- a multi-byte op (REX-pop, ret imm16, indirect jmp) must
+     * not straddle EndAddress into an adjacent function. Subtraction form so the
+     * function-extent check cannot wrap even for an unbounded dynamic table whose
+     * range ends at UINT64_MAX. */
+#define EPI_FITS(n) (in_bounds(pc, (n), lo, hi, bounded) && (pc) >= func_start && \
+                     (pc) < func_end && (uint64_t)(n) <= func_end - (pc))
+
+    /* Step 1: optional stack teardown. Only the exact legal RSP-teardown
+     * encodings are accepted so a non-RSP instruction with a similar shape
+     * (e.g. `add r12,imm` = REX.WB) is never mistaken for a teardown:
+     *   add rsp, imm8/imm32 : REX.W (0x48, REX.B CLEAR) 83/81 /0 (modrm 0xC4)
+     *   lea rsp, [fp + disp] : REX.W[.B] 8D, reg field = rsp, base = the
+     *                          UNWIND_INFO frame register, no SIB index. */
+    if (EPI_FITS(2)) {
+        uint8_t b0 = p[0];
+        if (b0 == 0x48 && p[1] == 0x83 && EPI_FITS(4) && p[2] == 0xC4) {
+            if (!ckadd_s(rsp, (int64_t)(int8_t)p[3], &rsp)) return 0;   /* add rsp, imm8 */
+            p += 4; pc += 4;
+        } else if (b0 == 0x48 && p[1] == 0x81 && EPI_FITS(7) && p[2] == 0xC4) {
+            if (!ckadd_s(rsp, (int64_t)(int32_t)rd_u32(p + 3), &rsp)) return 0;  /* add rsp, imm32 */
+            p += 7; pc += 7;
+        } else if ((b0 == 0x48 || b0 == 0x49) && p[1] == 0x8D && frame_reg != 0 &&
+                   EPI_FITS(3)) {
+            /* lea rsp, [frame_reg + disp]. reg field must be rsp (100b). Two
+             * encodings of the base: a direct base (rm != 100), and the SIB
+             * no-index form (rm == 100) that r12 and rsp REQUIRE. Indexed SIB,
+             * RIP-relative (mod0,rm5), and disp32-no-base (SIB base 101) are
+             * rejected -- none is a simple frame-pointer restore. */
+            uint8_t rex_b = (b0 & 0x01) ? 8u : 0u;
+            uint8_t modrm = p[2];
+            uint8_t mod = (modrm >> 6) & 3u;
+            uint8_t reg = (modrm >> 3) & 7u;
+            uint8_t rm  = modrm & 7u;
+            uint8_t base = 0xFFu;
+            uint32_t hdr = 3;   /* REX + 0x8D + modrm */
+            int ok = (reg == 4u && mod != 3u);
+            if (ok && rm == 4u) {
+                /* disp32-no-base (base field 101) applies ONLY at mod==0; at
+                 * mod 1/2 base 101 is a valid rbp/r13 (via REX.B) base. */
+                if (EPI_FITS(4) &&
+                    ((p[3] >> 3) & 7u) == 4u &&                    /* no index */
+                    !(mod == 0u && (p[3] & 7u) == 5u)) {          /* not disp32-no-base */
+                    base = (uint8_t)((p[3] & 7u) + rex_b);
+                    hdr = 4;
+                } else {
+                    ok = 0;
+                }
+            } else if (ok && mod == 0u && rm == 5u) {
+                ok = 0;                              /* RIP-relative */
+            } else if (ok) {
+                base = (uint8_t)(rm + rex_b);
+            }
+            if (ok && base == frame_reg) {
+                int64_t disp = 0;
+                uint32_t ilen = hdr;
+                if (mod == 1u) {
+                    if (EPI_FITS(hdr + 1u)) {
+                        disp = (int64_t)(int8_t)p[hdr]; ilen = hdr + 1;
+                    } else ok = 0;
+                } else if (mod == 2u) {
+                    if (EPI_FITS(hdr + 4u)) {
+                        disp = (int64_t)(int32_t)rd_u32(p + hdr); ilen = hdr + 4;
+                    } else ok = 0;
+                }   /* mod == 0: base-only, disp 0 */
+                if (ok && ckadd_s(*ctx_int_reg(ctx, frame_reg), disp, &rsp)) {
+                    p += ilen; pc += ilen;
+                }
+            }
+        }
+    }
+
+    /* Whether the scan consumed a real epilog prefix (a stack teardown and/or
+     * pops). Used to disambiguate an AMBIGUOUS indirect tail-call jmp from a body
+     * switch-dispatch jmp: only an indirect jmp reached AFTER a valid teardown/
+     * pops sequence is an epilog. */
+    int had_teardown = (pc != control_pc);
+    int pops = 0;
+
+    /* Step 2: run of pop r64 (optional REX.B for r8-r15). A legal epilog pops at
+     * most the nonvolatile integer registers, so the scan is capped at 16 and
+     * confined to the function body -- a degenerate/crafted pop sled cannot make
+     * one unwind cost O(image size). */
+    for (;;) {
+        if (!EPI_FITS(1))
+            return 0;
+        uint8_t rex_b = 0;
+        uint32_t adv = 0;
+        uint8_t b = p[0];
+        if ((b & 0xF0) == 0x40) {                 /* REX prefix */
+            rex_b = (b & 0x01) ? 8u : 0u;
+            if (!EPI_FITS(2))
+                return 0;
+            b = p[1];
+            adv = 1;
+        }
+        if (b >= 0x58 && b <= 0x5F) {             /* pop r64 */
+            if (pops >= 16)
+                return 0;   /* cap BEFORE dereferencing another slot */
+            unsigned reg = (unsigned)(b - 0x58) + rex_b;
+            uint64_t new_rsp;
+            if (!ckadd(rsp, 8, &new_rsp))
+                return 0;
+            uint64_t *slot = (uint64_t *)rsp;      /* stack read (not image-bounded) */
+            regs[reg] = *slot;
+            reg_slot[reg] = slot;
+            reg_touched[reg] = 1;
+            rsp = new_rsp;
+            pops++;
+            p += adv + 1; pc += adv + 1;
+            continue;
+        }
+        break;
+    }
+
+    /* Step 3: terminator. A `ret`/`rep ret` is unconditionally a function exit,
+     * hence an epilog. Tail-call jumps come in two disambiguation classes:
+     *   - RELATIVE (`jmp rel8`/`rel32`, EB/E9): an epilog iff the target is
+     *     OUTBOUND (outside [func_start,func_end)). An outbound relative jump is
+     *     always a tail call in valid code; an intra-function branch is a body
+     *     branch. The target check works from ANY control_pc position.
+     *   - INDIRECT (`[REX.W] FF /4`: rip-relative `FF 25`, register `FF E0-E7`,
+     *     indexed-SIB `FF 24 ...`): the SAME encodings are emitted for BOTH
+     *     indexed tail calls AND body switch dispatch, so the encoding alone is
+     *     ambiguous. We accept an indirect jmp as an epilog ONLY when the scan
+     *     consumed a real epilog prefix (a teardown and/or pops), which a body
+     *     switch never has. This detects the common `add rsp,N; pop; jmp <ind>`
+     *     tail-call epilog; a control_pc landing EXACTLY on the indirect jmp
+     *     (teardown already retired, nothing left to scan) is not detected and
+     *     falls back to prolog unwind -- the robust fix is UWOP_EPILOG (unwind
+     *     info v2) epilog metadata, tracked as a follow-up.
+     * `ret imm16` (0xC2 iw) is a legal epilog terminator: it pops the return
+     * address and then adds imm16 to RSP (its stack adjustment is simulated). */
+    if (!EPI_FITS(1))
+        return 0;
+    uint8_t t = p[0];
+    int is_epilog = 0;
+    uint32_t ret_imm = 0;   /* extra RSP adjustment from `ret imm16` */
+    int had_progress = (had_teardown || pops > 0);
+    /* Skip an optional REX prefix (0x40-0x4F) on an indirect jmp: Clang emits
+     * `rex64 jmpq *[rip+d]` as 48 FF /4 and `jmp r8-r15` as 41 FF /4 (REX.B).
+     * REX does not apply to a relative jmp, so EB/E9 are matched unprefixed. */
+    if (t == 0xC3) {                              /* ret */
+        is_epilog = 1;
+    } else if (t == 0xC2 && EPI_FITS(3)) {        /* ret imm16 */
+        is_epilog = 1;
+        ret_imm = (uint32_t)p[1] | ((uint32_t)p[2] << 8);
+    } else if (t == 0xF3 && EPI_FITS(2) && p[1] == 0xC3) {
+        is_epilog = 1;                            /* rep ret */
+    } else if (t == 0xEB && EPI_FITS(2)) {        /* jmp rel8 */
+        uint64_t tgt = pc + 2 + (uint64_t)(int64_t)(int8_t)p[1];
+        if (tgt < func_start || tgt >= func_end)
+            is_epilog = 1;
+    } else if (t == 0xE9 && EPI_FITS(5)) {        /* jmp rel32 */
+        uint64_t tgt = pc + 5 + (uint64_t)(int64_t)(int32_t)rd_u32(p + 1);
+        if (tgt < func_start || tgt >= func_end)
+            is_epilog = 1;
+    } else if (had_progress) {                    /* `[REX] FF /4` indirect jmp */
+        uint32_t avail = (func_end - pc > 16u) ? 16u : (uint32_t)(func_end - pc);
+        uint32_t jl = indirect_jmp_len(p, avail);
+        if (jl != 0 && EPI_FITS(jl))
+            is_epilog = 1;
+    }
+    if (!is_epilog)
+        return 0;
+
+    /* Commit: nonvolatile register restores (+ their saved-slot addresses), then
+     * pop the return address (and apply a `ret imm16` stack adjustment). */
+    uint64_t after_ret;
+    if (!ckadd(rsp, 8u + (uint64_t)ret_imm, &after_ret))
+        return 0;
+    for (unsigned i = 0; i < 16; i++) {
+        if (reg_touched[i]) {
+            *ctx_int_reg(ctx, i) = regs[i];
+            if (context_pointers)
+                context_pointers->Integer[i] = reg_slot[i];
+        }
+    }
+    uint64_t *ret_slot = (uint64_t *)rsp;
+    ctx->Rip = *ret_slot;
+    ctx->Rsp = after_ret;
+    return 1;
+#undef EPI_FITS
+}
+
+/* ==========================================================================
+ * RtlVirtualUnwind -- prolog-based unwind with iterative chaining
+ * ========================================================================== */
+
+/* Advance ctx one frame using a leaf convention (no unwind data): the return
+ * address is at [Rsp]. Used as the fail-safe so a malformed record makes forward
+ * progress instead of looping. */
+static void unwind_leaf(CONTEXT *ctx, uint64_t *establisher_frame)
+{
+    if (establisher_frame)
+        *establisher_frame = ctx->Rsp;
+    uint64_t *ret_slot = (uint64_t *)ctx->Rsp;
+    ctx->Rip = *ret_slot;
+    ctx->Rsp += 8;
+}
+
+void *RtlVirtualUnwind(uint32_t handler_type, uint64_t image_base, uint64_t control_pc,
+                       PRUNTIME_FUNCTION function_entry, CONTEXT *context,
+                       void **handler_data, uint64_t *establisher_frame,
+                       KNONVOLATILE_CONTEXT_POINTERS *context_pointers)
+{
+    if (handler_data)
+        *handler_data = 0;
+    if (establisher_frame)
+        *establisher_frame = 0;
+    if (!context)
+        return 0;
+    if (!function_entry || image_base == 0) {
+        unwind_leaf(context, establisher_frame);
+        return 0;
+    }
+
+    uint64_t lo = 0, hi = 0;
+    int bounded = unwind_module_extent(control_pc, image_base, &lo, &hi);
+
+    /* Primary UNWIND_INFO for the innermost function. */
+    uint64_t ui_addr = image_base + (function_entry->UnwindInfoAddress & ~1u);
+    if (!in_bounds(ui_addr, sizeof(UNWIND_INFO), lo, hi, bounded)) {
+        unwind_leaf(context, establisher_frame);
+        return 0;
+    }
+    UNWIND_INFO *ui = (UNWIND_INFO *)ui_addr;
+
+    /* Reject unsupported versions BEFORE any code-stream / epilog interpretation
+     * so a v2-or-later record with a body-offset PC fails safe (leaf) instead of
+     * being mis-simulated. */
+    if (UNWIND_INFO_VERSION(ui) != 1) {
+        unwind_leaf(context, establisher_frame);
+        return 0;
+    }
+
+    uint32_t prolog_off = (uint32_t)(control_pc - (image_base + function_entry->BeginAddress));
+    /* A language handler is active only when control is in the function BODY --
+     * not mid-prolog (frame not yet established) and not in the epilog. */
+    int pc_in_body = (prolog_off >= ui->SizeOfProlog);
+
+    /* Epilog check only when past the prolog (in body or epilog). */
+    if (pc_in_body) {
+        uint64_t func_start = image_base + function_entry->BeginAddress;
+        uint64_t func_end = image_base + function_entry->EndAddress;
+        uint8_t innermost_frame_reg = UNWIND_INFO_FRAMEREG(ui);
+        uint64_t entry_rsp = context->Rsp;   /* RSP at the fault PC, before sim */
+        if (unwind_try_epilog(control_pc, context, lo, hi, bounded, func_start, func_end,
+                              innermost_frame_reg, context_pointers)) {
+            /* Identify the frame being unwound by its RSP at the fault PC (a real
+             * address within this frame), not the post-return caller SP. Precise
+             * in-epilog frame-base recovery needs UWOP_EPILOG (v2) metadata. */
+            if (establisher_frame)
+                *establisher_frame = entry_rsp;
+            return 0;
+        }
+    }
+
+    void *handler = 0;
+    PRUNTIME_FUNCTION cur = function_entry;
+    int depth = 0;
+    uint64_t est_frame = context->Rsp;   /* refined below if a frame register is used */
+
+    /* Transactional snapshot: untrusted metadata is interpreted directly into
+     * `context`, but if any opcode/chain step turns out malformed we must NOT
+     * leaf-fall-back through the partially mutated state (a moved RSP would read
+     * RIP from the wrong slot). On failure the snapshot is restored and a single
+     * leaf pop is taken from the ORIGINAL RSP. Only the fields the interpreter
+     * can mutate are journaled -- the integer file (Rax..Rip, contiguous) and
+     * the FXSAVE XMM area -- avoiding a full 1232-byte CONTEXT copy per frame. */
+    uint64_t saved_ints[17];   /* Rax..R15 (16) + Rip */
+    memcpy(saved_ints, &context->Rax, sizeof(saved_ints));
+    uint8_t saved_xmm[256];
+    memcpy(saved_xmm, context->FltSave.XmmRegisters, sizeof(saved_xmm));
+    int have_cp = (context_pointers != 0);
+    KNONVOLATILE_CONTEXT_POINTERS saved_cp;
+    if (have_cp)
+        saved_cp = *context_pointers;
+    int bad = 0;
+
+    for (;;) {
+        ui_addr = image_base + (cur->UnwindInfoAddress & ~1u);
+        if (!in_bounds(ui_addr, sizeof(UNWIND_INFO), lo, hi, bounded)) {
+            bad = 1; break;
+        }
+        ui = (UNWIND_INFO *)ui_addr;
+        /* Only unwind-info version 1 is supported. Version 2 adds paired
+         * epilog descriptor slots whose decoding differs; accepting it without
+         * version-specific slot handling would misparse the code array, so a v2
+         * record fails safe (leaf pop) rather than being mis-walked. */
+        if (UNWIND_INFO_VERSION(ui) != 1) {
+            bad = 1; break;
+        }
+        uint8_t count = ui->CountOfCodes;
+        UNWIND_CODE *codes = ui->UnwindCode;
+        if (!in_bounds((uint64_t)(uintptr_t)codes, (uint64_t)count * 2u, lo, hi, bounded)) {
+            bad = 1; break;
+        }
+
+        /* Codes past the current prolog offset have not executed yet; for a
+         * chained parent, treat the whole prolog as executed. */
+        uint32_t eff_off = (depth == 0)
+            ? (uint32_t)(control_pc - (image_base + cur->BeginAddress))
+            : 0xFFFFFFFFu;
+
+        /* Establish the fixed frame base if a frame register is used and its
+         * SET_FPREG has executed (SAVE_NONVOL/XMM offsets are relative to it). */
+        uint8_t frame_reg = UNWIND_INFO_FRAMEREG(ui);
+        uint64_t frame_base;
+        if (frame_reg != 0) {
+            /* Find the SET_FPREG code offset (at most one). */
+            uint32_t fp_off = 0xFFFFFFFFu;
+            uint32_t j = 0;
+            while (j < count) {
+                uint8_t op = UNWIND_CODE_OP(codes[j]);
+                uint8_t info = UNWIND_CODE_INFO(codes[j]);
+                uint32_t slots = unwind_op_slots(op, info);
+                if (slots == 0 || j + slots > count)
+                    break;
+                if (op == UWOP_SET_FPREG) {
+                    fp_off = codes[j].b.CodeOffset;
+                    break;
+                }
+                j += slots;
+            }
+            if (eff_off >= fp_off) {
+                uint64_t reg_val = *ctx_int_reg(context, frame_reg);
+                uint64_t off16 = (uint64_t)UNWIND_INFO_FRAMEOFF(ui) * 16u;
+                if (reg_val < off16) {
+                    bad = 1; break;   /* frame-offset underflow: malformed */
+                }
+                frame_base = reg_val - off16;
+            } else {
+                frame_base = context->Rsp;
+            }
+        } else {
+            frame_base = context->Rsp;
+        }
+        if (depth == 0)
+            est_frame = frame_base;
+
+        /* Apply codes in array order (reverse-prolog order). */
+        int malformed = 0;
+        uint32_t i = 0;
+        while (i < count) {
+            UNWIND_CODE *uc = &codes[i];
+            uint8_t op = UNWIND_CODE_OP(*uc);
+            uint8_t info = UNWIND_CODE_INFO(*uc);
+            uint32_t slots = unwind_op_slots(op, info);
+            if (slots == 0 || i + slots > count) {
+                malformed = 1;
+                break;
+            }
+            if (uc->b.CodeOffset <= eff_off) {
+                switch (op) {
+                case UWOP_PUSH_NONVOL: {
+                    uint64_t next_rsp;
+                    if (!ckadd(context->Rsp, 8, &next_rsp)) { malformed = 1; break; }
+                    uint64_t *slot = (uint64_t *)context->Rsp;
+                    *ctx_int_reg(context, info) = *slot;
+                    if (context_pointers && info < 16)
+                        context_pointers->Integer[info] = slot;
+                    context->Rsp = next_rsp;
+                    break;
+                }
+                case UWOP_ALLOC_SMALL: {
+                    uint64_t d = (uint64_t)info * 8u + 8u;
+                    if (context->Rsp + d < context->Rsp) { malformed = 1; break; }
+                    context->Rsp += d;
+                    break;
+                }
+                case UWOP_ALLOC_LARGE: {
+                    if (info > 1) { malformed = 1; break; }   /* only forms 0/1 exist */
+                    uint64_t d = (info == 0)
+                        ? (uint64_t)codes[i + 1].FrameOffset * 8u
+                        : (uint64_t)rd_u32(&codes[i + 1]);
+                    if (context->Rsp + d < context->Rsp) { malformed = 1; break; }
+                    context->Rsp += d;
+                    break;
+                }
+                case UWOP_SET_FPREG: {
+                    /* SET_FPREG is only legal when a frame register is declared,
+                     * and its OpInfo is reserved (0). Otherwise the record is
+                     * malformed and would set RSP from a bogus register (e.g. a
+                     * crafted FrameRegister==0 would use RAX). */
+                    if (frame_reg == 0 || info != 0) { malformed = 1; break; }
+                    uint64_t reg_val = *ctx_int_reg(context, frame_reg);
+                    uint64_t off16 = (uint64_t)UNWIND_INFO_FRAMEOFF(ui) * 16u;
+                    if (reg_val < off16) { malformed = 1; break; }
+                    context->Rsp = reg_val - off16;
+                    break;
+                }
+                case UWOP_SAVE_NONVOL: {
+                    uint64_t addr;
+                    if (!ckadd(frame_base, (uint64_t)codes[i + 1].FrameOffset * 8u, &addr)) {
+                        malformed = 1; break;
+                    }
+                    uint64_t *slot = (uint64_t *)addr;
+                    *ctx_int_reg(context, info) = *slot;
+                    if (context_pointers && info < 16)
+                        context_pointers->Integer[info] = slot;
+                    break;
+                }
+                case UWOP_SAVE_NONVOL_FAR: {
+                    uint64_t addr;
+                    if (!ckadd(frame_base, (uint64_t)rd_u32(&codes[i + 1]), &addr)) {
+                        malformed = 1; break;
+                    }
+                    uint64_t *slot = (uint64_t *)addr;
+                    *ctx_int_reg(context, info) = *slot;
+                    if (context_pointers && info < 16)
+                        context_pointers->Integer[info] = slot;
+                    break;
+                }
+                case UWOP_SAVE_XMM128: {
+                    uint64_t addr;
+                    if (!ckadd(frame_base, (uint64_t)codes[i + 1].FrameOffset * 16u, &addr)) {
+                        malformed = 1; break;
+                    }
+                    M128A *slot = (M128A *)addr;
+                    *ctx_xmm_reg(context, info) = *slot;
+                    if (context_pointers && info < 16)
+                        context_pointers->Xmm[info] = slot;
+                    break;
+                }
+                case UWOP_SAVE_XMM128_FAR: {
+                    uint64_t addr;
+                    if (!ckadd(frame_base, (uint64_t)rd_u32(&codes[i + 1]), &addr)) {
+                        malformed = 1; break;
+                    }
+                    M128A *slot = (M128A *)addr;
+                    *ctx_xmm_reg(context, info) = *slot;
+                    if (context_pointers && info < 16)
+                        context_pointers->Xmm[info] = slot;
+                    break;
+                }
+                case UWOP_PUSH_MACHFRAME: {
+                    if (info > 1) { malformed = 1; break; }   /* only 0/1 (no/with err code) */
+                    /* Interrupt/exception machine frame on the stack:
+                     * [RIP][CS][EFLAGS][RSP][SS], preceded by an error code when
+                     * info==1. RSP currently points at (error code or) RIP. */
+                    uint64_t *mf = (uint64_t *)context->Rsp;
+                    if (info == 1)
+                        mf += 1;             /* skip pushed error code */
+                    context->Rip = mf[0];
+                    context->Rsp = mf[3];    /* RSP field of the iret frame */
+                    /* Terminal frame -- the machine frame fully defines caller. */
+                    if (establisher_frame)
+                        *establisher_frame = est_frame;
+                    return handler;
+                }
+                case UWOP_EPILOG:
+                case UWOP_SPARE_CODE:
+                    /* Not valid version-1 operations (v2-only descriptors). */
+                default:
+                    malformed = 1;
+                    break;
+                }
+            }
+            if (malformed)
+                break;
+            i += slots;
+        }
+        if (malformed) {
+            bad = 1;
+            break;
+        }
+
+        /* Handler + language data live after the even-slot-aligned code array.
+         * Per the AMD64 contract a CHAININFO record clears the handler flags, so
+         * the active handler always lives in the TERMINAL (non-chained) record;
+         * extract it there, never from a chained link (which stores a parent
+         * RUNTIME_FUNCTION at the same offset). The resolved target must land
+         * inside the owning image (checked add) before it can be returned. */
+        uint32_t aligned = ((uint32_t)count + 1u) & ~1u;
+        uint8_t flags = UNWIND_INFO_FLAGS(ui);
+        if (pc_in_body && !(flags & UNW_FLAG_CHAININFO) &&
+            (flags & handler_type & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER))) {
+            uint64_t hp = (uint64_t)(uintptr_t)(codes + aligned);
+            if (in_bounds(hp, 4, lo, hi, bounded)) {
+                uint32_t hrva = rd_u32((const void *)(uintptr_t)hp);
+                uint64_t htarget = image_base + hrva;
+                if (!bounded || (htarget >= lo && htarget < hi)) {
+                    handler = (void *)(uintptr_t)htarget;
+                    if (handler_data)
+                        *handler_data = (void *)(uintptr_t)(hp + 4);
+                }
+            }
+        }
+
+        if (flags & UNW_FLAG_CHAININFO) {
+            uint64_t cp = (uint64_t)(uintptr_t)(codes + aligned);
+            if (!in_bounds(cp, sizeof(RUNTIME_FUNCTION), lo, hi, bounded)) {
+                bad = 1; break;
+            }
+            if (++depth > UNWIND_MAX_CHAIN) {
+                bad = 1; break;
+            }
+            cur = (PRUNTIME_FUNCTION)(uintptr_t)cp;
+            continue;
+        }
+        break;   /* success: no more chaining */
+    }
+
+    if (bad) {
+        /* Restore the mutated register blocks and take exactly one leaf pop from
+         * the ORIGINAL RSP (transactional fail-safe for malformed metadata). */
+        memcpy(&context->Rax, saved_ints, sizeof(saved_ints));
+        memcpy(context->FltSave.XmmRegisters, saved_xmm, sizeof(saved_xmm));
+        if (have_cp)
+            *context_pointers = saved_cp;
+        unwind_leaf(context, establisher_frame);
+        return 0;
+    }
+
+    /* Terminal: pop the return address exactly once. */
+    if (establisher_frame)
+        *establisher_frame = est_frame;
+    uint64_t *ret_slot = (uint64_t *)context->Rsp;
+    context->Rip = *ret_slot;
+    context->Rsp += 8;
+    return handler;
+}
+
+/* ==========================================================================
+ * RtlLookupFunctionEntry
+ * ========================================================================== */
+
+/* Binary-search a sorted .pdata array for the entry covering `rva`. */
+static PRUNTIME_FUNCTION pdata_search(RUNTIME_FUNCTION *table, uint32_t count, uint32_t rva)
+{
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (rva < table[mid].BeginAddress)
+            hi = mid;
+        else if (rva >= table[mid].EndAddress)
+            lo = mid + 1;
+        else
+            return &table[mid];
+    }
+    return 0;
+}
+
+/* Search the dynamic-table registry for control_pc. Static-array nodes complete
+ * entirely under the registry lock (the returned pointer is into registry-owned
+ * storage that delete drains before freeing). Callback nodes acquire rundown,
+ * drop the lock, and invoke the callback outside it. */
+static PRUNTIME_FUNCTION dft_lookup(uint64_t control_pc, uint64_t *image_base)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&s_dft_lock, &flags);
+    for (dyn_func_table_t *n = s_dft_head; n; n = n->next) {
+        if (n->min_address > control_pc)
+            break;   /* sorted ascending: no later node can match */
+        if (control_pc < n->min_address || control_pc >= n->max_address)
+            continue;
+        if (n->callback) {
+            /* Snapshot the callback + context + base under the lock, then invoke
+             * OUTSIDE the lock using only those locals -- the node is never
+             * touched after unlock, so a concurrent (or self-issued) delete can
+             * unlink + free it with no use-after-free and no teardown wait. The
+             * callback function and its context lifetime are the caller's per
+             * the Windows RtlInstallFunctionTableCallback contract. */
+            PGET_RUNTIME_FUNCTION_CALLBACK cb = n->callback;
+            void *cx = n->context;
+            uint64_t base = n->base_address;
+            spin_unlock_irqrestore(&s_dft_lock, flags);
+            PRUNTIME_FUNCTION rf = cb(control_pc, cx);
+            /* Indirect (fragment) entries are not yet supported; fail safe. */
+            if (rf && RUNTIME_FUNCTION_CHAINED(rf))
+                return 0;
+            if (rf && image_base)
+                *image_base = base;
+            return rf;
+        }
+        uint32_t rva = (uint32_t)(control_pc - n->base_address);
+        /* Static-table entries are direct-only (RtlAddFunctionTable rejects
+         * indirect ones), so no redirection resolution is needed here. */
+        PRUNTIME_FUNCTION rf = pdata_search(n->functions, n->entry_count, rva);
+        uint64_t base = n->base_address;
+        spin_unlock_irqrestore(&s_dft_lock, flags);
+        if (rf && image_base)
+            *image_base = base;
+        return rf;
+    }
+    spin_unlock_irqrestore(&s_dft_lock, flags);
+    return 0;
+}
+
+PRUNTIME_FUNCTION RtlLookupFunctionEntry(uint64_t control_pc, uint64_t *image_base,
+                                         void *history_table)
+{
+    (void)history_table;   /* no caching layer yet (ABI-compat parameter) */
+
+    /* 1. Loaded-module .pdata (the common, untrusted case). */
+    loaded_module_t mod;
+    if (exec_find_module_by_pc(control_pc, &mod) == 0 && mod.pdata_size >= sizeof(RUNTIME_FUNCTION)) {
+        uint32_t count = (uint32_t)(mod.pdata_size / sizeof(RUNTIME_FUNCTION));
+        uint32_t rva = (uint32_t)(control_pc - mod.base_address);
+        RUNTIME_FUNCTION *table = (RUNTIME_FUNCTION *)(uintptr_t)mod.pdata_base;
+        PRUNTIME_FUNCTION rf = pdata_search(table, count, rva);
+        if (rf) {
+            /* Indirect (redirected) entries describe a function FRAGMENT sharing
+             * another entry's unwind info; unwinding them correctly needs the
+             * fragment's own range paired with the parent's UNWIND_INFO. Until
+             * that is implemented, fail safe (NULL) rather than mis-unwind with
+             * the wrong range. RVAs are checked against size_of_image directly
+             * (not base+RVA vs img_end, which could wrap for a high base). */
+            if (!RUNTIME_FUNCTION_CHAINED(rf) &&
+                rf->BeginAddress < rf->EndAddress &&
+                (uint64_t)rf->EndAddress <= mod.size_of_image &&
+                (uint64_t)rf->UnwindInfoAddress < mod.size_of_image) {
+                if (image_base)
+                    *image_base = mod.base_address;
+                return rf;
+            }
+            return 0;   /* indirect or malformed entry: fail closed */
+        }
+    }
+
+    /* 2. Dynamic function-table registry (JIT / no backing image). */
+    return dft_lookup(control_pc, image_base);
+}
+
+/* ==========================================================================
+ * Dynamic function-table registry: add / delete / callback
+ * ========================================================================== */
+
+/* Insert a fully-built node into the sorted list (caller holds the lock). */
+static void dft_insert_locked(dyn_func_table_t *node)
+{
+    dyn_func_table_t **pp = &s_dft_head;
+    while (*pp && (*pp)->min_address < node->min_address)
+        pp = &(*pp)->next;
+    node->next = *pp;
+    *pp = node;
+    s_dft_count++;
+}
+
+/* True if [min,max) overlaps any registered node (caller holds the lock). */
+static int dft_overlaps_locked(uint64_t min_addr, uint64_t max_addr)
+{
+    for (dyn_func_table_t *n = s_dft_head; n; n = n->next) {
+        if (min_addr < n->max_address && n->min_address < max_addr)
+            return 1;
+    }
+    return 0;
+}
+
+/* True if a node with this delete-identity is already registered (caller holds
+ * the lock). Rejecting a duplicate keeps RtlDeleteFunctionTable's identity key
+ * unambiguous even if a caller frees and reuses the array/id address. */
+static int dft_identity_exists_locked(uint64_t identity)
+{
+    for (dyn_func_table_t *n = s_dft_head; n; n = n->next) {
+        if (n->identity == identity)
+            return 1;
+    }
+    return 0;
+}
+
+int RtlAddFunctionTable(PRUNTIME_FUNCTION function_table, uint32_t entry_count,
+                        uint64_t base_address)
+{
+    if (!function_table || entry_count == 0 || base_address == 0)
+        return 0;
+    if (entry_count > UNWIND_MAX_DYNAMIC_ENTRIES)
+        return 0;   /* bounds the copy size and prevents multiply wrap */
+
+    /* Validate sorted, non-overlapping, in-order entries; compute span. */
+    uint64_t min_rva = function_table[0].BeginAddress;
+    uint64_t max_rva = function_table[0].EndAddress;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        RUNTIME_FUNCTION *e = &function_table[i];
+        if (e->BeginAddress >= e->EndAddress)
+            return 0;
+        if (i > 0 && e->BeginAddress < function_table[i - 1].EndAddress)
+            return 0;   /* not sorted / overlapping */
+        if (RUNTIME_FUNCTION_CHAINED(e))
+            return 0;   /* indirect entries would redirect into the caller's
+                         * (freeable) array; not permitted in a copied table */
+        if (e->EndAddress > max_rva)
+            max_rva = e->EndAddress;
+    }
+    /* Reject a base+RVA span that would wrap the address space. */
+    if (base_address + max_rva < base_address)
+        return 0;
+
+    /* Private copy so a caller freeing its array cannot dangle a returned
+     * entry pointer. `bytes` cannot wrap: entry_count is capped above. */
+    size_t bytes = (size_t)entry_count * sizeof(RUNTIME_FUNCTION);
+    dyn_func_table_t *node = (dyn_func_table_t *)kmalloc(sizeof(*node));
+    RUNTIME_FUNCTION *copy = (RUNTIME_FUNCTION *)kmalloc(bytes);
+    if (!node || !copy) {
+        if (node) kfree(node);
+        if (copy) kfree(copy);
+        return 0;
+    }
+    memcpy(copy, function_table, bytes);
+
+    node->base_address = base_address;
+    node->min_address  = base_address + min_rva;
+    node->max_address  = base_address + max_rva;
+    node->functions    = copy;
+    node->entry_count  = entry_count;
+    node->identity     = (uint64_t)(uintptr_t)function_table;
+    node->callback     = 0;
+    node->context      = 0;
+
+    uint64_t flags;
+    spin_lock_irqsave(&s_dft_lock, &flags);
+    if (s_dft_count >= UNWIND_MAX_DYNAMIC_TABLES ||
+        dft_overlaps_locked(node->min_address, node->max_address) ||
+        dft_identity_exists_locked(node->identity)) {
+        spin_unlock_irqrestore(&s_dft_lock, flags);
+        kfree(copy);
+        kfree(node);
+        return 0;
+    }
+    dft_insert_locked(node);
+    spin_unlock_irqrestore(&s_dft_lock, flags);
+    return 1;
+}
+
+int RtlInstallFunctionTableCallback(uint64_t table_identifier, uint64_t base_address,
+                                    uint32_t length, PGET_RUNTIME_FUNCTION_CALLBACK callback,
+                                    void *context, const char *out_of_process_dll)
+{
+    /* Low 2 bits set = callback-table convention; out-of-process unsupported. */
+    if (!callback || base_address == 0 || length == 0 || out_of_process_dll != 0)
+        return 0;
+    if ((table_identifier & 3u) != 3u)
+        return 0;
+    if (base_address + length < base_address)
+        return 0;   /* range would wrap the address space */
+
+    dyn_func_table_t *node = (dyn_func_table_t *)kmalloc(sizeof(*node));
+    if (!node)
+        return 0;
+    node->base_address = base_address;
+    node->min_address  = base_address;
+    node->max_address  = base_address + length;
+    node->functions    = 0;
+    node->entry_count  = 0;
+    node->identity     = table_identifier;
+    node->callback     = callback;
+    node->context      = context;
+
+    uint64_t flags;
+    spin_lock_irqsave(&s_dft_lock, &flags);
+    if (s_dft_count >= UNWIND_MAX_DYNAMIC_TABLES ||
+        dft_overlaps_locked(node->min_address, node->max_address) ||
+        dft_identity_exists_locked(node->identity)) {
+        spin_unlock_irqrestore(&s_dft_lock, flags);
+        kfree(node);
+        return 0;
+    }
+    dft_insert_locked(node);
+    spin_unlock_irqrestore(&s_dft_lock, flags);
+    return 1;
+}
+
+/* Shared teardown for both delete keys. Returns 1 if a node was removed. */
+static int dft_delete_by_identity(uint64_t identity)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&s_dft_lock, &flags);
+    dyn_func_table_t **pp = &s_dft_head;
+    dyn_func_table_t *node = 0;
+    while (*pp) {
+        if ((*pp)->identity == identity) {
+            node = *pp;
+            *pp = node->next;   /* unlink under the lock */
+            s_dft_count--;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    spin_unlock_irqrestore(&s_dft_lock, flags);
+    if (!node)
+        return 0;
+
+    /* The node is unlinked, so no new lookup can reach it, and an in-flight
+     * callback lookup holds only local copies of the callback/context (never the
+     * node), so the free is safe immediately -- including when this delete is
+     * issued from within that very callback (self-unregister does not stall). */
+    if (node->functions)
+        kfree(node->functions);
+    kfree(node);
+    return 1;
+}
+
+int RtlDeleteFunctionTable(PRUNTIME_FUNCTION function_table)
+{
+    if (!function_table)
+        return 0;
+    return dft_delete_by_identity((uint64_t)(uintptr_t)function_table);
+}
+
+/* ==========================================================================
+ * RtlPcToFileHeader + init
+ * ========================================================================== */
+
+void *RtlPcToFileHeader(void *pc_value, void **base_of_image)
+{
+    loaded_module_t mod;
+    if (exec_find_module_by_pc((uint64_t)(uintptr_t)pc_value, &mod) != 0) {
+        if (base_of_image)
+            *base_of_image = 0;
+        return 0;
+    }
+    void *base = (void *)(uintptr_t)mod.base_address;
+    if (base_of_image)
+        *base_of_image = base;
+    return base;
+}
+
+/* ==========================================================================
+ * Kernel-mode stack walking (TODO-23 s7)
+ * ==========================================================================
+ * ARCH: x86-64 -- the RBP frame-chain layout ([RBP] = saved RBP, [RBP+8] =
+ * return address) is the AMD64 SysV/MS frame convention. Safety is the RIP-keyed
+ * fault-recovery read (__kstack_read_u64), not a stack-bounds table; the bounds
+ * below are correctness-only (bound fabricated frames). Design rationale + the
+ * four Codex design-review rounds behind it are in unwind.h's stack-walk block. */
+
+/* Correctness span backstop when the containing stack cannot be resolved (boot/
+ * loader/AP/IST): a kernel task/thread stack is 8 KiB and the BSP boot stack
+ * 16 KiB, so 64 KiB covers any real chain while keeping a corrupt monotonic RBP
+ * from wandering far into adjacent mapped memory. Safety does NOT depend on this
+ * -- every dereference is fault-recovered. */
+#define RTL_STACK_WALK_MAX_SPAN   0x10000u
+
+extern char __text_start[];
+extern char __text_end[];
+
+/* A recorded return address must land in kernel text -- filters fabricated
+ * frames a corrupt chain would synthesize from stack data. (The kernel currently
+ * links at 1 MiB, so the kernel image window is [__text_start, __text_end);
+ * MM_KERNEL_VIRT_BASE is the not-yet-live TODO-33 higher-half base and must NOT
+ * be used as a validity predicate here.)
+ *
+ * LOCK-FREE by construction -- must stay so: this runs on the crash / DISPATCH-
+ * LEVEL walk path, so it MUST NOT call RtlPcToFileHeader (-> exec_find_module_by_pc
+ * takes s_module_lock, which exec.c documents as NOT NMI-safe -- a walk from a
+ * context already holding it, or an NMI, would deadlock). Loaded-module frames
+ * (PE drivers) therefore stop the walk today; validating them needs a lock-free
+ * module-range snapshot owned by the kernel-image/module-registry loader-
+ * integration work. No PE kernel drivers load yet, so kernel-text-only
+ * validation loses nothing now. */
+static int rtlp_is_code_pc(uint64_t pc)
+{
+    uint64_t ts = (uint64_t)(uintptr_t)__text_start;
+    uint64_t te = (uint64_t)(uintptr_t)__text_end;
+    return (pc >= ts && pc < te);
+}
+
+/* Resolve the containing kernel stack [*lo,*hi) for a live RSP, ONLY when RSP
+ * actually falls inside a known stack -- so a stale thread_current()/task_current()
+ * (the per-CPU cursor is not yet live) cannot yield wrong-but-plausible bounds.
+ * Returns 1 on a hit, 0 when the stack is unknown (boot/loader/AP/IST or a
+ * synthetic test buffer) -- the caller then uses the RSP-anchored span backstop.
+ * Bounds are correctness-only; a guard page left inside the range is harmless
+ * because the read that lands on it is fault-recovered and stops the walk. */
+static int rtlp_kernel_stack_bounds(uint64_t rsp, uint64_t *lo, uint64_t *hi)
+{
+    struct thread *t = thread_current();
+    struct task *k = task_current();
+    uint64_t b, e;
+
+    if (t && t->kernel_stack_base && t->kernel_stack_pages) {
+        b = (uint64_t)(uintptr_t)t->kernel_stack_base;
+        e = b + (uint64_t)t->kernel_stack_pages * 4096u;
+        if (rsp >= b && rsp < e) { *lo = b; *hi = e; return 1; }
+    }
+    if (t && t->stack_base && t->stack_size) {
+        b = (uint64_t)(uintptr_t)t->stack_base;
+        e = b + (uint64_t)t->stack_size;
+        if (rsp >= b && rsp < e) { *lo = b; *hi = e; return 1; }
+    }
+    if (k && k->stack_base) {
+        b = (uint64_t)(uintptr_t)k->stack_base;
+        e = b + (uint64_t)TASK_STACK_SIZE;
+        if (rsp >= b && rsp < e) { *lo = b; *hi = e; return 1; }
+    }
+    return 0;
+}
+
+/* Core RBP-chain walk. rsp = lower bound / span origin (captured stack pointer),
+ * rbp = first candidate frame pointer. Every stack slot is read through the
+ * fault-safe __kstack_read_u64, so a corrupt RBP (unmapped / guard / freed /
+ * off-stack) terminates the walk instead of faulting. */
+static uint16_t rtlp_walk_rbp(uint64_t rsp, uint64_t rbp, uint32_t skip,
+                              uint32_t count, void **buf, uint32_t *hash_out)
+{
+    uint64_t lo, hi;
+    uint32_t captured = 0, skipped = 0, visited = 0, hash = 0;
+    uint64_t prev = 0;
+
+    if (count == 0 || !buf) {
+        if (hash_out) *hash_out = 0;
+        return 0;
+    }
+    /* Cap the number of frames the caller can actually store (RTL_MAX_STACK_FRAMES
+     * is our absolute walk ceiling; kernel stacks are far shallower). */
+    if (count > RTL_MAX_STACK_FRAMES)
+        count = RTL_MAX_STACK_FRAMES;
+    if (!rtlp_kernel_stack_bounds(rsp, &lo, &hi)) {
+        /* Span fallback for an unresolved stack. Reject a wrapping RSP explicitly
+         * -- an untrusted crash CONTEXT could carry an rsp near the top of the
+         * address space where rsp + SPAN wraps and hi - 16 underflows, defeating
+         * the containment bound. */
+        if (rsp > ~(uint64_t)0 - RTL_STACK_WALK_MAX_SPAN) {
+            if (hash_out) *hash_out = 0;
+            return 0;
+        }
+        lo = rsp;
+        hi = rsp + RTL_STACK_WALK_MAX_SPAN;
+    }
+    if (hi < lo + 16u) {   /* need room for a full [rbp, rbp+16) slot pair */
+        if (hash_out) *hash_out = 0;
+        return 0;
+    }
+
+    /* Bound TOTAL frames examined (skipped + captured), not just captured: a large
+     * skip must not walk the whole 64 KiB span doing two guarded reads + a
+     * code-PC check per frame. */
+    while (captured < count && visited < RTL_MAX_STACK_FRAMES) {
+        uint64_t saved_rbp, ret;
+
+        /* Frame-pointer validity: 8-aligned, at/above SP and inside the bound so
+         * [rbp, rbp+16) is in range (hi >= lo+16 proven above, so hi - 16u cannot
+         * underflow), strictly climbing (no cycle), and canonical -- a non-
+         * canonical [rbp, rbp+16) would #GP (not #PF) and escape the
+         * __kstack_read_u64 fixup, so reject it before the read. */
+        if (rbp & 0x7u)          break;
+        if (rbp < lo || rbp > hi - 16u) break;
+        if (rbp <= prev)         break;
+        if (!MM_IS_CANONICAL_4LVL(rbp) || !MM_IS_CANONICAL_4LVL(rbp + 15u)) break;
+
+        visited++;
+
+        /* Fault-safe reads: return address first, then the saved frame pointer. */
+        if (__kstack_read_u64(&ret, (const void *)(uintptr_t)(rbp + 8)) != 0)
+            break;
+        if (__kstack_read_u64(&saved_rbp, (const void *)(uintptr_t)rbp) != 0)
+            break;
+        if (ret == 0 || !rtlp_is_code_pc(ret))
+            break;
+
+        if (skipped < skip) {
+            skipped++;
+        } else {
+            buf[captured++] = (void *)(uintptr_t)ret;
+            hash = (hash << 5) + hash + (uint32_t)ret;   /* djb2-ish; deterministic */
+        }
+        prev = rbp;
+        rbp  = saved_rbp;
+    }
+
+    if (hash_out)
+        *hash_out = hash;
+    return (uint16_t)captured;
+}
+
+uint16_t rtl_capture_stack_from_context(const CONTEXT *context, uint32_t frames_to_skip,
+                                        uint32_t frames_to_capture, void **back_trace,
+                                        uint32_t *back_trace_hash)
+{
+    uint64_t rsp, rbp;
+
+    if (!context) {
+        if (back_trace_hash)
+            *back_trace_hash = 0;
+        return 0;
+    }
+    rsp = context->Rsp;
+    rbp = context->Rbp;
+    if (rbp < rsp)   /* a valid frame pointer is at or above the stack pointer */
+        rbp = rsp;
+    return rtlp_walk_rbp(rsp, rbp, frames_to_skip, frames_to_capture,
+                         back_trace, back_trace_hash);
+}
+
+__attribute__((noinline))
+uint16_t RtlCaptureStackBackTrace(uint32_t frames_to_skip, uint32_t frames_to_capture,
+                                  void **back_trace, uint32_t *back_trace_hash)
+{
+    uint64_t rsp;
+    /* This frame's RBP: [rbp+8] is the return address into our CALLER, so
+     * frames_to_skip == 0 records the caller first (Windows semantics). Requires
+     * -fno-omit-frame-pointer (kernel-wide) and noinline (stable own frame). */
+    uint64_t rbp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
+    __asm__ volatile ("movq %%rsp, %0" : "=r"(rsp));
+    return rtlp_walk_rbp(rsp, rbp, frames_to_skip, frames_to_capture,
+                         back_trace, back_trace_hash);
+}
+
+__attribute__((noinline))
+uint32_t RtlWalkFrameChain(void **callers, uint32_t count, uint32_t flags)
+{
+    uint64_t rsp, rbp;
+
+    if (flags & RTL_STACK_WALK_USER_MODE) {
+        /* User-mode walk needs the current thread's saved ring-3 CONTEXT to source
+         * the user RSP/RBP; no such accessor exists from kernel mode yet. Deferred
+         * (the read mechanism would use the s13 fault-safe user path). */
+        return 0;
+    }
+    /* Frames-to-skip is encoded in the upper flag bits (ntdll convention). */
+    rbp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
+    __asm__ volatile ("movq %%rsp, %0" : "=r"(rsp));
+    return (uint32_t)rtlp_walk_rbp(rsp, rbp, flags >> RTL_STACK_WALK_SKIP_SHIFT,
+                                   count, callers, 0);
+}
+
+uint32_t rtl_unwind_dynamic_table_count(void)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&s_dft_lock, &flags);
+    uint32_t c = s_dft_count;
+    spin_unlock_irqrestore(&s_dft_lock, flags);
+    return c;
+}
+
+void rtl_unwind_init(void)
+{
+    if (s_unwind_ready)
+        return;
+    s_unwind_ready = 1;
+    klog(LOG_INFO, "rtl",
+         "rtl: unwind engine ready (dynamic tables: %u, kernel .pdata: ELF none)",
+         (uint64_t)s_dft_count);
+}
+
+/* ==========================================================================
+ * RtlUnwindEx -- unwind to a target frame
+ * ==========================================================================
+ * Two passes, both driven by RtlLookupFunctionEntry + RtlVirtualUnwind (the
+ * shipped engine): a no-side-effect PREFLIGHT that proves the chain reaches the
+ * target with well-formed, monotone frames, then an EXECUTE pass that invokes
+ * each intermediate frame's __finally termination handler with EXCEPTION_UNWINDING
+ * set. Splitting the validation out means a malformed or unreachable chain fails
+ * BEFORE any irreversible cleanup runs -- a post-hoc check cannot un-run a
+ * __finally. Proven against synthetic RtlAddFunctionTable tables (the ELF kernel
+ * has no .pdata); real kernel-driver __finally handlers arrive with the kernel-
+ * mode SEH scope-table walker follow-up.
+ * ========================================================================== */
+
+/* Frame ceiling for one unwind (runaway / cyclic chain guard). */
+#define UNWIND_MAX_UNWIND_FRAMES   RTL_MAX_STACK_FRAMES
+
+/* Minimum kernel-stack headroom the unwind call chain needs before it starts.
+ * The compiled preflight peak (rtl_unwind_to_target + noinline preflight's probe
+ * CONTEXT + RtlVirtualUnwind + exec_find_module_by_pc) is ~2.8 KiB; require 4 KiB
+ * so a deeply-consumed 8 KiB stack fails SAFE at entry rather than hitting the
+ * guard page mid-walk. Skipped when the containing stack is unknown (a synthetic
+ * test buffer / boot context), where no bound can be computed. */
+#define RTL_UNWIND_MIN_STACK   0x1000u
+
+/* Unwind-in-progress flags cleared on the record once the target is reached. */
+#define UNWIND_INPROGRESS_FLAGS \
+    ((uint32_t)(EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND | EXCEPTION_TARGET_UNWIND))
+
+/* One frame step: look up ctx->Rip's function entry and virtual-unwind ctx to
+ * its caller (requesting the UNW_FLAG_UHANDLER termination handler). Returns 1
+ * on a successful step (ctx advanced to the caller; *handler is the handler VA
+ * or NULL), 0 at a leaf / unknown PC (no function entry; ctx NOT advanced). */
+static int rtlp_unwind_step(CONTEXT *ctx, void **handler, uint64_t *establisher,
+                            uint64_t *image_base, PRUNTIME_FUNCTION *func_entry,
+                            void **handler_data)
+{
+    uint64_t ib = 0, est = 0;
+    void *hd = 0;
+    PRUNTIME_FUNCTION e = RtlLookupFunctionEntry(ctx->Rip, &ib, 0);
+    if (!e)
+        return 0;
+    void *h = RtlVirtualUnwind(UNW_FLAG_UHANDLER, ib, ctx->Rip, e, ctx,
+                               &hd, &est, 0);
+    *handler = h;
+    *establisher = est;
+    *image_base = ib;
+    *func_entry = e;
+    *handler_data = hd;
+    return 1;
+}
+
+/* Invoke one frame's termination handler with EXCEPTION_UNWINDING set and
+ * interpret the returned disposition. Returns 1 to continue the unwind, 0 on a
+ * reported collided unwind (*collided set; caller adopts dctx state), -1 on an
+ * invalid disposition (caller fails safe). The full nested/multi-scope collided-
+ * unwind recovery is owned by the kernel-mode SEH walker follow-up; this handles
+ * a single-level collision safely instead of silently double-running cleanup. */
+static int rtlp_call_termination_handler(PEXCEPTION_ROUTINE handler,
+                                         EXCEPTION_RECORD *rec, uint64_t establisher_frame,
+                                         CONTEXT *ctx, DISPATCHER_CONTEXT *dctx,
+                                         int *collided)
+{
+    EXCEPTION_DISPOSITION disp =
+        handler((struct _EXCEPTION_RECORD *)rec, (void *)(uintptr_t)establisher_frame,
+                (struct _CONTEXT *)ctx, (struct _DISPATCHER_CONTEXT *)dctx);
+    switch (disp) {
+    case ExceptionContinueSearch:
+        return 1;   /* the normal __finally return */
+    case ExceptionCollidedUnwind:
+        rec->ExceptionFlags |= (uint32_t)EXCEPTION_COLLIDED_UNWIND;
+        *collided = 1;
+        return 0;
+    default:
+        /* ExceptionContinueExecution / ExceptionNestedException / garbage are all
+         * invalid on the unwind pass -- only ContinueSearch and CollidedUnwind
+         * are legal dispositions while EXCEPTION_UNWINDING is set. */
+        return -1;
+    }
+}
+
+/* Preflight: walk a COPY of the chain WITHOUT side effects, confirming it
+ * reaches target (0 = exit unwind, whole stack) with strictly-ascending frames
+ * and RSP and no overshoot. Returns STATUS_SUCCESS if reachable, else
+ * STATUS_BAD_STACK. */
+/* noinline: keep the 1232-byte probe CONTEXT in this transient frame (freed
+ * before the execute pass), so a termination handler never runs with the probe's
+ * stack still live -- the deep-fault stack-headroom mitigation. */
+static __attribute__((noinline)) NTSTATUS
+rtlp_unwind_preflight(uint64_t target, const CONTEXT *start)
+{
+    CONTEXT probe = *start;
+    uint64_t prev_est = 0, prev_rsp = probe.Rsp;
+    int reached = 0;   /* caller rejects target == 0; a target is always required */
+    for (unsigned i = 0; i < UNWIND_MAX_UNWIND_FRAMES; i++) {
+        void *h = 0, *hd = 0;
+        uint64_t est = 0, ib = 0;
+        PRUNTIME_FUNCTION fe = 0;
+        if (!rtlp_unwind_step(&probe, &h, &est, &ib, &fe, &hd)) {
+            /* Leaf / unknown PC: top of stack. For a targeted unwind that means
+             * the target frame was never found -> unreachable. */
+            break;
+        }
+        if (i > 0 && est <= prev_est)         /* frames must strictly ascend */
+            return STATUS_BAD_STACK;
+        if (probe.Rsp <= prev_rsp)            /* RSP must strictly ascend */
+            return STATUS_BAD_STACK;
+        if (target != 0 && est > target)      /* overshot the target frame */
+            return STATUS_BAD_STACK;
+        prev_est = est;
+        prev_rsp = probe.Rsp;
+        if (target != 0 && est == target) {
+            reached = 1;
+            break;
+        }
+    }
+    return reached ? STATUS_SUCCESS : STATUS_BAD_STACK;
+}
+
+/* Compact control+integer snapshot -- the ONLY groups RtlRestoreContext restores.
+ * The unwind runs on an 8 KiB kernel stack at arbitrary fault depth, so a full
+ * 1232-byte CONTEXT per frame is dangerous headroom; this ~140-byte snapshot of
+ * each frame (needed only to resume the target frame + supply dctx.ControlPc)
+ * keeps the peak footprint well under the stack budget. GPRs are the 16 contiguous
+ * Rax..R15 slots (pinned by the _Static_asserts above). */
+typedef struct rtlp_frame_regs {
+    uint64_t gpr[16];   /* Rax..R15 in CONTEXT order */
+    uint64_t rip;
+    uint32_t eflags;
+} rtlp_frame_regs_t;
+
+static inline void rtlp_snapshot_regs(const CONTEXT *ctx, rtlp_frame_regs_t *fr)
+{
+    for (unsigned i = 0; i < 16; i++)
+        fr->gpr[i] = (&ctx->Rax)[i];
+    fr->rip = ctx->Rip;
+    fr->eflags = ctx->EFlags;
+}
+
+static inline void rtlp_restore_regs(CONTEXT *ctx, const rtlp_frame_regs_t *fr)
+{
+    for (unsigned i = 0; i < 16; i++)
+        (&ctx->Rax)[i] = fr->gpr[i];
+    ctx->Rip = fr->rip;
+    ctx->EFlags = fr->eflags;
+}
+
+NTSTATUS rtl_unwind_to_target(void *target_frame, void *target_ip,
+                              EXCEPTION_RECORD *exception_record, void *return_value,
+                              CONTEXT *context_record, void *history_table,
+                              uint32_t *out_finally_count)
+{
+    if (out_finally_count)
+        *out_finally_count = 0;
+    if (!exception_record || !context_record)
+        return STATUS_INVALID_PARAMETER;
+
+    const uint64_t target = (uint64_t)(uintptr_t)target_frame;
+    const uint64_t target_ip_val = (uint64_t)(uintptr_t)target_ip;
+    /* A whole-stack EXIT unwind (target_frame == NULL) resumes nowhere -- it is a
+     * thread-termination primitive with no consumer wired yet, and resuming
+     * through a NULL target_ip would jump to address 0. Reject both until an
+     * exit-unwind consumer + terminal outcome exist (filed follow-up). */
+    if (target == 0 || target_ip_val == 0) {
+        /* Also clear any unwind bits a reused/nested record entered with, so a
+         * rejected request never leaves the record marked actively unwinding. */
+        exception_record->ExceptionFlags &= ~UNWIND_INPROGRESS_FLAGS;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Normalize the record's unwind bits at entry: a reused/nested record may
+     * arrive with a stale EXCEPTION_TARGET_UNWIND / EXIT_UNWIND set, which exited-
+     * frame handlers would otherwise observe BEFORE the real target is reached
+     * (and run the wrong cleanup scopes irreversibly). Clear all in-progress bits
+     * up front; TARGET_UNWIND is re-set only at the target frame below. */
+    exception_record->ExceptionFlags &= ~UNWIND_INPROGRESS_FLAGS;
+
+    /* Refuse the unwind if this deeply-consumed stack lacks headroom for the
+     * ~2.8 KiB unwind call chain -- fail SAFE before consuming it, never mid-walk
+     * against the guard page. BEST-EFFORT: it runs after this function's small C
+     * prologue, treats the resolver's bounds as usable (the guard page sits a page
+     * below), and is skipped when the stack is unknown. A guard-page-aware bound +
+     * an asm entry trampoline before ANY prologue (or an emergency unwind stack) is
+     * the tracked full hardening; there is no ring-0 RtlUnwindEx caller yet, so
+     * best-effort is the shipping mitigation. */
+    {
+        uint64_t cur_rsp = 0, slo = 0, shi = 0;
+        __asm__ volatile ("movq %%rsp, %0" : "=r"(cur_rsp));
+        if (rtlp_kernel_stack_bounds(cur_rsp, &slo, &shi) &&
+            cur_rsp - slo < RTL_UNWIND_MIN_STACK)
+            return STATUS_BAD_STACK;   /* flags already normalized -> clean return */
+    }
+
+    /* Mark the unwind in progress on the (now-normalized) record. */
+    exception_record->ExceptionFlags |= (uint32_t)EXCEPTION_UNWINDING;
+
+    /* Pass 1: validate reachability with no side effects (fail before any cleanup). */
+    NTSTATUS pf = rtlp_unwind_preflight(target, context_record);
+    if (!NT_SUCCESS(pf)) {
+        exception_record->ExceptionFlags &= ~UNWIND_INPROGRESS_FLAGS;
+        return pf;   /* GUARANTEE: no __finally ran */
+    }
+
+    /* Pass 2: execute -- unwind context_record for real, running the __finally
+     * termination handler of each EXITED frame, then the TARGET frame's handler
+     * with EXCEPTION_TARGET_UNWIND (so it can run the __finally of scopes exited
+     * within the target function), and finally resume in the target frame's own
+     * context at target_ip. The preflight invariants are re-checked here too: a
+     * handler that adopted a collided context could otherwise redirect the walk
+     * backward or into a cycle before the frame cap. */
+    uint32_t finally_count = 0;
+    int reached = 0;
+    NTSTATUS status = STATUS_BAD_STACK;   /* until reached */
+    uint64_t prev_est = 0, prev_rsp = context_record->Rsp;
+    /* Only ONE full CONTEXT (frame_ctx below) lives in this frame -- the target
+     * frame's own snapshot doubles as the resume context. Kernel stacks are 8 KiB
+     * and faults occur at arbitrary depth, so a second 1232-byte CONTEXT here is
+     * dangerous headroom. */
+    for (unsigned i = 0; i < UNWIND_MAX_UNWIND_FRAMES; i++) {
+        void *h = 0, *hd = 0;
+        uint64_t est = 0, ib = 0;
+        PRUNTIME_FUNCTION fe = 0;
+        rtlp_frame_regs_t frame_regs;          /* compact resume snapshot of THIS frame */
+        rtlp_snapshot_regs(context_record, &frame_regs);
+        if (!rtlp_unwind_step(context_record, &h, &est, &ib, &fe, &hd)) {
+            /* Metadata-free frame before the target -> the target is unreachable. */
+            status = STATUS_BAD_STACK;
+            goto done;
+        }
+
+        /* Re-validate the same monotonicity/overshoot invariants preflight used. */
+        if ((i > 0 && est <= prev_est) || context_record->Rsp <= prev_rsp || est > target) {
+            status = STATUS_BAD_STACK;
+            goto done;
+        }
+        prev_est = est;
+        prev_rsp = context_record->Rsp;
+
+        const int at_target = (est == target);
+        if (at_target)
+            exception_record->ExceptionFlags |= (uint32_t)EXCEPTION_TARGET_UNWIND;
+
+        if (h) {
+            DISPATCHER_CONTEXT dctx = { 0 };
+            dctx.ControlPc = frame_regs.rip;
+            dctx.ImageBase = ib;
+            dctx.FunctionEntry = fe;
+            dctx.EstablisherFrame = est;
+            dctx.TargetIp = target_ip_val;
+            dctx.ContextRecord = context_record;   /* one canonical live unwind context */
+            dctx.LanguageHandler = (PEXCEPTION_ROUTINE)h;
+            dctx.HandlerData = hd;
+            dctx.HistoryTable = history_table;
+            dctx.ScopeIndex = 0;
+
+            int collided = 0;
+            int r = rtlp_call_termination_handler((PEXCEPTION_ROUTINE)h, exception_record,
+                                                  est, context_record, &dctx, &collided);
+            finally_count++;
+            if (r < 0) {
+                status = STATUS_INVALID_DISPOSITION;
+                goto done;
+            }
+            if (collided) {
+                /* A collision IN the target frame cannot be honoured by the
+                 * single-level adopt -- we would resume at the original target_ip
+                 * with the nested unwind's state discarded. Full nested recovery
+                 * is deferred; fail safe rather than resume with wrong state. */
+                if (at_target) {
+                    status = STATUS_INVALID_DISPOSITION;
+                    goto done;
+                }
+                /* Only an IN-PLACE modification of the working context is the
+                 * supported single-level adopt. A handler that REPOINTS
+                 * dctx.ContextRecord at a different, handler-controlled buffer is
+                 * the deferred nested collided protocol -> fail safe rather than
+                 * dereference (copy through) an untrusted pointer. */
+                if (dctx.ContextRecord != context_record) {
+                    status = STATUS_BAD_STACK;
+                    goto done;
+                }
+                /* Validate the in-place-adopted state BEFORE the next step
+                 * dereferences its RSP/frame: no non-canonical RIP, no backward or
+                 * wild-forward RSP (bounded to a forward span of the pre-adopt RSP,
+                 * the stack-walk backstop). A forged-but-in-span unmapped RSP is
+                 * still the engine's trusted-establisher-frame boundary: fault-safe
+                 * reads for a fully untrusted context are the deferred follow-up. */
+                if (!MM_IS_CANONICAL_4LVL(context_record->Rip) ||
+                    context_record->Rsp < prev_rsp ||
+                    context_record->Rsp - prev_rsp > (uint64_t)RTL_STACK_WALK_MAX_SPAN) {
+                    status = STATUS_BAD_STACK;
+                    goto done;
+                }
+            }
+        }
+
+        if (at_target) {
+            reached = 1;
+            status = STATUS_SUCCESS;
+            /* Resume in the target frame: restore its control+integer snapshot
+             * into the working CONTEXT (segments/FP stay the caller's originals,
+             * which RtlRestoreContext ignores), then set target_ip + return_value. */
+            rtlp_restore_regs(context_record, &frame_regs);
+            context_record->Rip = target_ip_val;
+            context_record->Rax = (uint64_t)(uintptr_t)return_value;
+            goto done;
+        }
+    }
+    /* Frame cap exhausted without reaching the target -- fail safe. */
+    status = STATUS_BAD_STACK;
+
+done:
+    /* Single cleanup exit: ALWAYS clear the flags and report the number of
+     * __finally handlers that ran -- the public RtlUnwindEx uses a non-zero count
+     * to know a post-cleanup failure is terminal (cannot return to the caller). */
+    exception_record->ExceptionFlags &= ~UNWIND_INPROGRESS_FLAGS;
+    if (out_finally_count)
+        *out_finally_count = finally_count;
+    (void)reached;
+    return status;
+}
+
+void RtlUnwindEx(void *target_frame, void *target_ip, EXCEPTION_RECORD *exception_record,
+                 void *return_value, CONTEXT *context_record, void *history_table)
+{
+    uint32_t finally_count = 0;
+    NTSTATUS s = rtl_unwind_to_target(target_frame, target_ip, exception_record,
+                                      return_value, context_record, history_table,
+                                      &finally_count);
+    if (NT_SUCCESS(s))
+        RtlRestoreContext(context_record, exception_record);   /* does not return */
+
+    if (finally_count > 0) {
+        /* One or more __finally handlers already ran, THEN the unwind failed
+         * (invalid disposition, target-frame collision, or a rejected adopted
+         * context). Returning to the original caller would resume execution on a
+         * partially cleaned-up stack -- double cleanup / use-after-free. An unwind
+         * failure past the point of no return is terminal: a full system raises
+         * `s` via RtlRaiseStatus into second-chance dispatch; until that path
+         * exists it bugchecks. */
+        KeBugCheckEx(BUGCHECK_KMODE_EXCEPTION_NOT_HANDLED, (uint64_t)(uint32_t)s,
+                     (uint64_t)finally_count, (uint64_t)(uintptr_t)target_frame,
+                     (uint64_t)(uintptr_t)target_ip);   /* does not return */
+    }
+
+    /* Preflight failure: NO __finally ran, so returning is the documented
+     * fail-safe (a full system would RtlRaiseStatus; kernel-internal callers
+     * inspect the return). Log so a silent no-op unwind is visible on serial. */
+    klog(LOG_ERROR, "rtl", "RtlUnwindEx: unreachable pre-cleanup (status 0x%x)",
+         (uint64_t)(uint32_t)s);
+}

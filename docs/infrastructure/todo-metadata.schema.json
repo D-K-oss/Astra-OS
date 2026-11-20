@@ -1,0 +1,121 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://impossible-os/docs/infrastructure/todo-metadata.schema.json",
+    "title": "Impossible OS TODO Frontmatter",
+    "description": "Canonical schema for the YAML frontmatter block carried by every file under todo/**/*.md. Mirrors docs/infrastructure/todo-metadata.md (the human-readable spec). Programmatic validators (the generator at scripts/todo-graph/build.py, CI lint via remark-lint-frontmatter-schema, ad-hoc jsonschema.validate calls) follow the per-file $schema field to load this sidecar. The stock Red Hat YAML language server does NOT auto-detect $schema as a schema directive in markdown frontmatter; editor-time diagnostics require remark-lint-frontmatter-schema or markdown-yaml-embedded-langservers. The §6 CI gate in todo/00-infrastructure/TODO-06-todo-metadata-layer.md is the authoritative line of defense.",
+    "type": "object",
+    "additionalProperties": true,
+    "required": [
+        "schema_version",
+        "id",
+        "domain",
+        "status",
+        "title"
+    ],
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "Relative path to this JSON Schema file. Programmatic validators (the generator, CI lint, ad-hoc jsonschema calls) follow it. The stock Red Hat YAML language server does NOT auto-detect this as a schema directive in markdown frontmatter; editor-time diagnostics require remark-lint-frontmatter-schema or markdown-yaml-embedded-langservers. Recommended to set even though optional."
+        },
+        "schema_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1,
+            "description": "Schema generation. Currently constrained to exactly 1. Bumped only on a NON-additive change (rename, removal, semantic shift); adding a new optional field does NOT bump it. The maximum tracks the current generator + schema together so editors and the generator agree on what is valid (no version-skew split brain)."
+        },
+        "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,58}[a-z0-9]$",
+            "description": "Globally unique identifier across all domains. Lowercase kebab-case, 2-60 chars, must start with a letter, must not end with a dash. Stable across renumbering: renaming a TODO file does NOT change its id."
+        },
+        "domain": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Directory short name (folder under todo/). Matches the file's parent directory by convention but is recorded explicitly so the cache schema is self-describing."
+        },
+        "status": {
+            "type": "string",
+            "enum": [
+                "draft",
+                "active",
+                "blocked",
+                "done",
+                "superseded"
+            ],
+            "description": "Lifecycle state. Validator gates status: done against every Implementation Order row being [x]."
+        },
+        "title": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Human-readable short name. May differ from the H1 heading for length reasons (the H1 is preserved for in-page display)."
+        },
+        "owners": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "description": "Free-form list of handles, roles, or team names. NOT enforced; advisory."
+        },
+        "depends_on": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{0,58}[a-z0-9]$"
+            },
+            "uniqueItems": true,
+            "description": "Structural dependencies on other TODO ids. The validator builds a digraph from this field and rejects cycles."
+        },
+        "satisfies": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{0,58}[a-z0-9]$"
+            },
+            "uniqueItems": true,
+            "description": "List of ids that this TODO closes when its status flips to done. Powers auto-closure propagation in the validator (gated by full acceptance)."
+        },
+        "superseded_by": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,58}[a-z0-9]$",
+            "description": "Single id. Set when this TODO's status is superseded. Validator surfaces a chain when traversing supersession."
+        },
+        "file_patterns": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "uniqueItems": true,
+            "description": "Glob patterns marking source paths this TODO owns. Linux MAINTAINERS-style F: parity. Powers the code <id> query (query-CLI section)."
+        },
+        "effort": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*[dw]$",
+            "not": {
+                "pattern": "[\\r\\n]"
+            },
+            "$comment": "The `not` clause is load-bearing and is NOT redundant with the anchored pattern. JSON Schema does not pin a regex engine, and the two that validate this file disagree on `$`: ECMA-262 without the `m` flag anchors at end-of-input, but Python's `re` -- which jsonschema.Draft202012Validator uses, the validation path docs/infrastructure/todo-metadata.md documents -- also matches immediately before a trailing newline, so `^[1-9][0-9]*[dw]$` ACCEPTS \"2w\\n\" there. cache_schema.EFFORT_REGEX refuses it via `\\Z`, so without this clause the schema would approve a value build.py rejects, which is the exact two-layer divergence this property exists to prevent (Codex consistency review of the cache-format identity work, [medium]). An explicit CR/LF exclusion says the same thing in every engine.",
+            "description": "Gantt row duration read by the visualization emitter: whole days or whole weeks, e.g. '3d' or '2w'. Deliberately narrower than Mermaid's full duration grammar -- every unit this rejects is one that cannot reach the emitted gantt line, and the renderer interpolates the value directly into a row. Absent means the renderer's 1w default; a present-but-invalid value FAILS the build rather than defaulting, because a silent default hides a typo behind a plausible schedule. This property is load-bearing because additionalProperties is true here: without it, editor-time and ad-hoc jsonschema validation would approve effort values (null, 7, '4mo') that scripts/todo-graph/build.py refuses, which is precisely the two-layer split this schema exists to keep honest."
+        }
+    },
+    "not": {
+        "anyOf": [
+            {
+                "required": [
+                    "created_at"
+                ]
+            },
+            {
+                "required": [
+                    "last_active_at"
+                ]
+            },
+            {
+                "required": [
+                    "stamped_items"
+                ]
+            }
+        ]
+    },
+    "$comment": "created_at, last_active_at and stamped_items are cache-only fields the generator computes (the first two from git log, the third from the per-item cache extension); they MUST NOT appear in hand-authored frontmatter. The not/anyOf clause enforces that contract at the schema layer. stamped_items was missing from the clause while scripts/todo-graph/build.py refused it, so the schema approved a TODO the generator rejects -- the two-layer split holding in one direction only."
+}

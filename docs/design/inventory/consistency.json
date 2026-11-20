@@ -1,0 +1,116 @@
+[
+ {
+  "id": "context-menus",
+  "kind": "look",
+  "question": "What does a right-click show?",
+  "variants": [
+   "win11.desktop.menu",
+   "win11.desktop.file-menu",
+   "win11.desktop.folder-menu",
+   "win11.desktop.shortcut-menu",
+   "win11.desktop.recycle-bin-menu",
+   "win11.desktop.classic-menu",
+   "win11.desktop.classic-file-menu",
+   "win11.desktop.classic-folder-menu",
+   "win11.desktop.classic-shortcut-menu",
+   "win11.desktop.classic-recycle-bin-menu"
+  ],
+  "rule": "One menu holds every verb, grouped and ordered by one scheme; no second menu sits behind a more-options entry.",
+  "reason": "The reference shows a modern menu with a classic menu behind it, and a verb can be in either."
+ },
+ {
+  "id": "dialog-generations",
+  "kind": "look",
+  "question": "What frame does a dialog have?",
+  "variants": [],
+  "rule": "One dialog frame, one button order and one spacing scale, for every dialog.",
+  "reason": "The reference has property sheets, task dialogs and modern content dialogs, each with its own layout and button order."
+ },
+ {
+  "id": "title-bars",
+  "kind": "look",
+  "question": "How tall is a title bar and what do its caption buttons look like?",
+  "variants": [
+   "win11.window.classic-title-bar.title-bar-height",
+   "win11.window.settings-title-bar.title-bar-height",
+   "win11.window.explorer-title-bar.title-bar-height",
+   "win11.window.notepad-title-bar.title-bar-height",
+   "win11.window.dialog.title-bar-height",
+   "win11.window.tool-window.title-bar-height"
+  ],
+  "rule": "One title bar height per density and one caption button style.",
+  "reason": "Measured on 26300.9974 at 100%: 31 px for a classic frame and 31 for a dialog, 28 for a tool window, 33 for Settings, 40 for File Explorer and 42 for Notepad; caption buttons are 47 by 30 except Settings' 46 by 32."
+ },
+ {
+  "id": "control-metrics",
+  "kind": "look",
+  "question": "What radius, focus rectangle, scroll bar, tooltip and menu font does a control use?",
+  "variants": [],
+  "rule": "The token in tokens.json, in every program.",
+  "reason": "These differ between the old and the new programs of the reference."
+ },
+ {
+  "id": "dark-mode",
+  "kind": "look",
+  "question": "Does a surface follow the dark theme?",
+  "variants": [],
+  "rule": "Every surface follows the theme.",
+  "reason": "Some dialogs and tools of the reference stay light in dark mode."
+ },
+ {
+  "id": "keyboard-access",
+  "kind": "look",
+  "question": "Can a command be reached by an access key?",
+  "variants": [],
+  "rule": "Every command has an access key and every page is reachable by keyboard alone.",
+  "reason": "Old dialogs of the reference have access keys and new pages do not."
+ },
+ {
+  "id": "tool-frame",
+  "kind": "look",
+  "question": "What frame does a management console have?",
+  "variants": [],
+  "rule": "Each console stays a separate tool under its own name, in one tool frame with the one dialog style.",
+  "reason": "Device Manager, Disk Management, Services, Event Viewer, Task Scheduler and Computer Management each keep an older frame of their own."
+ },
+ {
+  "id": "settings-home",
+  "kind": "home",
+  "question": "Where does a setting live?",
+  "variants": [],
+  "rule": "Settings is the one program and holds every setting. No Control Panel window is built; its name and entry points open the matching Settings page. A Control Panel-only setting joins the Settings page whose captured related-settings link opens it, in a group at the foot of that page.",
+  "reason": "The reference reaches the same setting in Settings and in Control Panel with two layouts, and keeps some settings only in Control Panel or an old property sheet.",
+  "design": "shell.md#settings-and-control-panel-frame"
+ },
+ {
+  "id": "hello-enrolment",
+  "kind": "flow",
+  "question": "How is a sign-in method enrolled?",
+  "variants": [],
+  "rule": "One enrolment flow behind the four captured entry points.",
+  "reason": "The reference enrols a PIN, a face, a fingerprint and a security key through four different wizards.",
+  "design": "shell.md#sign-in-method-enrolment"
+ },
+ {
+  "id": "glass-material",
+  "kind": "look",
+  "question": "What fills a shell surface or a window frame?",
+  "variants": [],
+  "rule": "A slight frosted glass, the one deliberate visual difference from the reference: shell surfaces and the active window's frame (title bar, navigation pane, dialog, tooltip) are glass with the values of tokens.json; content areas are solid. The shape, radius, border, text and icons of a glass surface match the reference exactly; only its fill is ours.",
+  "reason": "The reference fills title bars with a wallpaper tint in new programs and a flat colour in old ones, and menus and flyouts with a different translucent material; the operator chose one glass for all of them on 2026-11-14.",
+  "design": "shell.md#materials"
+ },
+ {
+  "id": "resize-borders",
+  "kind": "look",
+  "question": "Where does a window's edge resize it?",
+  "variants": [
+   "win11.window.classic-title-bar.resize-outside",
+   "win11.window.settings-title-bar.resize-outside",
+   "win11.window.explorer-title-bar.resize-outside",
+   "win11.window.notepad-title-bar.resize-outside"
+  ],
+  "rule": "Every window resizes from the same band: 7 px outside its border and the border itself, 7 px below its bottom border and the top 8 rows, the classic frame's values.",
+  "reason": "Measured on 26300.9974 at 100%: the band outside the side border is 7 px for a classic frame, Settings and File Explorer and 5 for Notepad, and Settings starts its top band 3 rows down."
+ }
+]

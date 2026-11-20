@@ -1,0 +1,274 @@
+/* ============================================================================
+ * ob.h -- Object Manager core: OBJECT_HEADER, flags, macros, API
+ *
+ * Every kernel object body is preceded in memory by an OBJECT_HEADER.
+ * ob_alloc_object() returns a pointer to the body; the header is at
+ * body - sizeof(OBJECT_HEADER).
+ * ============================================================================ */
+
+#pragma once
+
+#include "kernel/types.h"
+#include "kernel/atomic.h"
+#include "kernel/boot_init.h"
+#include "kernel/ob/ob_type.h"
+#include "kernel/ob/handle_table.h"
+
+/* Forward-declare -- implemented in (security descriptor integration) */
+typedef struct security_descriptor SECURITY_DESCRIPTOR;
+
+/* --- Object flags -------------------------------------------------------- */
+
+#define OB_FLAG_PERMANENT    (1u << 0)  /* never deleted when refcount hits 0 */
+#define OB_FLAG_KERNEL_ONLY  (1u << 1)  /* not accessible from user mode */
+#define OB_FLAG_NAMED        (1u << 2)  /* object has a namespace entry */
+#define OB_FLAG_PMM_ALLOC    (1u << 3)  /* allocated via pmm_alloc_contiguous (not kmalloc) */
+#define OB_FLAG_TAIL_SD      (1u << 4)  /* alloc block has a tail-packed creator SD; count it when freeing pmm frames */
+
+/* --- OBJECT_HEADER ------------------------------------------------------- */
+
+/* Forward declaration for trace info */
+struct ob_trace_info;
+
+typedef struct object_header {
+    atomic_t             ref_count;     /* atomic reference count (SMP-safe) */
+    uint32_t             handle_count;  /* number of open handles */
+    const OBJECT_TYPE   *type;          /* type descriptor */
+    const char          *name;          /* namespace name (NULL if unnamed) */
+    SECURITY_DESCRIPTOR *security; /* NULL until */
+    struct ob_trace_info *trace; /* NULL unless type tracing enabled */
+    uint32_t             flags;         /* OB_FLAG_* */
+    uint32_t             _pad;          /* align body to 8 bytes */
+} OBJECT_HEADER;
+
+/* --- Pointer conversion macros ------------------------------------------- */
+
+#define OB_HEADER_FROM_BODY(body_ptr) \
+    ((OBJECT_HEADER *)((uint8_t *)(body_ptr) - sizeof(OBJECT_HEADER)))
+
+#define OB_BODY_FROM_HEADER(hdr_ptr) \
+    ((void *)((uint8_t *)(hdr_ptr) + sizeof(OBJECT_HEADER)))
+
+/* --- Limits -------------------------------------------------------------- */
+
+/* Capacity of the global registered-type table (g_ob_types[]). The table is
+ * append-only: types register once and live for the boot, so this is a hard
+ * ceiling, not a working-set size. Production registers ~16-20 real types
+ * (File/Process/Thread/Job/Section/Timer/Semaphore/Event/Mutant/Directory/
+ * SymbolicLink/Peb/Teb/...), and more are coming (tokens, ALPC ports, rlimit
+ * quota objects). Raised 32 -> 64 (2026-07-12): the Job Object type is a new
+ * permanent registration that, on top of the ob test suite's accumulated
+ * throwaway stress/type-test registrations in a single boot, tipped the table
+ * to 32/32 and failed "OB: namespace locking stress". 64 gives NT-scale
+ * headroom (real NT has ~40-70 types). Safe to grow: OBJECT_TYPES_INFORMATION
+ * .types[] is sized by this, but NtQueryObject(ObjectTypesInformation) is
+ * size-negotiated (writes number_of_types entries and returns the exact needed
+ * length), so a larger array never truncates or breaks a caller; there is no
+ * external user-mode consumer today. */
+#define OB_MAX_TYPES  64
+
+/* --- Built-in type singletons (populated by ob_init) --------------------- */
+
+extern const OBJECT_TYPE *ObpFileType;
+extern const OBJECT_TYPE *ObpProcessType;
+extern const OBJECT_TYPE *ObpThreadType;
+extern const OBJECT_TYPE *ObpDirectoryType;
+extern const OBJECT_TYPE *ObpSymlinkType;
+extern const OBJECT_TYPE *ObpEventType;
+extern const OBJECT_TYPE *ObpMutexType;
+extern const OBJECT_TYPE *ObpSemaphoreType;
+extern const OBJECT_TYPE *ObpSectionType;
+extern const OBJECT_TYPE *ObpTimerType;
+extern const OBJECT_TYPE *ObpTokenType;
+extern const OBJECT_TYPE *ObpPebType;
+extern const OBJECT_TYPE *ObpTebType;
+
+/* --- API ----------------------------------------------------------------- */
+
+/*
+ * ob_create_type -- register a new object type
+ *
+ * Copies *tmpl into the global type table.  Returns a pointer to the
+ * internal copy, or NULL if the table is full (OB_MAX_TYPES reached).
+ */
+const OBJECT_TYPE *ob_create_type(const OBJECT_TYPE *tmpl);
+
+/* Get registered type table (read-only) and count. */
+const OBJECT_TYPE *ob_get_types(uint32_t *out_count);
+
+/* Return the mutable stats slot for a registered type, or NULL for synthetic
+ * unregistered descriptors used by tests/internal fixtures. */
+OBJECT_TYPE *ob_type_stats_slot(const OBJECT_TYPE *type);
+
+/*
+ * ob_alloc_object -- allocate header + body as a single block
+ *
+ * Uses kmalloc for total sizes ≤ 4096, pmm_alloc_contiguous otherwise.
+ * The block is zero-filled; ref_count is initialised to 1; type is set.
+ * Returns a pointer to the body (not the header), or NULL on failure.
+ */
+void *ob_alloc_object(const OBJECT_TYPE *type);
+
+/*
+ * ObReferenceObject -- increment the reference count on an object body
+ */
+void ObReferenceObject(void *body);
+
+/*
+ * ObReferenceObjectSafe -- reference an object ONLY if it is still alive
+ * (ref_count > 0). Returns 0 on success, -1 if the object is already at count 0
+ * (being torn down). Use this (not the blind ObReferenceObject) on any path that
+ * obtains a body pointer it does NOT already hold a reference for -- e.g. a
+ * lookup that may race a concurrent last-handle close. The cmpxchg-if-nonzero
+ * loop is the NT ObReferenceObjectSafe pattern.
+ *
+ * PRECONDITION: the caller must keep the header ALLOCATION valid for the
+ * duration of the call (the safe-ref protects only against count-0 resurrection,
+ * not against the memory already being freed). For handle-table lookups this is
+ * the per-handle-table lock that the future `ObpReferenceObjectByHandle`
+ * primitive will hold; for namespace lookups it is the parent directory lock
+ * plus the directory entry's own reference.
+ */
+int ObReferenceObjectSafe(void *body);
+
+/*
+ * ObDereferenceObject -- decrement the reference count
+ *
+ * When the count reaches 0 and OB_FLAG_PERMANENT is not set:
+ *   1. Calls type->on_delete(body) if non-NULL
+ *   2. Frees the combined header+body allocation
+ * Returns the new reference count (0 means the object was freed).
+ */
+int32_t ObDereferenceObject(void *body);
+
+/*
+ * ObReferenceObjectByPointer -- validate type, then safe-reference
+ *
+ * Returns 0 on success. Returns -1 if EITHER the object's type does not match
+ * the expected type OR the object is already at count 0 (being torn down); in
+ * both cases the body is not referenced. Uses ObReferenceObjectSafe, so the
+ * same header-allocation-validity precondition applies (the caller pins the
+ * object's existence, e.g. via the handle-table or directory lock).
+ */
+int ObReferenceObjectByPointer(void *body, const OBJECT_TYPE *expected_type,
+                               uint32_t access);
+
+/*
+ * ObMakeTemporaryObject -- clear OB_FLAG_PERMANENT so the object can be
+ * deleted when its reference count reaches 0.
+ */
+void ObMakeTemporaryObject(void *body);
+
+/*
+ * ObSetSecurityDescriptor -- attach a self-relative SD to an object.
+ * The SD is stored as a pointer in the object header.  The caller
+ * retains ownership of the memory (use static blobs from default_sds
+ * or kmalloc'd copies).
+ */
+void ObSetSecurityDescriptor(void *body, SECURITY_DESCRIPTOR *sd);
+
+/*
+ * ObGetSecurityDescriptor -- return the SD attached to an object.
+ * Returns NULL if no SD is set.
+ */
+SECURITY_DESCRIPTOR *ObGetSecurityDescriptor(void *body);
+
+/* --- NtClose / NtDuplicateObject / NtQueryObject ------------------------- */
+
+#define DUPLICATE_CLOSE_SOURCE  0x00000001
+#define DUPLICATE_SAME_ACCESS   0x00000002
+
+/* Object information classes for NtQueryObject */
+typedef enum {
+    ObjectBasicInformation  = 0,
+    ObjectNameInformation   = 1,
+    ObjectTypeInformation   = 2,
+    ObjectTypesInformation  = 3,  /* enumerate all registered types */
+} OBJECT_INFORMATION_CLASS;
+
+/* Returned by NtQueryObject(ObjectTypeInformation) -- per-type statistics */
+typedef struct {
+    char        type_name[32];    /* null-terminated type name */
+    uint32_t    total_objects;    /* current live objects of this type */
+    uint32_t    total_handles;    /* current open handles */
+    uint32_t    peak_objects;     /* high-water mark */
+    uint32_t    peak_handles;     /* high-water mark */
+    uint32_t    body_size;        /* sizeof object body */
+    uint32_t    valid_access;     /* reserved (0 for now) */
+} OBJECT_TYPE_INFORMATION;
+
+/* Returned by NtQueryObject(ObjectTypesInformation) */
+typedef struct {
+    uint32_t                number_of_types;
+    OBJECT_TYPE_INFORMATION types[OB_MAX_TYPES];
+} OBJECT_TYPES_INFORMATION;
+
+/* Layer-1 guard (kernel-code-quality Gate 3): keep the query-returned struct
+ * within a page so a future OB_MAX_TYPES bump cannot silently turn it into a
+ * kernel-stack / large-allocation hazard. ~3.6 KiB at OB_MAX_TYPES=64; if
+ * growth breaks this, switch NtQueryObject(ObjectTypesInformation) to a
+ * variable-length output rather than enlarging the fixed array. */
+_Static_assert(sizeof(OBJECT_TYPES_INFORMATION) <= 4096,
+               "OBJECT_TYPES_INFORMATION must stay within a page; make "
+               "ObjectTypesInformation variable-length instead of growing "
+               "OB_MAX_TYPES further");
+
+/* NtClose -- close a handle in the current process */
+int NtClose(HANDLE_TABLE *ht, HANDLE handle);
+
+/* NtDuplicateObject -- duplicate a handle between processes */
+int NtDuplicateObject(HANDLE_TABLE *src_ht, HANDLE src_handle,
+                      HANDLE_TABLE *dst_ht, HANDLE *dst_handle,
+                      uint32_t desired_access, uint32_t attrs,
+                      uint32_t options);
+
+/* NtQueryObject -- query object metadata by handle */
+int NtQueryObject(HANDLE_TABLE *ht, HANDLE handle,
+                  OBJECT_INFORMATION_CLASS info_class,
+                  void *buffer, uint32_t size, uint32_t *return_length);
+
+/* --- NtOpenDirectoryObject / NtQueryDirectoryObject ---------------------- */
+
+/* Directory entry info returned by NtQueryDirectoryObject.
+ * Layout is ABI for user-mode sys_querydirobj callers: the same 96
+ * bytes are copied across the INT 0x80 boundary unchanged. User
+ * mirrors in user/test/test_syscall.c + user/test/test_fileio.c
+ * redeclare this struct and _Static_assert the same invariants --
+ * the kernel-side asserts below make the producer side also
+ * drift-detected, so neither side can reorder/pad silently. */
+typedef struct {
+    char name[64];       /* object component name (OB_NAME_MAX) */
+    char type_name[32];  /* object type name ("File", "Process", etc.) */
+} OBJECT_DIRECTORY_INFORMATION;
+_Static_assert(sizeof(OBJECT_DIRECTORY_INFORMATION) == 96,
+    "OBJECT_DIRECTORY_INFORMATION is a 96-byte ABI row (name[64]+type_name[32])");
+_Static_assert(__builtin_offsetof(OBJECT_DIRECTORY_INFORMATION, type_name) == 64,
+    "OBJECT_DIRECTORY_INFORMATION.type_name at offset 64");
+
+/* NtOpenDirectoryObject -- open a namespace directory by path.
+ * Returns 0 on success (*out_handle set), -1 on failure. */
+int NtOpenDirectoryObject(HANDLE_TABLE *ht, const char *name,
+                          uint32_t access, HANDLE *out_handle);
+
+/* NtQueryDirectoryObject -- enumerate entries in an opened directory.
+ * buffer: array of OBJECT_DIRECTORY_INFORMATION to fill.
+ * buffer_count: max entries to return.
+ * context: in/out iteration state (0 = start from beginning).
+ * return_count: receives number of entries actually returned.
+ * Returns 0 on success, -1 on error. */
+int NtQueryDirectoryObject(HANDLE_TABLE *ht, HANDLE dir_handle,
+                           OBJECT_DIRECTORY_INFORMATION *buffer,
+                           uint32_t buffer_count,
+                           uint32_t *context,
+                           uint32_t *return_count);
+
+/*
+ * ob_init -- initialise the Object Manager subsystem
+ *
+ * Registers all built-in type singletons.  Called during boot_phase2,
+ * before registry_init.  Requires SUBSYS_HEAP.
+ */
+boot_result_t ob_init(void);
+
+/* Pull in namespace API (directories, symlinks, path resolution) */
+#include "kernel/ob/ob_ns.h"

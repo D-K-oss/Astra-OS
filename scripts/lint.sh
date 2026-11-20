@@ -1,0 +1,3222 @@
+#!/usr/bin/env bash
+# ============================================================================
+# lint.sh -- Code style linter for Impossible OS
+#
+# Checks all C source and header files against the project's coding standards.
+# Uses grep and awk for pattern matching (no external dependencies).
+#
+# Usage:
+#   bash scripts/lint.sh              # Lint all files
+#   bash scripts/lint.sh src/kernel/  # Lint specific directory
+#
+# Exit codes:
+#   0 = clean (no violations)
+#   1 = violations found
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ---- Commit-gate scoping: todo/ files this commit does not touch ------------
+# The LINT_GATE_SCOPE_STAGED flag is set by `.githooks/pre-commit`, and by NOTHING
+# else -- a check in the tooling suite enforces that it has exactly one setter.
+# It names the `todo/**.md` files that are modified in the WORKING TREE but are
+# not part of the commit being made, so the three corpus-wide checks can stop
+# judging a file the commit never touches.
+#
+# WHY. While an unattended run holds the tree it is mid-edit in some TODO, and
+# a mid-edit TODO is routinely in a state those checks refuse -- a table not yet
+# realigned, a section without its Implementation Order row. An attended repair
+# that deliberately commits only `scripts/` was blocked by the run's in-flight
+# file anyway, three times on 2026-08-07, and re-blocked on every cache rebuild
+# because the run kept editing. The gate was answering a question nobody asked.
+#
+# NARROW ON PURPOSE. The set is exactly `unstaged AND NOT staged`: a file the
+# commit touches is judged as always, even if it also has later unstaged edits,
+# and a file with no working-tree changes is judged as always. A bare
+# `bash scripts/lint.sh` sets nothing and stays fully repo-wide, and CI runs on
+# a clean checkout where the set is empty by construction -- so this narrows
+# ONE invocation of the gate, not the rule.
+GATE_EXCLUDED_TODO=""
+GATE_STAGED_TODO=""
+# WHY CHECKS 10/11 CARE ABOUT THE STAGED-VS-WORKTREE DISTINCTION AT ALL. They
+# became fence-aware, which gave a pre-existing worktree read two routes it
+# never had: an unstaged fence wrapped around a staged violation MASKS it
+# (fail-open), and an unstaged unclosed fence REFUSES a commit that does not
+# contain it (false block). Neither is reachable against a fence-blind check.
+#
+# There is deliberately NO "which files diverge" set here. That was the first
+# repair and it was unsound four ways -- a staged-new file deleted from disk is
+# never visited by a filesystem walk, `--name-only` C-quotes non-ASCII paths so
+# they never match, `assume-unchanged` hides a difference entirely, and the
+# diff-then-read gap is a TOCTOU window. Checks 10/11 read the whole document
+# set out of the index instead (`todo_fence.staged_docs`), so no per-file
+# decision exists to get wrong.
+if [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ]; then
+    GATE_STAGED_TODO="$(git -C "$REPO_ROOT" diff --cached --name-only -- 'todo/*.md' 'todo/**/*.md' 2>/dev/null | sort -u)"
+    # UNTRACKED counts too: a run that OPENS a new TODO (a fresh capture file,
+    # a split section) has a file that is equally not part of this commit, and
+    # leaving it in meant the wedge simply moved to new files. Staged wins over
+    # both -- `git diff --cached` lists a staged-new file, so anything the
+    # commit actually carries is judged.
+    GATE_EXCLUDED_TODO="$(
+        comm -23 \
+            <( { git -C "$REPO_ROOT" diff --name-only -- 'todo/*.md' 'todo/**/*.md' 2>/dev/null;
+                 git -C "$REPO_ROOT" ls-files --others --exclude-standard -- 'todo/*.md' 'todo/**/*.md' 2>/dev/null; } | sort -u) \
+            <(git -C "$REPO_ROOT" diff --cached --name-only -- 'todo/*.md' 'todo/**/*.md' 2>/dev/null | sort -u) \
+        2>/dev/null || true)"
+    if [ -n "$GATE_EXCLUDED_TODO" ]; then
+        # NAMES ONLY WHAT ACTUALLY EXCLUDES PER FILE: Checks 10/11/17/24
+        # wholly, and Check 7's FINDINGS but not its rc-7 coverage/population
+        # gate. An over-claiming scope line is worse than none -- it tells a
+        # reader a wedge cannot happen from a file they are not committing, and
+        # one can -- so this line has been wrong in BOTH directions and each was
+        # found by reading the code rather than the banner. It first claimed
+        # 7/17/24 while Check 7 only downgraded a stale-cache error; the
+        # correction then dropped to 10/11/24 on the further claim that "Check
+        # 17 does not consult it at all", which was false at the time it was
+        # written -- Check 17 has filtered `TABLE_ALIGN_RAW` per file all along.
+        # Section 39 made Check 7 exclude its FINDINGS, and said so precisely
+        # rather than claiming the whole check, because the exclusion ran on the
+        # helper's stdout and could not reach the coverage/population accounting
+        # behind rc 7. Section 43 passed the set INTO the helper, which
+        # subtracts each owner from the live population and from the baseline's
+        # per-owner contributions together -- so the banner now names Check 7
+        # WHOLLY, and does so for the first time truthfully. This line has been
+        # wrong in both directions before; it is accurate only because the code
+        # under it changed, never because the wording did.
+        echo -e "${DIM:-}gate scope: $(printf '%s\n' "$GATE_EXCLUDED_TODO" | wc -l | tr -d ' ') todo file(s) modified outside this commit are not judged by Checks 7/10/11/17/24 (Check 7 additionally downgrades a STALE cache to a warning when every dirty todo file is excluded -- exclusion cannot answer staleness)${NC:-}"
+        # THE TRANSPORT INVARIANT (v14 close-out, 2026-08-16). This variable is
+        # newline-delimited and downstream consumers recover owners from prose,
+        # so a todo path carrying whitespace would not match its own exclusion
+        # entry and would still gate an unrelated commit (Codex adversarial,
+        # todo-metadata-layer gate-scope work post-ship, [medium]). Measured 0 of 281 corpus
+        # paths carry any -- the convention is `TODO-NN-slug.md` -- so instead
+        # of a NUL-safe protocol redesign the invariant is pinned fail-closed
+        # at the boundary the transport depends on.
+        if printf '%s\n' "$GATE_EXCLUDED_TODO" | grep -q '[[:space:]]'; then
+            echo "ERROR: a modified todo path contains whitespace; the newline-delimited gate-scope transport cannot carry it. Rename the file (corpus convention is TODO-NN-slug.md, no spaces)."
+            exit 1
+        fi
+    fi
+fi
+
+# True when $1 is a todo file the commit does not touch.
+gate_excluded() {
+    [ -n "$GATE_EXCLUDED_TODO" ] || return 1
+    printf '%s\n' "$GATE_EXCLUDED_TODO" | grep -qxF "${1#"$REPO_ROOT"/}"
+}
+
+# The same rule, applied to a STREAM of findings: drop every line that names an
+# excluded todo file anywhere in it. Reads stdin, writes stdout.
+#
+# THE DECISION SECTION 39 OWED (filed by the section-38 consistency review).
+# Check 7 now honours the exclusion set, which it did not: it reported every
+# finding in a current cache and only DOWNGRADED a stale-cache error. That was
+# the odd one out -- Checks 10/11 exclude through the environment, Check 24
+# through a JSON filter, and Check 17 has excluded per file all along at the
+# `TABLE_ALIGN_RAW` filter below. Its finding is exactly the shape the exclusion
+# set exists for: an unattended run stamps an item `[x]` while its
+# implementation is still in flight, and an attended commit touching only
+# `scripts/` is blocked by a TODO it never opened -- which happened three times
+# on 2026-08-07 and is why the pre-commit hook scopes the gate at all.
+#
+# $1 names WHERE the owning todo path is found in a line:
+#   stamp-owner  -- Check 7: `... (stamped [x] in <todo> section N: "...")`
+#   leading-path -- Check 17: `<todo>: message`
+#
+# THE OWNER IS EXTRACTED AND COMPARED EXACTLY, never matched as a substring.
+# Check 7 reports at the SOURCE file that defines the stub (`report_rel =
+# result.def_rel`, `scripts/lint/check_stub_behind_stamp.py:272`) and names the
+# owning TODO only inside the message -- so a filter anchored on the leading
+# `path:line:` field would match no todo path ever and be a silent no-op. The
+# obvious repair, `grep -vFf` over the WHOLE line, overshoots the other way: the
+# message embeds arbitrary `item_text`, and cross-TODO mentions are routine
+# here, so a genuine finding owned by a STAGED file would be discarded because
+# its item text happens to name an excluded one -- turning a real
+# stub-behind-stamp error into a clean result (Codex adversarial, section 39,
+# [medium]). A gate may not acquire a silent false negative to gain a scope.
+# THE TWO MODES DIFFER BECAUSE THE TWO OUTPUTS DIFFER, not for symmetry.
+# Check 17 emits `would align: <path>` (`scripts/format-md-tables.py:375`) and
+# nothing else, so the only path on the line IS the owner, a substring match
+# cannot reach anything else, and it absorbs the fact that the emitted path is
+# ABSOLUTE while the exclusion set is repo-relative. Check 7 embeds arbitrary
+# `item_text`, so its owner must be extracted and compared exactly.
+#
+# Collapsing both onto one exact matcher looked tidier and silently disabled
+# Check 17's exclusion outright -- `^([^:]+):` captures the literal
+# `would align`, so no finding could ever match the set and an unaligned TODO
+# edited outside the commit kept wedging it (Codex adversarial, section 39
+# round 2, [medium]).
+gate_exclude_lines() {
+    if [ -z "$GATE_EXCLUDED_TODO" ]; then cat; return 0; fi
+    if [ "$1" = "leading-path" ]; then
+        grep -vFf <(printf '%s\n' "$GATE_EXCLUDED_TODO") || true
+        return 0
+    fi
+    GATE_EXCL="$GATE_EXCLUDED_TODO" python3 -c '
+import os, re, sys
+excluded = {p for p in os.environ.get("GATE_EXCL", "").split("\n") if p}
+owner = re.compile(r"stamped \[x\] in (\S+) section")
+for line in sys.stdin:
+    m = owner.search(line)
+    # NO OWNER, NO EXCLUSION. A line this filter cannot attribute is kept, so a
+    # message-format change degrades to reporting too much rather than to
+    # silently dropping a finding.
+    if m is None or m.group(1) not in excluded:
+        sys.stdout.write(line)
+'
+}
+
+# ---- Help ----
+case "${1:-}" in
+    -h|--help)
+        cat <<'EOF'
+Impossible OS -- code style linter
+
+Usage:
+  bash scripts/lint.sh                    Lint full repo (default scope)
+  bash scripts/lint.sh src/kernel/mm/     Lint a specific path (skips xref check)
+  bash scripts/lint.sh --help             Show this help
+
+Checks (5):
+  1. #pragma once or include guard in every .h
+  2. Lines <= 120 characters (excludes comment lines)
+  3. No trailing whitespace
+  4. No numeric TODO shorthand (TODO-NN sectionN, DNN TNN) outside todo/**
+     except a baseline allowlist of pre-existing files (see the developer
+     tooling stack roadmap -- Tooling Doctor section -- for the legacy-XREF
+     sweep).
+  5. No bare "section sign + number" (§N) in code comments outside todo/**
+     unless the same line carries an external-spec qualifier (UEFI, Intel
+     SDM, NTFS, ACPI, RFC, etc.). Pre-existing files are warn-listed;
+     anything new is an error. Code comments must name the FEATURE, not
+     the TODO section number, because numbers drift silently on renumber.
+
+Removed 2026-04-17: "functions > 50 lines" and "lowercase #define" warnings
+(warn-only, never triaged; duplicated Codex + domain code-quality coverage).
+Removed 2026-04-18: camelCase-function warning -- unsafe for a Win11-native
+OS where NT/Rtl/Ob/Se/Ke/Mm/Io/Ex API names are deliberately CamelCase.
+Style review belongs with Codex adversarial review + domain code-quality
+skills; lint stays focused on drift-catching structural checks.
+
+Exit codes:
+  0 = clean
+  1 = errors found
+EOF
+        exit 0
+        ;;
+esac
+
+# ---- Colors ----
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+DIM='\033[0;90m'
+NC='\033[0m'
+
+# ---- Counters ----
+ERRORS=0
+WARNINGS=0
+
+error() {
+    local file=$1 line=$2 msg=$3
+    echo -e "${RED}error${NC}: ${file}:${line}: ${msg}"
+    ERRORS=$((ERRORS + 1))
+}
+
+warn() {
+    local file=$1 line=$2 msg=$3
+    echo -e "${YELLOW}warn${NC}: ${file}:${line}: ${msg}"
+    WARNINGS=$((WARNINGS + 1))
+}
+
+# ---- Determine files to lint ----
+SEARCH_PATH="${1:-$REPO_ROOT/src $REPO_ROOT/include}"
+
+# Exclude third-party and auto-generated files. Third-party libraries
+# carry their upstream style and line-length conventions -- we do not own
+# them, so we do not gate on them. Auto-generated headers are pure data
+# dumps with mechanical formatting.
+EXCLUDE_PATTERNS=(
+    "stb_truetype"
+    "stb_image"
+    "cJSON"
+    "build_info.h"
+    "os_logo.h"
+    "bsod_icon.h"
+    "boot_splash_font_data.h"
+)
+
+build_exclude_args() {
+    local args=""
+    for pat in "${EXCLUDE_PATTERNS[@]}"; do
+        args="$args ! -name '*${pat}*'"
+    done
+    # Vendored third-party libraries under src/libs/ carry their own upstream
+    # style and line lengths -- we do not own them, so exclude the whole tree
+    # (monocypher, cjson, lz4, miniz, mbedtls). Our kernel-side wrappers live in
+    # src/kernel/ and are still linted.
+    args="$args ! -path '*/src/libs/*'"
+    # ACPICA is vendored too but lives at src/kernel/acpica/ (the path its
+    # owning TODO specified), so the src/libs/ rule above does not reach it.
+    # Same reasoning: upstream style, not ours. Our OS Services Layer
+    # (src/kernel/acpi_osl.c) and the global-lock unit sit OUTSIDE this tree
+    # and stay linted.
+    args="$args ! -path '*/src/kernel/acpica/*'"
+    echo "$args"
+}
+
+# Find all .c and .h files
+mapfile -t FILES < <(eval "find $SEARCH_PATH -type f \\( -name '*.c' -o -name '*.h' \\) $(build_exclude_args)" 2>/dev/null | sort)
+
+if [ ${#FILES[@]} -eq 0 ]; then
+    echo -e "${RED}No source files found.${NC}"
+    exit 1
+fi
+
+echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  Impossible OS -- Code Style Linter${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+echo -e "  ${DIM}Checking ${#FILES[@]} files...${NC}"
+echo ""
+
+# ============================================================================
+# Check 1: #pragma once or include guard in .h files
+# ============================================================================
+for file in "${FILES[@]}"; do
+    [[ "$file" != *.h ]] && continue
+    relpath="${file#"$REPO_ROOT"/}"
+
+    if ! grep -q '#pragma once' "$file" 2>/dev/null; then
+        # Check for traditional include guards
+        if ! grep -qE '#ifndef\s+\w+_H' "$file" 2>/dev/null; then
+            error "$relpath" 1 "missing #pragma once or include guard"
+        fi
+    fi
+done
+
+# ============================================================================
+# Check 2: Lines > 120 characters
+# ============================================================================
+for file in "${FILES[@]}"; do
+    relpath="${file#"$REPO_ROOT"/}"
+    # gawk by name: mawk, the default awk on a clean Ubuntu, counts bytes, so a line of
+    # 77 characters with box-drawing in it read as 169 (found by CI_CONTAINER=1).
+    gawk -v file="$relpath" '
+        length($0) > 120 {
+            # Skip comments and long string literals
+            if ($0 ~ /^\s*\*/ || $0 ~ /^\s*\/\*/ || $0 ~ /^\s*\/\//) next
+            printf "'"${RED}"'error'"${NC}"': %s:%d: line exceeds 120 characters (%d chars)\n", file, NR, length($0)
+            errors++
+        }
+        END { exit errors > 0 ? 1 : 0 }
+    ' "$file" 2>/dev/null && true
+    # Count errors from awk output
+    long_lines=$(awk 'length($0) > 120 && $0 !~ /^\s*\*/ && $0 !~ /^\s*\/\*/ && $0 !~ /^\s*\/\//' "$file" 2>/dev/null | wc -l)
+    ERRORS=$((ERRORS + long_lines))
+done
+
+# ============================================================================
+# Check 3: Trailing whitespace
+# ============================================================================
+for file in "${FILES[@]}"; do
+    relpath="${file#"$REPO_ROOT"/}"
+    while IFS= read -r match; do
+        linenum=$(echo "$match" | cut -d: -f1)
+        error "$relpath" "$linenum" "trailing whitespace"
+    done < <(grep -n '[[:space:]]$' "$file" 2>/dev/null || true)
+done
+
+# ============================================================================
+# Check 4: Drift-prone TODO numeric shorthand outside todo/
+# ============================================================================
+# Numeric XREFs (e.g. TODO-<num> <section-sign><num>, D<num> T<num> <section-sign><num>)
+# go stale silently when TODOs renumber. Inside todo/** the create-todo / validate-todo-file skills
+# enforce the shorthand deliberately. Outside todo/** we want anchor links to a
+# canonical doc or named-capability references instead.
+#
+# Known-dirty files (pre-existing refs) get a warning; everything else is an
+# error so new drift cannot sneak in. Legacy cleanup is tracked in
+# todo/00-infrastructure/TODO-01-developer-tooling-stack.md "tooling doctor"
+# section.
+#
+# Only runs on the default lint scope (whole repo). If a path argument was
+# given, skip -- per-subsystem runs should not scan outside their path.
+if [ "$#" -eq 0 ]; then
+    # ERE regex matching all four drift-prone shorthand flavors.
+    TODO_XREF_REGEX='(TODO-[0-9]+[[:space:]]*§[0-9]+|TODO-[0-9]+[[:space:]]+section[[:space:]]+[0-9]+|D[0-9]+[[:space:]]*T[0-9]+[[:space:]]*§?[0-9]+|\bT[0-9]+[[:space:]]*§[0-9]+)'
+
+    # Paths with pre-existing legacy refs (warn-only until the sweep lands).
+    # Keep sorted alphabetically for easy audit. The legacy sweep landed
+    # with the developer-tooling stack Legacy-XREF Sweep item; this list
+    # is intentionally empty so any new numeric-TODO shorthand is flagged
+    # as an error.
+    TODO_XREF_LEGACY_FILES=()
+
+    is_todo_xref_legacy() {
+        local path="$1"
+        local legacy
+        for legacy in "${TODO_XREF_LEGACY_FILES[@]}"; do
+            [ "$path" = "$legacy" ] && return 0
+        done
+        return 1
+    }
+
+    # Top-level roots to scan. Keep narrow so unrelated repos (node_modules,
+    # build artifacts, plugin marketplaces) are not traversed. `.github/`
+    # is included so workflow YAML cannot sneak in shorthand that would
+    # then outlive a TODO renumbering. The PULL_REQUEST_TEMPLATE.md skip
+    # below preserves the intentional teaching template.
+    TODO_XREF_ROOTS=(
+        "$REPO_ROOT/src"
+        "$REPO_ROOT/include"
+        "$REPO_ROOT/scripts"
+        "$REPO_ROOT/docs"
+        "$REPO_ROOT/user"
+        "$REPO_ROOT/tools"
+        "$REPO_ROOT/.github"
+        "$REPO_ROOT/README.md"
+        "$REPO_ROOT/CONTRIBUTING.md"
+        "$REPO_ROOT/CLAUDE.md"
+        "$REPO_ROOT/Makefile"
+        "$REPO_ROOT/CHANGELOG.md"
+    )
+
+    # Existing roots only (some may not exist in every checkout).
+    TODO_XREF_EXISTING=()
+    for root in "${TODO_XREF_ROOTS[@]}"; do
+        [ -e "$root" ] && TODO_XREF_EXISTING+=("$root")
+    done
+
+    while IFS=: read -r file linenum rest; do
+        [ -z "$file" ] && continue
+        relpath="${file#"$REPO_ROOT"/}"
+        # Skip templates that TEACH the shorthand intentionally, and the
+        # AI-workflow regression script whose whole purpose is to enforce
+        # the AI Development System roadmap section structure (references
+        # are load-bearing -- if those sections renumber, the script must
+        # be updated too; the rule against drift does not apply to the
+        # file that IS the drift-detector).
+        case "$relpath" in
+            .github/PULL_REQUEST_TEMPLATE.md) continue ;;
+            scripts/test-ai-system.sh) continue ;;
+            scripts/todo-graph/*) continue ;;
+            # Fixture rows for the implementation-plan tool: every reference
+            # names a section of a corpus the test writes into a temporary
+            # directory, never one in this tree.
+            scripts/tests/test_todo_plan.py) continue ;;
+            *.claude/*) continue ;;
+            # Append-only historical run log (archived out of the doctrine
+            # file 2026-07-11): entries reference TODO numbers/sections AS
+            # THEY WERE at the time; renumbering-drift rules are for live
+            # references, not history.
+            docs/overnight/run-log.md) continue ;;
+        esac
+        if is_todo_xref_legacy "$relpath"; then
+            warn "$relpath" "$linenum" "numeric TODO shorthand (legacy; tracked for cleanup)"
+        else
+            error "$relpath" "$linenum" "numeric TODO shorthand outside todo/ (breaks on TODO renumbering; use anchor link or capability name)"
+        fi
+    done < <(
+        grep -rnHE "$TODO_XREF_REGEX" \
+            --include='*.c' --include='*.h' --include='*.asm' --include='*.S' \
+            --include='*.sh' --include='*.md' --include='*.json' \
+            --include='*.bat' --include='*.ps1' --include='*.py' \
+            --include='*.yml' --include='*.yaml' \
+            --include='Makefile' --include='*.mk' \
+            --exclude-dir='.git' --exclude-dir='build' --exclude-dir='node_modules' \
+            "${TODO_XREF_EXISTING[@]}" 2>/dev/null \
+        || true
+    )
+fi
+
+# ============================================================================
+# Check 5: Bare "section sign + number" in code comments without external-spec
+# qualifier. A bare section-sign glyph followed by a digit inside a .c / .h /
+# .asm / .py / .sh file almost always refers to a TODO section; those break
+# silently when the owning TODO renumbers. External-spec citations (UEFI,
+# Intel SDM, NTFS, ACPI) stay legal because they point at stable published
+# standards.
+#
+# Allowed tokens on the same line: UEFI, Intel, SDM, AMD, APM, RFC <n>,
+# ACPI <n>, NTFS, FAT32/16, NVMe, PCI / PCIe, PE/COFF, PE32, COFF, USB <n>,
+# xHCI / EHCI / OHCI / UHCI, VirtIO, SMBIOS, IEEE, NIST, TCG, WHEA, HPET,
+# MP Spec, "spec ", "specification".
+#
+# The legacy allowlist lists every file that already contains bare §N refs
+# today (WARN) so the check does not block commits while the cleanup is in
+# progress. Any file NOT on the allowlist must not introduce new bare §N --
+# that is the permanent drift gate for new code.
+#
+# Only runs on the default lint scope (whole repo).
+if [ "$#" -eq 0 ]; then
+    BARE_SECTION_RE='§ ?[0-9]'
+    SPEC_TOKENS_RE='(UEFI|Intel|SDM|AMD|APM|RFC [0-9]|ACPI [0-9]|NTFS|FAT[0-9]|NVMe|PCIe?|PE/COFF|PE32|COFF|USB [0-9]|xHCI|EHCI|OHCI|UHCI|VirtIO|SMBIOS|IEEE|NIST|TCG|WHEA|HPET|MP Spec|spec |specification)'
+
+    # Path-based spec-code exemption: files whose WHOLE JOB is implementing
+    # an external standard carry §N refs to that standard per-line without
+    # repeating the standard's name (the file scope provides the context).
+    # Add directories/paths here only when every §N ref in the file truly
+    # points at the named external standard.
+    is_bare_section_spec_code() {
+        local path="$1"
+        case "$path" in
+            # NTFS on-disk format spec (Linux-NTFS + Microsoft NTFS reference).
+            src/kernel/fs/ntfs/*|include/kernel/fs/ntfs.h) return 0 ;;
+            # Vendored third-party libraries cite RFC/standard sections with the
+            # section glyph; we do not own their comments (lz4, miniz, mbedtls).
+            src/libs/*) return 0 ;;
+        esac
+        return 1
+    }
+
+    # Files with pre-existing bare §N refs (WARN-only; tracked for cleanup
+    # in todo/00-infrastructure/TODO-01-developer-tooling-stack.md). Keep
+    # sorted alphabetically for easy audit. Any new file must NOT land
+    # here -- check the lint output and replace the §N with a feature
+    # name or a doc anchor link before adding.
+    BARE_SECTION_LEGACY_FILES=()
+
+    is_bare_section_legacy() {
+        local path="$1"
+        local legacy
+        for legacy in "${BARE_SECTION_LEGACY_FILES[@]}"; do
+            [ "$path" = "$legacy" ] && return 0
+        done
+        return 1
+    }
+
+    # Same scan roots as Check 4; reuse the existing TODO_XREF_EXISTING array.
+    while IFS=: read -r file linenum rest; do
+        [ -z "$file" ] && continue
+        # Line passes if it carries an external-spec qualifier.
+        if echo "$rest" | grep -qE "$SPEC_TOKENS_RE"; then
+            continue
+        fi
+        relpath="${file#"$REPO_ROOT"/}"
+        case "$relpath" in
+            .github/PULL_REQUEST_TEMPLATE.md) continue ;;
+            scripts/test-ai-system.sh) continue ;;
+            scripts/todo-graph/*) continue ;;
+            *.claude/*) continue ;;
+            # Append-only historical run log (archived out of the doctrine
+            # file 2026-07-11): entries reference TODO numbers/sections AS
+            # THEY WERE at the time; renumbering-drift rules are for live
+            # references, not history.
+            docs/overnight/run-log.md) continue ;;
+        esac
+        # Path-based spec-code exemption (NTFS etc.).
+        if is_bare_section_spec_code "$relpath"; then
+            continue
+        fi
+        if is_bare_section_legacy "$relpath"; then
+            warn "$relpath" "$linenum" "bare section ref (legacy; tracked for cleanup)"
+        else
+            error "$relpath" "$linenum" "bare section ref in code (breaks on TODO renumbering; name the feature or cite external spec)"
+        fi
+    done < <(
+        grep -rnHE "$BARE_SECTION_RE" \
+            --include='*.c' --include='*.h' --include='*.asm' --include='*.S' \
+            --include='*.sh' --include='*.bat' --include='*.ps1' --include='*.py' \
+            --include='*.yml' --include='*.yaml' \
+            --include='Makefile' --include='*.mk' \
+            --include='*.ld' --include='*.lds' --include='*.inc' \
+            --exclude-dir='.git' --exclude-dir='build' --exclude-dir='node_modules' \
+            "${TODO_XREF_EXISTING[@]}" 2>/dev/null \
+        || true
+    )
+fi
+
+# ============================================================================
+# Check 6: Tautological-test detection (TODO-08 #12)
+# ============================================================================
+# Walks src/kernel/test/test_*.c and flags two AI-slop anti-patterns that
+# build green and pass the test runner but verify nothing:
+#   (a) TEST_ASSERT_EQ(X, X, ...) where LHS == RHS string-identical
+#   (b) TEST_ASSERT(true, ...) / TEST_ASSERT(1, ...)
+# Allowlist: a /* TEST-TAUTOLOGY-OK: <reason> */ marker on the same line.
+# Skip the whole check via SKIP_LINT_TAUTOLOGY=1 on the lint invocation;
+# the skip prints a visible WARN line so bypasses are auditable.
+if [ "${SKIP_LINT_TAUTOLOGY:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 6 (tautological-test) skipped via SKIP_LINT_TAUTOLOGY=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    # Legacy-allowlist pattern: pre-existing tautological tests get WARN
+    # (tracked for cleanup in todo/00-infrastructure/TODO-08-automation
+    # -hardening.md #12 follow-up); any NEW tautological test in any
+    # other file is ERROR. Mirrors Check 5's BARE_SECTION_LEGACY_FILES.
+    TAUTOLOGY_LEGACY_FILES=(
+        "src/kernel/test/test_alpc.c"
+        "src/kernel/test/test_boot_init.c"
+        "src/kernel/test/test_bulletproof.c"
+        "src/kernel/test/test_cpu_security.c"
+        "src/kernel/test/test_crashdump.c"
+        "src/kernel/test/test_desktop.c"
+        "src/kernel/test/test_exec.c"
+        "src/kernel/test/test_ixfs.c"
+        "src/kernel/test/test_klog.c"
+        "src/kernel/test/test_nt_types.c"
+        "src/kernel/test/test_peb_teb.c"
+        "src/kernel/test/test_usermode_launcher.c"
+        "src/kernel/test/test_vfs.c"
+    )
+    is_tautology_legacy() {
+        local path="$1"
+        local legacy
+        for legacy in "${TAUTOLOGY_LEGACY_FILES[@]}"; do
+            [ "$path" = "$legacy" ] && return 0
+        done
+        return 1
+    }
+
+    # Collect all test files and run the python checker once -- saves
+    # ~50 fork-execs vs the prior per-file awk loop AND handles three
+    # patterns the awk version missed (Codex review 2026-04-28):
+    # multiline assertions, inner-comma tautologies, and SYM-vs-literal
+    # -of-SYM comparisons. Output is one finding per line in the
+    # `relpath:line:detail` format that the parent loop dispatches via
+    # error()/warn() based on TAUTOLOGY_LEGACY_FILES membership.
+    TAUTOLOGY_FILES=()
+    while IFS= read -r file; do
+        [ -n "$file" ] && TAUTOLOGY_FILES+=("$file")
+    done < <(find "$REPO_ROOT/src/kernel/test" -maxdepth 1 -type f -name 'test_*.c' 2>/dev/null)
+    if [ "${#TAUTOLOGY_FILES[@]}" -gt 0 ]; then
+        while IFS=: read -r f l rest; do
+            [ -z "$f" ] && continue
+            if is_tautology_legacy "$f"; then
+                warn "$f" "$l" "$rest (legacy; tracked for cleanup)"
+            else
+                error "$f" "$l" "$rest"
+            fi
+        done < <(python3 "$REPO_ROOT/scripts/lint/check_tautological_test.py" \
+            "${TAUTOLOGY_FILES[@]}" 2>/dev/null)
+    fi
+fi
+
+# ============================================================================
+# Check 7: Stub-behind-stamp detection (TODO-08 #12 + TODO-06 #9)
+# ============================================================================
+# Reads build/todo-cache.json for the stamped-item -> {file, symbol} map
+# emitted by the per-item cache extension and flags any function whose
+# body is a <=3-line `return CONSTANT;` placeholder under an [x] stamp
+# (AI-slop "marked done but doesn't actually do anything" anti-pattern).
+# Allowlist: /* INTENTIONAL-STUB: <reason> */ on the same line as the
+# body-opening `{` (mirrors Check 6's TEST-TAUTOLOGY-OK marker).
+# Skip the whole check via SKIP_LINT_STUB_BEHIND_STAMP=1.
+#
+# Cache freshness: the cache is rebuilt automatically by the PostToolUse
+# hook on TODO edits and by scripts/todo-graph/build-and-validate.sh. To
+# protect against a stale cache silently passing the lint, this check
+# WARNs (without erroring) when the cache mtime is older than the newest
+# todo/**/*.md mtime; the contributor sees a clear "rebuild and rerun"
+# pointer rather than a false-clean.
+if [ "${SKIP_LINT_STUB_BEHIND_STAMP:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 7 (stub-behind-stamp) skipped via SKIP_LINT_STUB_BEHIND_STAMP=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    # Single-spawn helper: probe + staleness + walk in one Python process.
+    # Distinct exit codes (per check_stub_behind_stamp.py header):
+    #   0 = clean walk        (route findings via error())
+    #   2 = cache missing     -> WARN (contributor hasn't built it)
+    #   3 = no stamped_items  -> WARN (cache pre-extension; run build). This is
+    #       the LEGACY case only: the field absent from every node. A cache
+    #       that has the field but an empty population is a producer
+    #       regression and reaches the rc 7 gate instead (section 17).
+    #   4 = cache stale       -> ERROR (false-clean risk; rebuild required)
+    #   5 = cache malformed   -> ERROR (corrupt JSON, a shape violating
+    #       scripts/todo-graph/schema/cache.schema.json, an empty node
+    #       array, or a cache whose corpus binding declares a producer
+    #       contract this reader does not speak -- or declares none at all;
+    #       investigate)
+    #   6 = internal failure  -> ERROR
+    #   7 = coverage floor breached -> ERROR (the check went blinder)
+    #   8 = baseline invalid  -> ERROR (tracked floor file missing/corrupt)
+    #   9 = resolver input refused -> ERROR (oversized file, or one rewritten
+    #       mid-run so returned coordinates no longer describe it -- NEVER a
+    #       coverage finding, NEVER silently downgraded to "unresolved")
+    CACHE="$REPO_ROOT/build/todo-cache.json"
+    # A MISSING cache is built here, not skipped. `build-and-validate.sh`
+    # without its keep flag deletes the cache on exit and build/ is untracked,
+    # so "missing" was the common state, and rc 2 turned the whole stub walk
+    # into one warning among two hundred (2026-11-10: the check skipped
+    # through a full lint and failed its own integration test, twice). A build
+    # is about 3 s. If it fails, the rc 2 warning below still says so.
+    if [ ! -f "$CACHE" ] && [ -f "$REPO_ROOT/scripts/todo-graph/build.py" ] \
+            && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        mkdir -p "$REPO_ROOT/build"
+        python3 "$REPO_ROOT/scripts/todo-graph/build.py" --quiet --output "$CACHE" \
+            >/dev/null 2>&1 || rm -f "$CACHE"
+    fi
+    # GUARDED, because line 17 sets `set -euo pipefail`: an unguarded
+    # command-substitution assignment that fails takes the ENTIRE linter down
+    # before Check 7 can report a controlled error or the summary can print,
+    # and if the first succeeds while the second fails the first file leaks
+    # (Codex adversarial, section 43 post-ship, [medium]).
+    STUB_ERR_FILE=""; STUB_OUT_FILE=""
+    STUB_ERR_FILE="$(mktemp -t lint-stub-stderr.XXXXXX)" || STUB_ERR_FILE=""
+    STUB_OUT_FILE="$(mktemp -t lint-stub-stdout.XXXXXX)" || STUB_OUT_FILE=""
+    if [ -z "$STUB_ERR_FILE" ] || [ -z "$STUB_OUT_FILE" ]; then
+        rm -f "$STUB_ERR_FILE" "$STUB_OUT_FILE"
+        echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) could not allocate a temporary file -- the stub walk did not run"
+        ERRORS=$((ERRORS + 1))
+        STUB_RC=""
+    fi
+    if [ -n "$STUB_ERR_FILE" ]; then
+    # Run helper outside `set -e` failure boundary: nonzero rc on
+    # missing/stale/corrupt cache is informational, not a fatal lint
+    # error -- the case statement below routes each rc to error()/warn().
+    STUB_RC=0
+    # THE SET GOES IN, not just over the output (section 43). Filtering the
+    # helper's stdout reaches its FINDINGS and nothing else, so a todo file this
+    # commit does not touch could still move the stamped-symbol population and
+    # refuse the commit at rc 7 -- the wedge the set exists to prevent. The
+    # helper now subtracts each named owner from the live population AND from
+    # the baseline's per-owner contributions, and REFUSES if it cannot do both.
+    STUB_LINT_CACHE="$CACHE" STUB_LINT_REPO_ROOT="$REPO_ROOT" \
+        STUB_LINT_EXCLUDED="$GATE_EXCLUDED_TODO" \
+        python3 "$REPO_ROOT/scripts/lint/check_stub_behind_stamp.py" \
+        >"$STUB_OUT_FILE" 2>"$STUB_ERR_FILE" || STUB_RC=$?
+    # Drop findings owned by a todo file this commit does not touch -- see
+    # `gate_exclude_lines`. With no exclusion set this is a pass-through.
+    STUB_OUT="$(gate_exclude_lines stamp-owner < "$STUB_OUT_FILE")"
+    case "$STUB_RC" in
+        0)
+            while IFS=: read -r f l rest; do
+                [ -z "$f" ] && continue
+                error "$f" "$l" "$rest"
+            done <<< "$STUB_OUT"
+            # SURFACE THE COVERAGE LINE. The helper writes it to stderr (stdout
+            # is the findings channel), and this branch used to read stdout
+            # only -- so a normal lint run published no coverage ratio at all
+            # and the whole point of counting the blind spot was invisible to
+            # the caller.
+            # SEVERITY IS WARN WHILE A GAP STANDS, INFO ONLY AT FULL COVERAGE.
+            # The roadmap chose "WARN on the standing gap, ERROR on a
+            # REGRESSION"; emitting the gap as INFO made the shipped severity
+            # weaker than the committed decision. It stays a WARN (not an
+            # ERROR) for the original reason: the gap is pre-existing and
+            # erroring would block every commit in the repo until it hit zero.
+            STUB_COV="$(grep -m1 'stub-behind-stamp:coverage' "$STUB_ERR_FILE" 2>/dev/null || true)"
+            if [ -n "$STUB_COV" ]; then
+                STUB_R="${STUB_COV#*resolved=}"; STUB_R="${STUB_R%%/*}"
+                STUB_T="${STUB_COV#*resolved=*/}"; STUB_T="${STUB_T%% *}"
+                if [ -n "$STUB_R" ] && [ "$STUB_R" = "$STUB_T" ]; then
+                    echo -e "${CYAN}info${NC}: Check 7 ${STUB_COV#stub-behind-stamp:}"
+                else
+                    echo -e "${YELLOW}warn${NC}: Check 7 (stub-behind-stamp) ${STUB_COV#stub-behind-stamp:coverage } -- refs the check could not examine are NOT findings and NOT clean"
+                    WARNINGS=$((WARNINGS + 1))
+                fi
+            fi
+            # A DELIBERATE BYPASS MUST BE SEEN. STUB_LINT_ALLOW_NO_BASELINE=1
+            # disables the only coverage floor; announcing it on the helper's
+            # stderr while the caller discards stderr is not "visibly reported".
+            if grep -q 'baseline floor SKIPPED' "$STUB_ERR_FILE" 2>/dev/null; then
+                echo -e "${YELLOW}warn${NC}: Check 7 (stub-behind-stamp) coverage floor BYPASSED via STUB_LINT_ALLOW_NO_BASELINE=1 -- the resolver could go blind without this run noticing"
+                WARNINGS=$((WARNINGS + 1))
+            fi
+            ;;
+        2)
+            echo -e "${YELLOW}warn${NC}: Check 7 (stub-behind-stamp) skipped -- build/todo-cache.json missing; run bash scripts/todo-graph/build-and-validate.sh"
+            WARNINGS=$((WARNINGS + 1))
+            ;;
+        3)
+            echo -e "${YELLOW}warn${NC}: Check 7 (stub-behind-stamp) deferred -- build/todo-cache.json lacks per-item file:symbol map; rebuild with bash scripts/todo-graph/build-and-validate.sh"
+            WARNINGS=$((WARNINGS + 1))
+            ;;
+        4)
+            # STALE CACHE. At the commit gate, with a `todo/` file being edited
+            # OUTSIDE this commit, the corpus genuinely did move and rebuilding
+            # chases a target that keeps moving -- that is the loop that
+            # re-blocked an attended repair on every rebuild. Excluding files
+            # cannot answer staleness, so this one is downgraded rather than
+            # filtered -- and only when the commit touches NO todo file at all.
+            # That last condition is not belt-and-braces: with a violating todo
+            # file STAGED, the excluded set is still non-empty (the run's file
+            # is in it) and the looser test downgraded a staleness THIS commit
+            # was causing. Caught by the staged-file safety probe.
+            # A bare lint and CI still ERROR unconditionally.
+            if [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ] && [ -n "$GATE_EXCLUDED_TODO" ] \
+               && [ -z "$GATE_STAGED_TODO" ]; then
+                echo -e "${YELLOW}warn${NC}: Check 7 (stub-behind-stamp) cache stale, but every modified todo file is outside this commit -- not gating on a corpus this commit does not touch"
+                WARNINGS=$((WARNINGS + 1))
+            else
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) cache stale relative to todo/**/*.md; rebuild with bash scripts/todo-graph/build-and-validate.sh and re-run lint"
+                ERRORS=$((ERRORS + 1))
+            fi
+            ;;
+        7)
+            # rc 7 carries TWO contracts, and the handler must route on the
+            # emitted tag rather than assume one. Coverage floor breached:
+            # something made the check BLINDER -- an unresolved symbol yields no
+            # finding, so losing resolution is indistinguishable from passing.
+            # POPULATION moved: the floor is a RATIO, so a shifting denominator
+            # changes what passing means. Grepping only for COVERAGE REGRESSION
+            # printed an effectively BLANK error on a population change and
+            # threw away the helper's actionable message (Codex consistency,
+            # section 14).
+            if grep -q 'COVERAGE REGRESSION' "$STUB_ERR_FILE" 2>/dev/null; then
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) COVERAGE REGRESSION -- $(grep -m1 'COVERAGE REGRESSION' "$STUB_ERR_FILE" 2>/dev/null | sed 's/.*REGRESSION: //' | cut -c1-140)"
+            elif grep -q 'POPULATION ' "$STUB_ERR_FILE" 2>/dev/null; then
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) $(grep -m1 'POPULATION ' "$STUB_ERR_FILE" 2>/dev/null | sed 's/.*\] //' | cut -c1-200)"
+            elif grep -q 'EXCLUSION SET INVALID' "$STUB_ERR_FILE" 2>/dev/null; then
+                # THIRD rc-7 contract, added with the scoped-exclusion work in
+                # section 43 and NOT routed by it -- the message fell through to
+                # the "see $STUB_ERR_FILE" arm below, which names a file this
+                # block DELETES two lines later, so the actionable diagnostic
+                # was destroyed on its way out (Codex consistency, post-ship,
+                # [medium]).
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) EXCLUSION SET INVALID -- $(grep -m1 'EXCLUSION SET INVALID' "$STUB_ERR_FILE" 2>/dev/null | sed 's/.*EXCLUSION SET INVALID: //' | cut -c1-200)"
+            else
+                # The unrecognised arm QUOTES the diagnostic rather than naming
+                # a path that is about to be removed. Same reason.
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) rc 7 with no recognized diagnostic: $(head -3 "$STUB_ERR_FILE" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+            fi
+            ERRORS=$((ERRORS + 1))
+            ;;
+        8)
+            # The coverage floor's own bookkeeping file is tracked repo state.
+            # Treating it as absent-means-no-floor let a delete silently
+            # disable the gate, so an invalid baseline is an ERROR with a
+            # named, reported bypass rather than a quiet degrade to warn.
+            # TWO rc-8 tokens since section 43: the original `BASELINE INVALID`
+            # and `BASELINE by_owner INVALID` for the per-owner contract. The
+            # first grep matches BOTH (the second contains the first as a
+            # substring only if the tokens are ordered carefully), so the
+            # by_owner form is matched FIRST and explicitly.
+            if grep -q 'BASELINE by_owner INVALID' "$STUB_ERR_FILE" 2>/dev/null; then
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) BASELINE by_owner INVALID -- $(grep -m1 'BASELINE by_owner INVALID' "$STUB_ERR_FILE" 2>/dev/null | sed 's/.*BASELINE by_owner INVALID: //' | cut -c1-200)"
+            elif grep -q 'BASELINE INVALID' "$STUB_ERR_FILE" 2>/dev/null; then
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) BASELINE INVALID -- $(grep -m1 'BASELINE INVALID' "$STUB_ERR_FILE" 2>/dev/null | sed 's/.*BASELINE INVALID: //' | cut -c1-140)"
+            else
+                echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) rc 8 with no recognized diagnostic: $(head -3 "$STUB_ERR_FILE" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+            fi
+            ERRORS=$((ERRORS + 1))
+            ;;
+        9)
+            # Named case, not the wildcard: a resolver-refused input is
+            # infrastructure trouble with a specific, actionable cause
+            # (oversized file or a mid-run rewrite), not a generic helper
+            # crash -- routing it through `*)` would bury that guidance.
+            echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) RESOLVER INPUT REFUSED -- $(grep -m1 'RESOLVER INPUT REFUSED' "$STUB_ERR_FILE" 2>/dev/null | sed 's/.*RESOLVER INPUT REFUSED: //' | cut -c1-140)"
+            ERRORS=$((ERRORS + 1))
+            ;;
+        *)
+            echo -e "${RED}error${NC}: Check 7 (stub-behind-stamp) helper exited $STUB_RC: $(head -3 "$STUB_ERR_FILE" 2>/dev/null | tr '\n' ' ')"
+            ERRORS=$((ERRORS + 1))
+            ;;
+    esac
+    rm -f "$STUB_ERR_FILE" "$STUB_OUT_FILE"
+    fi
+fi
+
+# ============================================================================
+# Check 9: Stamp-region placeholder leak detection (post-2026-04-28)
+# ============================================================================
+# Recurring failure mode: when writing a Verified/Quality-reviewed stamp
+# before the corresponding commit lands, an `<this-commit>` (or `<hash>`,
+# `<TBD>`, `<insert-hash>`, etc.) placeholder gets written into the stamp
+# and never replaced after the commit. The earlier lint checks did not
+# catch it because the placeholder uses ASCII angle brackets and contains
+# no Unicode dashes, no bare section signs, no numeric TODO shorthand.
+# Hit twice in the 2026-04-28 session (one boot-platform stamp + one
+# automation-hardening stamp) before the user noticed. ERRORs on any
+# literal placeholder inside `> **Verified:**` / `> **Quality
+# reviewed:**` lines anywhere under todo/.
+#
+# Allowed (explicit "still-TBD" markers): a placeholder is OK when the
+# enclosing line explicitly says `TBD:` -- e.g. `(TBD: original review
+# commit hash unrecorded; placeholder preserved for git-log audit)`. The
+# check matches the literal placeholder pattern and excludes lines that
+# contain `TBD:` so deliberate "this slot is intentionally empty" notes
+# are not flagged.
+if [ "${SKIP_LINT_PLACEHOLDER:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 9 (stamp placeholder) skipped via SKIP_LINT_PLACEHOLDER=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    # Match any "<lowercase-word>" pattern inside a stamp line. This
+    # catches the canonical `<this-commit>` / `<hash>` placeholders
+    # plus any free-form variant a future writer invents (e.g.
+    # `<this-and-following-commit>`, `<insert-hash>`). False positives
+    # avoided by: (a) anchoring on the stamp prefix `> **Verified:**`
+    # / `> **Quality reviewed:**`; (b) requiring the bracket content
+    # to be lowercase + hyphen only (excludes XML-like `<details>`,
+    # markdown comparisons `<value>`, and natural-language `<key>`
+    # patterns); (c) excluding lines containing `TBD:`.
+    placeholder_hits="$(grep -rnE \
+        '> \*\*(Verified|Quality reviewed):\*\*.*<[a-z][a-z0-9_-]+>' \
+        todo 2>/dev/null \
+        | grep -vE 'TBD:' || true)"
+    if [ -n "$placeholder_hits" ]; then
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            # grep -rn returns "path:line:content"
+            file="${entry%%:*}"
+            tail_field="${entry#*:}"
+            ln="${tail_field%%:*}"
+            content="${tail_field#*:}"
+            placeholder="$(printf '%s\n' "$content" | grep -oE '<[a-zA-Z0-9_-]+>' | head -1)"
+            echo -e "${RED}error${NC}: $file:$ln: stamp placeholder leak: $placeholder"
+            ERRORS=$((ERRORS + 1))
+        done <<< "$placeholder_hits"
+    fi
+fi
+
+# ============================================================================
+# Check 10: Stamp-region completeness (TODO-08 stamp-region completeness lints)
+# Check 11: OS Comparison cross-table sync (TODO-08 stamp-region completeness lints)
+# ============================================================================
+# Both checks walk every todo/**/*.md IO table, find [x] rows, and verify
+# downstream invariants in the matching `## N.` section + OS Comparison
+# row. Sentinel-date scoped: only enforce on sections whose Verified
+# stamp date is on/after LINT_LAND_DATE. Older sections are grandfathered
+# (existing TODOs ship pre-doctrine and would all WARN otherwise).
+#
+# Doctrine:
+#   Check 10 -- review-todo-section/SKILL.md step 16 (canonical stamp shape)
+#   Check 11 -- feedback_os_comparison_update memory (flip OS row to checkmark
+#               every shipped IO row)
+#
+# Skip flags:
+#   SKIP_LINT_STAMP_REGION=1   -- Check 10 emits WARN with reason logged
+#   SKIP_LINT_OS_COMPARISON=1  -- Check 11 emits WARN with reason logged
+if [ "${SKIP_LINT_STAMP_REGION:-}" = "1" ] && [ "${SKIP_LINT_OS_COMPARISON:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 10 + Check 11 both skipped via SKIP_LINT_STAMP_REGION + SKIP_LINT_OS_COMPARISON"
+    WARNINGS=$((WARNINGS + 2))
+else
+    LINT_OUT="$(LINT_GATE_EXCLUDED_TODO="$GATE_EXCLUDED_TODO" \
+                python3 - "$REPO_ROOT" <<'PYEOF'
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Sentinel date: stamp-region completeness lints land date. Sections
+# whose `> **Verified:**` carries an earlier date are grandfathered
+# (pre-doctrine ship).
+LINT_LAND_DATE = "2026-04-29"
+
+SKIP_C10 = os.environ.get("SKIP_LINT_STAMP_REGION", "") == "1"
+SKIP_C11 = os.environ.get("SKIP_LINT_OS_COMPARISON", "") == "1"
+
+todo_root = Path("todo")
+errors = []
+warnings = []
+
+# THE SHARED FENCE TRACKER (section 38). Checks 10/11 scan raw Markdown, so a
+# fenced Implementation Order row plus a fenced heading used to read as a
+# shipped section and raise a blocking stamp-region error over a code sample.
+# `mask_text` blanks every fenced / HTML-comment line to spaces of the SAME
+# length, which keeps every character offset below pointing at the same
+# character of the original file.
+#
+# THE TOOL COMES FROM $REPO_ROOT; THE CORPUS COMES FROM CWD. That split is not
+# incidental -- lint.sh's own fixtures in `scripts/test-tooling.sh` run it from
+# a temp directory holding a synthetic `todo/`, so a CWD-relative path to this
+# module made the loader miss and take every Check 10/11 fixture down with it
+# (14 tooling failures, 2026-08-11). `todo_root` below stays CWD-relative for
+# exactly the reason this path must not be.
+try:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "todo_fence", str(Path(sys.argv[1]) / "scripts" / "todo_fence.py"))
+    _fence = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_fence)
+except Exception as _exc:
+    sys.stderr.write("lint: Check 10/11 cannot load the shared fence "
+                     "tracker (%s)\n" % _exc)
+    sys.exit(2)
+
+# EVERY PATTERN BELOW IS LINE-LOCAL, and that is load-bearing rather than
+# tidiness. `\s` and a negated class like `[^|]` both match a NEWLINE, so once
+# the lines between two real ones are blanked a pattern spanning `\s+` can JOIN
+# them: reproduced 2026-08-11, a bare `##` line, a fenced block and a later
+# `12. Title` line together satisfy `^##\s+12\.\s+(.+?)$` though nothing matches
+# before masking -- a section the file does not have. `| a | b` followed by a
+# real row does the same to an `[^|]*`-based IO pattern. `[ \t]` and `[^|\n]`
+# cannot cross a line, so masking can only ever REMOVE a match (Codex design
+# review, section 38, [medium]). The hazard also predates masking: these
+# patterns could already span lines in an unmasked file.
+
+# Parse the IO table for [x] rows: capture section number + deliverable.
+IO_ROW_RE = re.compile(
+    r"^\|[^|\n]*\|[^|\n]*\|[ \t]*§?[ \t]*(\d+)[ \t]*\|([^|\n]+)\|[^|\n]*\|[ \t]*\[x\][ \t]*\|",
+    re.MULTILINE,
+)
+
+# Section header anchor. DEFINED AND NEVER CONSUMED -- the live heading match is
+# the inline regex inside section_body(). Deliberately left as-is: "fixing" a
+# pattern nothing reads is a no-op dressed as a fix (section 36 round-5
+# consistency review, restated by section 38's checklist).
+SEC_HDR_RE = re.compile(r"^##\s+(\d+)\.\s+(.+?)$", re.MULTILINE)
+
+# Body end-sentinels: stop scanning a section body at any of these.
+# A section body ends at the NEXT level-2 heading of ANY kind. This used to
+# be an allowlist of the five known trailing heading names, which silently
+# over-captured on the 4 TODO files whose trailing heading was not one of
+# them (Bare Metal Testing Plan / Shadow SSDT slot registry / Codex
+# Adversarial Review / Completed (Reference)). Sections use `### ` for their
+# own sub-headings, so a bare `## ` boundary needs no allowlist and cannot
+# go stale as new trailing blocks are added. Same defect class as the
+# section_block over-capture fixed in scripts/overnight/section_slice.py.
+BODY_END_RE = re.compile(r"^##[ \t]+\S", re.MULTILINE)
+
+# Verified date extraction.
+VERIFIED_DATE_RE = re.compile(
+    r"^>[ \t]*\*\*Verified:\*\*[ \t]*(\d{4}-\d{2}-\d{2})",
+    re.MULTILINE,
+)
+
+# Stamp-region required pieces (Check 10).
+NOTES_RE = re.compile(r"^>[ \t]*\*\*Notes:\*\*", re.MULTILINE)
+TEST_RUNNER_RE = re.compile(r"^>[ \t]*\*\*Test runner:\*\*", re.MULTILINE)
+VERIFIED_RE = re.compile(r"^>[ \t]*\*\*Verified:\*\*", re.MULTILINE)
+QUALITY_RE = re.compile(r"^>[ \t]*\*\*Quality reviewed:\*\*", re.MULTILINE)
+NO_TEST_SURFACE_RE = re.compile(
+    r"\*\*Note:\*\*[ \t]*No[ \t]+\w+[ \t]+test[ \t]+surface", re.IGNORECASE
+)
+
+OS_SHIPPED_GLYPHS = ("✅", "✓")
+OS_NOT_SHIPPED_GLYPHS = ("⬜", "⚠️", "Planned")
+
+
+def section_body(text, section_num):
+    m = re.search(
+        r"^##[ \t]+" + str(section_num) + r"\.[ \t]+(.+?)$",
+        text, re.MULTILINE,
+    )
+    if not m:
+        return None
+    start = m.end()
+    end_m = BODY_END_RE.search(text, start)
+    end = end_m.start() if end_m else len(text)
+    return text[start:end]
+
+
+def os_table_block(text):
+    m = re.search(r"^##[ \t]+OS Comparison\b", text, re.MULTILINE)
+    if not m:
+        return ""
+    start = m.end()
+    end_m = re.search(r"^##[ \t]+\w", text[start:], re.MULTILINE)
+    end = start + end_m.start() if end_m else len(text)
+    return text[start:end]
+
+
+def os_row_for_section(os_block, section_num, deliverable_substring):
+    if not os_block:
+        return None
+    sec_marker = "§" + str(section_num)
+    deliv_lower = deliverable_substring.lower().strip()
+    for line in os_block.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        if sec_marker in line:
+            return line
+    if deliv_lower:
+        words = re.findall(r"\b[a-zA-Z][a-zA-Z-]{3,}\b", deliv_lower)
+        if words:
+            needle = words[0]
+            for line in os_block.splitlines():
+                if not line.lstrip().startswith("|"):
+                    continue
+                if needle in line.lower():
+                    return line
+    return None
+
+
+# COMMIT-GATE SCOPE. Under `LINT_GATE_SCOPE_STAGED` these two checks judge the
+# bytes the COMMIT carries, not the bytes on disk -- see the shell block that
+# computes these two sets for why fence-awareness made that distinction matter.
+_STAGED_SCOPE = os.environ.get("LINT_GATE_SCOPE_STAGED", "") == "1"
+_EXCLUDED = {p for p in os.environ.get("LINT_GATE_EXCLUDED_TODO", "").split("\n") if p}
+
+
+# THE DOCUMENT SET. Under the commit gate it comes from the index snapshot, so
+# what is judged is what is being committed; otherwise it is the worktree, which
+# is what a bare `bash scripts/lint.sh` and CI both want.
+if _STAGED_SCOPE:
+    try:
+        _SNAPSHOT, _TREE = _fence.staged_docs(sys.argv[1])
+    except _fence.StagedSnapshotError as _exc:
+        # INFRASTRUCTURE, not a clean bill: passing here would mean passing the
+        # commit unread. Emitted through the block's own ERROR channel so it
+        # lands in the lint summary like any other finding.
+        print("ERROR todo/: Check 10/11 could not read the staged snapshot -- "
+              "%s; refusing rather than judging the working tree instead" % _exc)
+        raise SystemExit(0)
+    _DOCS = sorted(_SNAPSHOT.items())
+else:
+    _DOCS = [(str(p), None) for p in sorted(todo_root.rglob("*.md"))]
+
+for rel, staged_text in _DOCS:
+    md_path = Path(rel)
+    # A file the commit does not touch is not this commit's to judge. Checks
+    # 7/17/24 already worked this way; 10/11 join them because the new
+    # unclosed-delimiter refusal would otherwise let a run's mid-edit TODO
+    # block an unrelated commit -- the exact wedge that scoping exists to stop.
+    if _STAGED_SCOPE and rel in _EXCLUDED:
+        continue
+    try:
+        raw = staged_text if staged_text is not None \
+            else md_path.read_text(encoding="utf-8")
+    except Exception:
+        continue
+    # An unclosed fence or `<!--` masks its opener to EOF, so every walk below
+    # would find no IO rows and report the file clean because it could not read
+    # it. Say so instead -- `build.py` refuses the same documents, and a gate
+    # that went quiet would silently disagree with the producer about the same
+    # file (Codex design review, section 38, [high]).
+    _why = _fence.scan_text(raw).unclosed_reason()
+    if _why:
+        errors.append(f"{rel}: cannot be checked -- {_why} (Check 10/11)")
+        continue
+    text = _fence.mask_text(raw)
+    os_block = os_table_block(text)
+    for m in IO_ROW_RE.finditer(text):
+        sec_num = int(m.group(1))
+        deliv = m.group(2).strip()
+        body = section_body(text, sec_num)
+        if body is None:
+            continue
+        ver_m = VERIFIED_DATE_RE.search(body)
+        if not ver_m:
+            continue
+        ver_date = ver_m.group(1)
+        if ver_date < LINT_LAND_DATE:
+            continue
+
+        if not SKIP_C10:
+            missing_pieces = []
+            if not NOTES_RE.search(body):
+                missing_pieces.append("Notes")
+            has_test_runner = bool(TEST_RUNNER_RE.search(body))
+            has_no_test_exemption = bool(NO_TEST_SURFACE_RE.search(body))
+            if not has_test_runner and not has_no_test_exemption:
+                missing_pieces.append("Test runner")
+            if not VERIFIED_RE.search(body):
+                missing_pieces.append("Verified")
+            if not QUALITY_RE.search(body):
+                missing_pieces.append("Quality reviewed")
+            if missing_pieces:
+                deliv_short = deliv[:40].strip()
+                errors.append(
+                    f"{rel}: section-{sec_num} ({deliv_short}) stamp-region "
+                    f"missing: {', '.join(missing_pieces)} (Check 10)"
+                )
+
+        if not SKIP_C11:
+            os_row = os_row_for_section(os_block, sec_num, deliv)
+            if os_row is None:
+                deliv_short = deliv[:40].strip()
+                warnings.append(
+                    f"{rel}: section-{sec_num} ({deliv_short}) has no "
+                    f"matchable OS Comparison row (Check 11)"
+                )
+            else:
+                shipped = any(g in os_row for g in OS_SHIPPED_GLYPHS)
+                not_shipped = any(g in os_row for g in OS_NOT_SHIPPED_GLYPHS)
+                if not shipped and not_shipped:
+                    errors.append(
+                        f"{rel}: section-{sec_num} IO row [x] but matching "
+                        f"OS Comparison row is not shipped (Check 11)"
+                    )
+
+for w in warnings:
+    print(f"WARN {w}")
+for e in errors:
+    print(f"ERROR {e}")
+PYEOF
+)"
+    if [ -n "$LINT_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                ERROR\ *)
+                    echo -e "${RED}error${NC}: ${line#ERROR }"
+                    ERRORS=$((ERRORS + 1))
+                    ;;
+                WARN\ *)
+                    echo -e "${YELLOW}warn${NC}: ${line#WARN }"
+                    WARNINGS=$((WARNINGS + 1))
+                    ;;
+            esac
+        done <<< "$LINT_OUT"
+    fi
+    if [ "${SKIP_LINT_STAMP_REGION:-}" = "1" ]; then
+        echo -e "${YELLOW}warn${NC}: Check 10 (stamp-region) skipped via SKIP_LINT_STAMP_REGION=1"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+    if [ "${SKIP_LINT_OS_COMPARISON:-}" = "1" ]; then
+        echo -e "${YELLOW}warn${NC}: Check 11 (OS comparison) skipped via SKIP_LINT_OS_COMPARISON=1"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 12: Codex prompt argument escaping (per the prompt-argument escaping
+# doctrine section of 00-infrastructure/TODO-08-automation-hardening). Source
+# text is the LOAD-BEARING safety: every documented Codex dispatch in
+# .claude/skills/, scripts/, docs/ MUST single-quote its prompt body so bash
+# never evaluates the dispatch text. Patterns flagged at WARN:
+#   - prompt body in DOUBLE quotes contains $(...) / ${...} / un-escaped
+#     `<` that bash would parse as redirect
+# WARN-first per the partial-enforcement-heuristics promotion doctrine; can
+# graduate to ERROR after FP ratio observed.
+if [ "${SKIP_LINT_PROMPT_ESCAPING:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 12 (codex-prompt-escaping) skipped via SKIP_LINT_PROMPT_ESCAPING=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    LINT12_OUT="$(python3 - <<'PYEOF'
+import pathlib, re, sys
+
+# Match a Codex dispatch invocation on a single line. Two shapes:
+#   1. node ".../codex-companion.mjs" adversarial-review <body>
+#   2. bash scripts/codex-dispatch.sh <body>
+# For each, capture the body argument (everything after the
+# subcommand / wrapper script up to end of line). The body MAY be
+# wrapped in single quotes, double quotes, or unquoted (latter is a
+# different lint failure -- whitespace splits multi-word body across
+# argv).
+CODEX_LINE_RE = re.compile(
+    r"(?:codex-companion\.mjs[^\n]*?adversarial-review|codex-dispatch\.sh)"
+    r"\s+(.*)$"
+)
+
+# Inside a captured body, detect:
+#   - $( or ${ inside DOUBLE quotes (would expand)
+#   - un-escaped < that looks like a redirect AND is OUTSIDE quotes
+DANGER_DOUBLE = re.compile(r'"[^"]*?(\$\(|\$\{)[^"]*?"')
+
+ROOTS = ["scripts", ".claude/skills", "docs"]
+EXTENSIONS = (".sh", ".md", ".py", ".mjs")
+warnings = []
+
+for root in ROOTS:
+    p = pathlib.Path(root)
+    if not p.exists():
+        continue
+    for f in p.rglob("*"):
+        if not f.is_file() or not f.name.endswith(EXTENSIONS):
+            continue
+        # Skip the wrapper script + this lint scanner itself + the
+        # canonical doctrine doc -- they document the patterns we
+        # flag elsewhere.
+        rel = str(f)
+        if rel.endswith("scripts/codex-dispatch.sh"):
+            continue
+        if rel.endswith("scripts/lint.sh"):
+            continue
+        if rel.endswith(".claude/skills/codex-prompt-shape.md"):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for ln_no, ln in enumerate(text.splitlines(), 1):
+            m = CODEX_LINE_RE.search(ln)
+            if not m:
+                continue
+            body = m.group(1)
+            # Skip lines that are clearly prose talking about the
+            # pattern (e.g. lint check 12 description, the doctrine
+            # rule statement). Heuristic: prose lines start with
+            # markdown emphasis markers or are inside a code-fence
+            # for documentation. Cheaper heuristic: body must look
+            # like an actual bash arg (starts with " or ' or a
+            # placeholder like <).
+            stripped = body.lstrip()
+            if not stripped:
+                continue
+            if stripped[0] not in ('"', "'", "<"):
+                # Prose mention, not an actual invocation. Skip.
+                continue
+            if stripped[0] == "'":
+                # Single-quoted body: bash never EXPANDS it, but a literal INNER
+                # apostrophe (e.g. "exec'd", "wrapper's") closes the quote EARLY
+                # and exposes the rest of the line to the parser (E1: a following
+                # ( or ` then syntax-errors). Flag the premature-close shape --
+                # an apostrophe immediately followed by an alnum -- after removing
+                # the VALID escape sequence '\''. Conservative: legitimate string
+                # concatenation ('a' 'b') and trailing comments are not alnum.
+                probe = stripped.replace("'\\''", "")
+                first = probe.find("'")
+                second = probe.find("'", first + 1)
+                if (second != -1 and second + 1 < len(probe)
+                        and probe[second + 1].isalnum()):
+                    warnings.append(f"{rel}:{ln_no}: Codex prompt single-quoted body has an INNER apostrophe (e.g. \"exec'd\") that closes the quote early -- bash then parses the rest and can syntax-error on a following ( or backtick. Use the heredoc form (PROMPT=$(cat <<'EOF' ... EOF); codex-dispatch.sh \"$PROMPT\") or escape as '\\''. (E1)")
+                continue
+            if stripped[0] == "<":
+                # Unquoted placeholder body. Real invocation would
+                # fail to parse -- catch as separate lint at the
+                # caller site, not here.
+                continue
+            # Double-quoted body: scan for $(/${
+            if DANGER_DOUBLE.search(body):
+                warnings.append(f"{rel}:{ln_no}: Codex prompt in double quotes contains $( or ${{ that bash will expand. Single-quote the prompt: '<body>' instead of \"<body>\".")
+
+for w in warnings:
+    print(f"WARN {w}")
+PYEOF
+)"
+    if [ -n "$LINT12_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                WARN\ *)
+                    echo -e "${YELLOW}warn${NC}: ${line#WARN }"
+                    WARNINGS=$((WARNINGS + 1))
+                    ;;
+            esac
+        done <<< "$LINT12_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 13: Review/task citations in source comments
+# ============================================================================
+# C / asm comments must not carry review-archaeology attributions like
+# "(Codex H1 ...)", "Codex M3 fix:", "incident YYYY-MM-DD", "see commit
+# <hash>", or "per Codex review". Per CLAUDE.md "Don't reference the
+# current task, fix, or callers ... those belong in the PR description
+# and rot as the codebase evolves."
+#
+# Files already on the legacy allowlist below WARN (cleanup is in
+# progress); any other file ERRORS so new citations cannot land.
+#
+# Skip the whole check via SKIP_LINT_CITATIONS=1; the skip prints a
+# visible WARN line so bypasses are auditable.
+if [ "${SKIP_LINT_CITATIONS:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 13 (citation guard) skipped via SKIP_LINT_CITATIONS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ "$#" -eq 0 ]; then
+    # Citation patterns. Each pattern's match anchors must align with
+    # the actual citation form, not random uses of the underlying
+    # word. "Codex" alone is too loose (it matches the OpenAI product
+    # name in legitimate API docs); require a citation cue (Mn/Hn/Fn,
+    # fix, review, finding, round) within ~40 chars to reduce false
+    # positives.  Per-line opt-out: /* CITATION-OK: <reason> */ marker.
+    CITATION_RE='(\bCodex\b[^A-Za-z0-9_]{1,40}([HMFCS][0-9]|fix|review|finding|round|adversarial|consistency)|review caught|adversarial review|consistency review|design review|post-impl review|incident 20[0-9]{2}-[0-9]{2}-[0-9]{2}|see commit [0-9a-f]{7,}|per Codex review)'
+
+    # Vendored / third-party paths that we do not own.
+    is_citation_vendored() {
+        local path="$1"
+        case "$path" in
+            include/stb_truetype.h) return 0 ;;
+            src/libs/*) return 0 ;;
+        esac
+        return 1
+    }
+
+    # Files with pre-existing citations -- WARN-only while the manual
+    # cleanup sweep is in progress. Keep sorted for diff hygiene; remove
+    # entries as files are scrubbed clean.
+    CITATION_LEGACY_FILES=()
+
+    is_citation_legacy() {
+        local path="$1"
+        local legacy
+        for legacy in "${CITATION_LEGACY_FILES[@]}"; do
+            [ "$path" = "$legacy" ] && return 0
+        done
+        return 1
+    }
+
+    while IFS=: read -r file linenum rest; do
+        [ -z "$file" ] && continue
+        relpath="${file#"$REPO_ROOT"/}"
+        if is_citation_vendored "$relpath"; then
+            continue
+        fi
+        # Inline allowlist marker: a same-line `CITATION-OK: <reason>`
+        # token (with at least one word of reason) opts the line out.
+        # Use sparingly -- the marker must justify why the citation is
+        # real-and-not-archaeology (e.g. "OpenAI Codex API name",
+        # "upstream commit ref needed for repro").
+        if echo "$rest" | grep -qE 'CITATION-OK:[[:space:]]*[A-Za-z]'; then
+            continue
+        fi
+        # Restrict matches to lines that look like comments (start with
+        # *, //, or /*, or sit inside a known comment block). The grep
+        # pattern is loose; this gate prevents false positives on code
+        # identifiers that happen to share a token (e.g. a variable
+        # literally named codex_review_completed in a hook is a path,
+        # not a citation).
+        if ! echo "$rest" | grep -qE '^\s*(\*|//|/\*)'; then
+            # Allow content after a // on the same line as code.
+            if ! echo "$rest" | grep -qE '//.*'"$CITATION_RE"; then
+                continue
+            fi
+        fi
+        if is_citation_legacy "$relpath"; then
+            warn "$relpath" "$linenum" "review/task citation in comment (legacy; tracked for manual cleanup)"
+        else
+            error "$relpath" "$linenum" "review/task citation in comment (CLAUDE.md: belongs in PR description, not source; or add /* CITATION-OK: <reason> */ if genuine)"
+        fi
+    done < <(
+        grep -rnHE "$CITATION_RE" \
+            --include='*.c' --include='*.h' --include='*.cc' --include='*.cpp' --include='*.hpp' \
+            --include='*.asm' --include='*.S' --include='*.s' \
+            --exclude-dir='.git' --exclude-dir='build' --exclude-dir='node_modules' \
+            "$REPO_ROOT/src" "$REPO_ROOT/include" 2>/dev/null \
+        || true
+    )
+fi
+
+# ============================================================================
+# Check 14: Agent tool-allowlist invariant (specialist-agents design 2026-06-20;
+#           runner class added 2026-07-02)
+# ============================================================================
+# Two sanctioned agent classes, each capability-bounded:
+#   ANALYST (default): `tools:` must be a subset of the read-only allowlist
+#     {Read, Grep, Glob, WebSearch, WebFetch}. Sensors, not actuators.
+#   RUNNER (opt-in via `<!-- agent-class: runner -->` on its own line): may add
+#     Bash for named idempotent command execution (build/test/lint runs, git/gh
+#     READ queries); allowlist is {Bash, Read, Grep, Glob} -- no Edit/Write/
+#     Skill/Agent (cannot mutate files or spawn work) and no Web tools (research
+#     stays with the analysts). The main session remains the sole
+#     editor/committer/Codex-dispatcher and re-verifies runner-reported
+#     artifacts (build.log tails, test summaries) itself.
+# A missing `tools:` line (the agent would inherit ALL tools) is a violation in
+# both classes. Per-file opt-out for a deliberately-broader future agent: an
+# HTML comment `<!-- agent-tools-exempt: <reason> -->` on its own line.
+# Whole-check skip: SKIP_LINT_AGENT_TOOLS=1 (prints an auditable WARN).
+if [ "${SKIP_LINT_AGENT_TOOLS:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 14 (agent tool-allowlist) skipped via SKIP_LINT_AGENT_TOOLS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ "$#" -eq 0 ]; then
+    AGENT_TOOLS_OUT=$(python3 - "$REPO_ROOT" <<'PY'
+import sys, glob, os, re
+root = sys.argv[1]
+ANALYST_ALLOWED = {"Read", "Grep", "Glob", "WebSearch", "WebFetch"}
+RUNNER_ALLOWED = {"Bash", "Read", "Grep", "Glob"}
+# Runner class is roster-gated: the marker ALONE cannot mint a runner. Adding a
+# runner is a deliberate act that edits this roster (and gets reviewed).
+RUNNER_ROSTER = {"checks-runner.md", "git-historian.md", "gh-query-runner.md"}
+# Model pins are ALIASES so every agent follows the newest release of its tier
+# with no edit (Sonnet 5 -> 5.5 happened that way, 2026-09-29). A dated ID such
+# as `claude-sonnet-5` freezes the agent on an old model, and a missing line
+# silently inherits the session model (Opus). Opus is roster-gated like the
+# runner class: kernel-quality-auditor stays on Opus by operator decision
+# (2026-09-29), and any other agent moving up is a deliberate roster edit.
+MODEL_ALIASES = {"sonnet", "opus", "haiku", "inherit"}
+# Every agent runs at medium by operator decision (2026-11-06). A missing line
+# silently inherits the session's effort, so absence is refused like a wrong value.
+AGENT_EFFORT = "medium"
+OPUS_ROSTER = {"kernel-quality-auditor.md"}
+viol = []
+for path in sorted(glob.glob(os.path.join(root, ".claude/agents/*.md"))):
+    rel = os.path.relpath(path, root)
+    base = os.path.basename(path)
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    mm = re.search(r'^model:\s*(\S*)\s*$', text, re.M)
+    mln = text[:mm.start()].count('\n') + 1 if mm else 1
+    model = mm.group(1).strip('"\'') if mm else ""
+    if not mm:
+        viol.append((rel, 1, "no `model:` line (the agent would inherit the session model, usually Opus); pin an alias: sonnet, opus, haiku"))
+    elif model not in MODEL_ALIASES:
+        viol.append((rel, mln, f"`model: {model}` is not an alias; use one of sonnet, opus, haiku, inherit so the agent follows the newest release"))
+    elif model == "opus" and base not in OPUS_ROSTER:
+        viol.append((rel, mln, "`model: opus` but not in Check 14 OPUS_ROSTER (moving an agent to Opus is a deliberate roster edit in scripts/lint.sh)"))
+    if base in OPUS_ROSTER and model != "opus":
+        viol.append((rel, mln, "in OPUS_ROSTER but not `model: opus` (kernel-quality-auditor stays on Opus by operator decision 2026-09-29)"))
+    em = re.search(r'^effort:\s*(\S*)\s*$', text, re.M)
+    if not em or em.group(1).strip('"\'') != AGENT_EFFORT:
+        eln = text[:em.start()].count('\n') + 1 if em else 1
+        viol.append((rel, eln, f"`effort: {AGENT_EFFORT}` is required on every agent (operator decision 2026-11-06)"))
+    if re.search(r'^<!--\s*agent-tools-exempt:\s*\S', text, re.M):
+        continue
+    has_marker = bool(re.search(r'^<!--\s*agent-class:\s*runner\s*-->', text, re.M))
+    is_runner = has_marker and base in RUNNER_ROSTER
+    if has_marker and base not in RUNNER_ROSTER:
+        viol.append((rel, 1, "agent-class runner marker but not in Check 14 RUNNER_ROSTER (adding a runner requires editing the roster in scripts/lint.sh)"))
+    if is_runner and not re.search(r'^##\s*Forbidden\s*--\s*hard rules', text, re.M):
+        viol.append((rel, 1, "runner agent missing the required '## Forbidden -- hard rules' section"))
+    allowed = RUNNER_ALLOWED if is_runner else ANALYST_ALLOWED
+    klass = "runner" if is_runner else "read-only"
+    m = re.search(r'^tools:\s*(.*)$', text, re.M)
+    if not m:
+        viol.append((rel, 1, "no `tools:` allowlist (agent would inherit ALL tools; restrict to read-only set)"))
+        continue
+    inline = m.group(1).strip().strip('[]')
+    toks = []
+    if inline:
+        toks = [t.strip().strip('"').strip("'") for t in inline.split(',') if t.strip()]
+    else:
+        for line in text[m.end():].splitlines():
+            lm = re.match(r'\s*-\s*(.+?)\s*$', line)
+            if lm:
+                toks.append(lm.group(1).strip('"').strip("'"))
+            elif line.strip() == "":
+                continue
+            else:
+                break
+    bad = [t for t in toks if t not in allowed]
+    ln = text[:m.start()].count('\n') + 1
+    if not toks:
+        viol.append((rel, ln, "empty `tools:` allowlist (could not parse a read-only tool set)"))
+    elif bad:
+        viol.append((rel, ln, "tools not in " + klass + " allowlist " + ("{Bash,Read,Grep,Glob}" if is_runner else "{Read,Grep,Glob,WebSearch,WebFetch}") + ": " + ", ".join(bad)))
+for rel, ln, msg in viol:
+    print(f"{rel}\t{ln}\t{msg}")
+PY
+)
+    if [ -n "$AGENT_TOOLS_OUT" ]; then
+        while IFS=$'\t' read -r at_rel at_ln at_msg; do
+            [ -z "$at_rel" ] && continue
+            error "$at_rel" "$at_ln" "$at_msg"
+        done <<< "$AGENT_TOOLS_OUT"
+    fi
+fi
+
+# --- Check 15: no &-bundled Codex dispatch in documented examples -----------
+# Two codex-dispatch.sh in one command (joined by & / && / ;) records only the
+# first review-kind and breaks the section-commit gate. Run each dispatch as its
+# own Bash call. WARN-only: catches drift in skills/scripts/docs examples.
+if [ "${SKIP_LINT_CODEX_BUNDLE:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 15 (codex-&-bundle) skipped via SKIP_LINT_CODEX_BUNDLE=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    LINT15_OUT="$(python3 - "$REPO_ROOT" <<'PYEOF'
+import os, re, sys
+root = sys.argv[1]
+roots = ["scripts", ".claude/skills", "docs"]
+exts = (".sh", ".md", ".py", ".mjs")
+self_name = "lint.sh"
+two = re.compile(r"codex-(?:bg-)?dispatch\.sh.*(?:&&|&|;).*codex-(?:bg-)?dispatch\.sh")
+bg = re.compile(r"codex-(?:bg-)?dispatch\.sh[^\n]*\s&\s*$")
+warns = []
+for base in roots:
+    for dirpath, _dirs, files in os.walk(os.path.join(root, base)):
+        for fn in files:
+            if not fn.endswith(exts) or fn == self_name:
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            # design docs (specs/plans) legitimately discuss the anti-pattern.
+            if rel.startswith(("docs/specs/", "docs/plans/")):
+                continue
+            try:
+                lines = open(os.path.join(dirpath, fn), encoding="utf-8",
+                             errors="replace").read().splitlines()
+            except OSError:
+                continue
+            for i, ln in enumerate(lines, 1):
+                if two.search(ln) or bg.search(ln):
+                    warns.append(f"{rel}:{i}: &-bundled codex dispatch -- run each "
+                                 f"dispatch as its own Bash call")
+for w in warns:
+    print(f"WARN {w}")
+PYEOF
+)"
+    if [ -n "$LINT15_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                WARN\ *)
+                    echo -e "${YELLOW}warn${NC}: ${line#WARN }"
+                    WARNINGS=$((WARNINGS + 1))
+                    ;;
+            esac
+        done <<< "$LINT15_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 16: Tracked-secret guard (TODO-08 automation hardening)
+# ============================================================================
+# A live OpenRouter key was once committed inside a tracked *.example
+# template (2026-06 incident; scrubbed from history). Two rules over
+# TRACKED content, replacing the guard lost with the Conclave removal:
+#   - basename `secret` or `secrets.json` must never be tracked
+#     (templates ship as *.example with placeholder values);
+#   - live API-key material (OpenRouter sk-or-v1-<hex>, OpenAI sk-proj-,
+#     Anthropic sk-ant-) must never appear in tracked text. The regexes
+#     require real key length, so pattern DOCUMENTATION does not trip them.
+# Skip via SKIP_LINT_SECRETS=1 (visible WARN so bypasses stay auditable).
+if [ "${SKIP_LINT_SECRETS:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 16 (tracked-secret guard) skipped via SKIP_LINT_SECRETS=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    # parameter expansion, not a basename subprocess: the per-file spawn cost
+    # ~2.5s over ~2000 tracked files on every pre-commit run (perf finding)
+    while IFS= read -r sfile; do
+        sbase=${sfile##*/}
+        if [ "$sbase" = "secret" ] || [ "$sbase" = "secrets.json" ]; then
+            echo -e "${RED}error${NC}: $sfile: tracked-secret: basename '$sbase' must not be tracked (gitignore it; ship a *.example template with placeholders)"
+            ERRORS=$((ERRORS + 1))
+        fi
+    done < <(git ls-files)
+    # scan BOTH the index (--cached: what a commit would ship, closing the
+    # stage-then-clean-worktree bypass) and the worktree (hygiene), dedup by path
+    SECRET_RE='sk-or-v1-[a-f0-9]{48,}|sk-proj-[A-Za-z0-9_-]{40,}|sk-ant-[A-Za-z0-9_-]{40,}'
+    SECRET_HITS=$( { git grep --cached -l -I -E "$SECRET_RE" -- . 2>/dev/null; \
+                     git grep -l -I -E "$SECRET_RE" -- . 2>/dev/null; } | sort -u || true)
+    if [ -n "$SECRET_HITS" ]; then
+        while IFS= read -r shit; do
+            echo -e "${RED}error${NC}: ${shit}: tracked-secret: live API-key pattern in staged/tracked content (rotate the key, scrub the file, gitignore the real secret)"
+            ERRORS=$((ERRORS + 1))
+        done <<< "$SECRET_HITS"
+    fi
+fi
+
+# ============================================================================
+# Check 17: TODO table column alignment (informational -- WARN only)
+# ============================================================================
+# Cosmetic-only: renderers ignore source whitespace in tables entirely, so a
+# ragged table is never a correctness problem, only harder to skim in a raw
+# editor/terminal. scripts/format-md-tables.py already skips prose-heavy
+# tables (History/Notes logs) on its own -- see its docstring -- so this
+# check only flags the short, genuinely tabular tables worth aligning.
+# Skip via SKIP_LINT_TABLE_ALIGN=1.
+if [ "${SKIP_LINT_TABLE_ALIGN:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 17 (table-column-align) skipped via SKIP_LINT_TABLE_ALIGN=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    # One summary line, not one per file -- this is repo-wide-scan cosmetic
+    # debt (measured 2026-07-05: 213/251 todo/*.md files), and per-file WARN
+    # spam here would drown out every other check on every future commit.
+    # THE WHOLE ENVELOPE IS VALIDATED, not just the output (section 43). This
+    # was `2>/dev/null || true`, which erased the diagnostic AND the status --
+    # and `--check` legitimately exits 1 for violations, so an uncaught
+    # MaskUnavailable out of the formatter's fence walk (it has no top-level
+    # handler) exited 1 with a traceback on stderr and empty stdout, and was
+    # counted as ZERO unaligned files. A refusal read as a pass is the exact
+    # defect Check 19 was hardened against in section 41; this is that shape.
+    # A MISSING TOOL IS NOT A CRASHED TOOL, and the distinction has to be made
+    # BEFORE the envelope below, which treats every unexpected rc as an error.
+    # `python3 <absent script>` exits 2, so without this a tree that simply does
+    # not carry the formatter -- every synthetic lint fixture under
+    # `scripts/test-tooling.sh` -- would report a Check 17 error about a file it
+    # has nothing to do with. Same shape and same wording as Check 7's missing
+    # cache: skipped, WARNED, and visible.
+    if [ ! -f "$REPO_ROOT/scripts/format-md-tables.py" ]; then
+        echo -e "${YELLOW}warn${NC}: Check 17 (table-column-align) skipped -- scripts/format-md-tables.py is absent"
+        WARNINGS=$((WARNINGS + 1))
+        TABLE_ALIGN_RAW=""
+        TABLE_ALIGN_ERR=""
+    else
+    TABLE_ALIGN_ERR=$(mktemp) || { echo -e "${RED}error${NC}: Check 17 (table-column-align) mktemp failed -- the alignment scan did not run"; ERRORS=$((ERRORS + 1)); TABLE_ALIGN_ERR=""; }
+    TABLE_ALIGN_RC=0
+    if [ -n "$TABLE_ALIGN_ERR" ]; then
+        TABLE_ALIGN_RAW=$(python3 "$REPO_ROOT/scripts/format-md-tables.py" --check "$REPO_ROOT/todo" 2>"$TABLE_ALIGN_ERR") || TABLE_ALIGN_RC=$?
+        # EVERY line must be a record, and stderr must be EMPTY. Counting
+        # record-SHAPED lines is not enough: `format-md-tables.py` prints as it
+        # walks (`format-md-tables.py:397`), so it can emit a valid
+        # `would align: <path>` and THEN raise on a later file -- rc 1, one good
+        # record, a traceback on stderr, and a partial count published as the
+        # verdict. That is the same erased-refusal defect in a narrower window
+        # (Codex adversarial, section 43, [medium]). The producer's record is
+        # exactly `would align: <path>` in --check mode, so anything else on
+        # stdout, or anything at all on stderr, means the scan did not complete.
+        TABLE_ALIGN_RECORDS=$(printf '%s' "$TABLE_ALIGN_RAW" | grep -c . || true)
+        TABLE_ALIGN_ODD=$(printf '%s' "$TABLE_ALIGN_RAW" | grep -cvE '^would align: .' || true)
+        TABLE_ALIGN_NOISE=0
+        [ -s "$TABLE_ALIGN_ERR" ] && TABLE_ALIGN_NOISE=1
+        TABLE_ALIGN_BAD=0
+        case "$TABLE_ALIGN_RC" in
+            0) [ "${TABLE_ALIGN_RECORDS:-0}" -eq 0 ] || TABLE_ALIGN_BAD=1 ;;
+            1) [ "${TABLE_ALIGN_RECORDS:-0}" -gt 0 ] || TABLE_ALIGN_BAD=1 ;;
+            *) TABLE_ALIGN_BAD=1 ;;
+        esac
+        [ "${TABLE_ALIGN_ODD:-0}" -eq 0 ] || TABLE_ALIGN_BAD=1
+        [ "$TABLE_ALIGN_NOISE" = "0" ] || TABLE_ALIGN_BAD=1
+        if [ "$TABLE_ALIGN_BAD" = "1" ]; then
+            TABLE_ALIGN_SAID=0
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                echo -e "${RED}error${NC}: Check 17 (table-column-align) $line"
+                ERRORS=$((ERRORS + 1))
+                TABLE_ALIGN_SAID=1
+            done < "$TABLE_ALIGN_ERR"
+            if [ "$TABLE_ALIGN_SAID" = "0" ]; then
+                echo -e "${RED}error${NC}: Check 17 (table-column-align) scripts/format-md-tables.py exited $TABLE_ALIGN_RC with $TABLE_ALIGN_RECORDS output line(s), $TABLE_ALIGN_ODD of them not a \`would align: <path>\` record, and no diagnostic -- the alignment scan did not complete"
+                ERRORS=$((ERRORS + 1))
+            fi
+            # A broken scan reports NOTHING further: the count below would be
+            # partial output, and a partial count published as the verdict is
+            # how the erased refusal looked clean in the first place.
+            TABLE_ALIGN_RAW=""
+        fi
+        rm -f "$TABLE_ALIGN_ERR"
+    else
+        TABLE_ALIGN_RAW=""
+    fi
+    fi
+    # Drop findings in files the commit does not touch, through the SHARED
+    # predicate rather than a second copy of it (section 39). A mid-edit table
+    # is ragged for a moment by nature; that is the editing session's business,
+    # not this commit's.
+    if [ -n "$TABLE_ALIGN_RAW" ]; then
+        TABLE_ALIGN_RAW=$(printf '%s\n' "$TABLE_ALIGN_RAW" | gate_exclude_lines leading-path)
+    fi
+    TABLE_ALIGN_COUNT=$(printf '%s' "$TABLE_ALIGN_RAW" | grep -c . || true)
+    if [ "${TABLE_ALIGN_COUNT:-0}" -gt 0 ]; then
+        # PROMOTED TO ERROR 2026-08-02. It sat as a cosmetic warning and 22
+        # files drifted, which is a real daily cost for anyone who READS these
+        # files raw -- the rendering is unaffected, the source skim is not.
+        # Warnings do not stop drift; the whole corpus was aligned in one pass
+        # (whitespace-only inside table rows; the tool refuses prose tables
+        # with cells over --max-cell) and gating is what keeps it aligned.
+        # One command fixes it, and the message says so.
+        echo -e "${RED}error${NC}: Check 17 (table-column-align) $TABLE_ALIGN_COUNT todo/*.md file(s) have unaligned table columns -- fix with: python3 scripts/format-md-tables.py todo/"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 18: no bespoke session-lifecycle code in the runner control plane
+# ============================================================================
+# The "structural-wait" apparatus -- a session that exited and relied on a
+# bespoke detached watcher to relaunch it -- broke the overnight runner
+# repeatedly (cgroup escape, pid-1 watchers, deadlocked flock) before it was
+# ripped out 2026-07-11. The ONLY sanctioned relaunch is the *:0/10 systemd
+# watchdog timer; reviews are polled IN-SESSION. This check flags any detach
+# primitive (setsid / nohup / disown / systemd-run) added to a control-plane
+# file (per scripts/overnight/control-plane-manifest.txt) unless it carries a
+# `LIFECYCLE-WAIVER:` comment on its line or one of the two lines above -- so
+# re-introducing the fragile pattern is a conscious, reviewed act.
+# Skip via SKIP_LINT_LIFECYCLE=1 (visible WARN so bypasses stay auditable).
+if [ "${SKIP_LINT_LIFECYCLE:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 18 (runner-lifecycle) skipped via SKIP_LINT_LIFECYCLE=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    LINT18_OUT="$(python3 - "$REPO_ROOT" <<'PYEOF'
+import os, re, subprocess, sys
+root = sys.argv[1]
+manifest = os.path.join(root, "scripts/overnight/control-plane-manifest.txt")
+prefixes = []
+try:
+    for ln in open(manifest, encoding="utf-8"):
+        ln = ln.split("#", 1)[0].strip()
+        if ln:
+            prefixes.append(ln)
+except OSError:
+    prefixes = []
+
+def in_cp(rel):
+    return any(rel == p or (p.endswith("/") and rel.startswith(p)) for p in prefixes)
+
+# Shell files: the bare detach COMMANDS are real invocations. A trailing colon
+# means a label string (DETACH="setsid:$!"), not a command -- exclude it.
+sh_prim = re.compile(r"(?<![\w.-])(setsid|nohup|disown|systemd-run)(?![\w.:-])")
+# Python/node: match REAL detach signals, not bare words -- so a string token in
+# an allowlist (e.g. section_commit_gate's _WRAPPER_TOKENS {"setsid","nohup"})
+# is not a false positive, while os.setsid / start_new_session=True /
+# preexec_fn / os.fork / a systemd-run argv ARE flagged.
+py_prim = re.compile(
+    r"os\.setsid|start_new_session\s*=\s*True|preexec_fn|os\.fork\b|"
+    r"(?<![\w.-])systemd-run(?![\w.:-])")
+
+def waived_above(lines, i):
+    """A LIFECYCLE-WAIVER on the invocation line or anywhere in the contiguous
+    comment/blank block immediately above it."""
+    if "LIFECYCLE-WAIVER:" in lines[i]:
+        return True
+    j = i - 1
+    while j >= 0:
+        s = lines[j].lstrip()
+        if s == "" or s.startswith("#") or s.startswith("//"):
+            if "LIFECYCLE-WAIVER:" in lines[j]:
+                return True
+            j -= 1
+            continue
+        break
+    return False
+
+try:
+    tracked = subprocess.run(["git", "-C", root, "ls-files"],
+                             capture_output=True, text=True).stdout.splitlines()
+except Exception:
+    tracked = []
+errs = []
+for rel in tracked:
+    if not in_cp(rel):
+        continue
+    # The tests dir NAMES these primitives to forbid them; the manifest/matcher
+    # list them as data. None are invocations.
+    if "/tests/" in rel or rel.endswith(("control-plane-manifest.txt",
+                                         "control-plane-match.sh")):
+        continue
+    is_py = rel.endswith((".py", ".mjs", ".js"))
+    is_sh = rel.endswith(".sh")
+    if not (is_py or is_sh):
+        continue
+    prim = py_prim if is_py else sh_prim
+    try:
+        lines = open(os.path.join(root, rel), encoding="utf-8",
+                     errors="replace").read().splitlines()
+    except OSError:
+        continue
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith("#") or s.startswith("//"):
+            continue  # comment -- discussion, not an invocation
+        m = prim.search(ln)
+        if not m or waived_above(lines, i):
+            continue
+        errs.append(f"{rel}:{i+1}: control-plane '{m.group(0)}' without a "
+                    f"LIFECYCLE-WAIVER -- the *:0/10 watchdog is the only "
+                    f"sanctioned relaunch; add a waiver comment if this "
+                    f"detaches a REVIEW/job (not the session)")
+for e in errs:
+    print(f"ERROR {e}")
+PYEOF
+)"
+    if [ -n "$LINT18_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                ERROR\ *)
+                    echo -e "${RED}error${NC}: ${line#ERROR }"
+                    ERRORS=$((ERRORS + 1))
+                    ;;
+            esac
+        done <<< "$LINT18_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 19: TODO prose shape -- item-length cap and hard-wrapped prose
+# ============================================================================
+# WHY THIS IS HERE AND NOT ONLY IN A HOOK. Both rules already have PreToolUse
+# hooks (todo_item_line_length, todo_wrap_reminder) and both hooks work -- on
+# Edit/Write. Neither sees a `python3` heredoc or rewrite script run through
+# Bash, which is how the operator AND the unattended runner most often write
+# TODO content. Measured 2026-07-28: five over-cap items landed after the
+# item-length hook shipped, in exactly the two commits that used the script
+# path. lint.sh is the only layer that reaches CI (build.yml, release.yml), so
+# without an entry here the rules are invisible to CI entirely.
+#
+# WARN-only, and one summary line per rule, following Check 17's precedent:
+# this is repo-wide legacy debt (measured 2026-07-28: 1,407 over-cap items
+# across 141 files; 35 files with hard-wrapped prose), so erroring would fail
+# every commit until a sweep lands and per-item WARNs would drown every other
+# check. Enforcement on NEW content is scripts/todo-staged-check.py at
+# pre-commit, which judges only ADDED lines.
+# Skip via SKIP_LINT_TODO_PROSE=1.
+if [ "${SKIP_LINT_TODO_PROSE:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 19 (todo-prose) skipped via SKIP_LINT_TODO_PROSE=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    # The trailing /dev/null is load-bearing, not defensive noise: awk with
+    # an EMPTY file-operand list falls back to stdin and blocks there
+    # forever. `find` yields nothing whenever this runs against a tree with
+    # no todo/ directory -- which is exactly what the tooling suite's
+    # scratch-repo fixtures do -- so without it a lint invocation hangs
+    # indefinitely instead of reporting. Measured 2026-07-30: an 18-minute
+    # stall in scripts/test-tooling.sh with awk parked in
+    # unix_stream_read_generic, which in an unattended run is a hang with
+    # no verdict rather than a slow gate. /dev/null contributes no lines,
+    # so the counts are unchanged.
+    LINT19_ITEMS=$(awk '/^ *- \[[ x\/]\]/ && length>250 {c++} END{print c+0}' \
+        $(find "$REPO_ROOT/todo" -name '*.md' 2>/dev/null) /dev/null 2>/dev/null || echo 0)
+    LINT19_FILES=$(awk '/^ *- \[[ x\/]\]/ && length>250 {print FILENAME}' \
+        $(find "$REPO_ROOT/todo" -name '*.md' 2>/dev/null) /dev/null 2>/dev/null | sort -u | wc -l | tr -d ' ')
+    if [ "${LINT19_ITEMS:-0}" -gt 0 ]; then
+        echo -e "${YELLOW}warn${NC}: Check 19 (todo-item-length) $LINT19_ITEMS checklist item(s) over the 250-char cap across $LINT19_FILES file(s) (legacy debt; NEW ones are blocked at commit by scripts/todo-staged-check.py)"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+    # THE REFUSAL IS PROPAGATED, not swallowed. This used to send stderr to
+    # /dev/null, turn every nonzero exit into success with `|| true`, and count
+    # only stdout lines saying "would reflow" -- so `todo-reflow.py`'s exit 2
+    # (the document ends inside an unclosed fence or HTML comment, or an
+    # indented delimiter is hiding hard-wrapped prose) reached the lint as
+    # SILENCE. Measured: the tool returned 2 on the hostile fixture while this
+    # check reported 0 files (Codex adversarial, section 41 round 3, [medium]).
+    # A gate adopting the shared tracker and then discarding its refusal is the
+    # exact fail-open shape `todo_fence`'s module docstring exists to prevent.
+    LINT19_WRAP=0
+    # CORPUS DISCOVERY IS GUARDED THREE WAYS, and each guard was paid for.
+    #   -d: lint.sh runs under `set -euo pipefail`, so ASSIGNING from a `find`
+    #       over a MISSING todo/ aborts the WHOLE linter -- rc 1, no diagnostic,
+    #       every later check silently skipped. Measured: it killed
+    #       `lint_check6_marker` in the tooling suite, whose scratch repo has no
+    #       todo/ (Codex adversarial, section 41 round 5, [medium]). The
+    #       pre-existing `$(find ...)` uses above survive only because they are
+    #       command ARGUMENTS, whose substitution status set -e ignores.
+    #   `|| rc`: any OTHER find failure is reported rather than swallowed.
+    #   -print0 + array: filenames reach the tool quoted, not word-split.
+    # An EMPTY list is skipped rather than passed on: with no FILE arguments the
+    # tool prints its usage and exits 2, which this check reads as a refusal.
+    #   -L: a SYMLINKED todo/ is REFUSED, not followed. `[ -d ]` follows the
+    #       link while a plain find does not traverse it, so the scan enumerated
+    #       NOTHING and passed as if the corpus were empty (round 6, [medium];
+    #       measured 0 files vs 1). `find -H` fixed that and was then WITHDRAWN
+    #       on round 7: it makes the link's target the corpus, so a todo/
+    #       pointing at $HOME or / has the linter reading, and hard-wrap
+    #       checking, the whole of it. This scanner wants the repository's own
+    #       corpus, and "that is not it" is a better answer than either
+    #       traversing elsewhere or silently finding nothing.
+    #   mktemp guarded: it is a command substitution in an assignment, so under
+    #       set -e a full or unwritable TMPDIR takes the whole linter down.
+    #       Measured: `export TMPDIR=/nonexistent; V="$(mktemp)"` exits 1.
+    LINT19_FILES=()
+    LINT19_FIND_RC=0
+    LINT19_INFRA=""
+    if [ -L "$REPO_ROOT/todo" ]; then
+        LINT19_INFRA="todo/ is a symlink; the hard-wrap scan requires a real directory inside the repository"
+    elif [ -d "$REPO_ROOT/todo" ]; then
+        if LINT19_LIST="$(mktemp 2>/dev/null)"; then
+            # -type f excludes a symlinked DESCENDANT too: refusing only a
+            # symlinked root still let `todo/x.md -> /etc/passwd` be opened and
+            # scanned (round 8, [medium]).
+            find "$REPO_ROOT/todo" -name '*.md' -type f -print0 > "$LINT19_LIST" 2>/dev/null \
+                || LINT19_FIND_RC=$?
+            while IFS= read -r -d '' LINT19_F; do
+                LINT19_FILES+=("$LINT19_F")
+            done < "$LINT19_LIST"
+            rm -f "$LINT19_LIST"
+        else
+            LINT19_INFRA="could not create a temporary file (mktemp failed)"
+        fi
+    fi
+    if [ "$LINT19_FIND_RC" != "0" ]; then
+        LINT19_INFRA="could not enumerate todo/*.md (find exited $LINT19_FIND_RC)"
+    fi
+    if [ -n "$LINT19_INFRA" ]; then
+        echo -e "${RED}error${NC}: Check 19 (todo-hard-wrap) $LINT19_INFRA -- the hard-wrap scan did not run"
+        ERRORS=$((ERRORS + 1))
+    fi
+    if [ "${#LINT19_FILES[@]}" -gt 0 ] && LINT19_WRAP_ERR="$(mktemp 2>/dev/null)"; then
+        LINT19_WRAP_RC=0
+        LINT19_WRAP_OUT="$(python3 "$REPO_ROOT/scripts/todo-reflow.py" --check \
+            "${LINT19_FILES[@]}" 2>"$LINT19_WRAP_ERR")" || LINT19_WRAP_RC=$?
+        # Counted, never branched on the exit status of a `grep -v`: this host's
+        # grep is ugrep, whose `-v` status does not follow the GNU rule.
+        LINT19_WRAP=$(printf '%s\n' "$LINT19_WRAP_OUT" | grep -c 'would reflow' || true)
+        # THE EXIT CODE IS VALIDATED AS AN ENVELOPE, not just tested for 2.
+        # `rc 1` is the tool's "found hard-wrapped prose" code and must come
+        # with at least one record on stdout; anything else exiting 1 is a CRASH
+        # wearing the findings code -- an uncaught decode error did exactly that
+        # and this check counted zero (Codex adversarial, section 41 round 4).
+        # A missing interpreter or script is python3's own 2, and lands here too.
+        LINT19_WRAP_BAD=0
+        case "$LINT19_WRAP_RC" in
+            0) ;;
+            1) [ "${LINT19_WRAP:-0}" -gt 0 ] || LINT19_WRAP_BAD=1 ;;
+            *) LINT19_WRAP_BAD=1 ;;
+        esac
+        if [ "$LINT19_WRAP_BAD" = "1" ]; then
+            # ERROR, matching Check 22b's refusal on the same condition: a file
+            # the repair tool cannot read is not a style warning.
+            LINT19_WRAP_SAID=0
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                echo -e "${RED}error${NC}: Check 19 (todo-hard-wrap) $line"
+                ERRORS=$((ERRORS + 1))
+                LINT19_WRAP_SAID=1
+            done < "$LINT19_WRAP_ERR"
+            # A silent nonzero still has to be reported, or the fail-open this
+            # branch exists to close reappears whenever stderr happens to be
+            # empty.
+            if [ "$LINT19_WRAP_SAID" = "0" ]; then
+                echo -e "${RED}error${NC}: Check 19 (todo-hard-wrap) scripts/todo-reflow.py exited $LINT19_WRAP_RC with no diagnostic -- the hard-wrap scan did not run"
+                ERRORS=$((ERRORS + 1))
+            fi
+        fi
+        rm -f "$LINT19_WRAP_ERR"
+    elif [ "${#LINT19_FILES[@]}" -gt 0 ]; then
+        # Files to scan, but no temp file to capture diagnostics into. Reported
+        # rather than skipped: silence here is the same fail-open as swallowing
+        # the exit code.
+        echo -e "${RED}error${NC}: Check 19 (todo-hard-wrap) could not create a temporary file (mktemp failed) -- the hard-wrap scan did not run"
+        ERRORS=$((ERRORS + 1))
+    fi
+    if [ "${LINT19_WRAP:-0}" -gt 0 ]; then
+        echo -e "${YELLOW}warn${NC}: Check 19 (todo-hard-wrap) $LINT19_WRAP todo/*.md file(s) contain hard-wrapped prose (one paragraph per line is the convention; repair with: python3 scripts/todo-reflow.py --write <file>)"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 20: documented `bash <a python file>` invocations
+# ============================================================================
+# A file with a `#!/usr/bin/env python3` shebang is NOT runnable by bash: bash
+# reads the docstring as code and dies with "syntax error near unexpected
+# token", exit 2. Documentation that tells the agent to run one that way is a
+# defect, and a SILENT one where the caller reads the exit code -- the
+# convergence gate's contract is exit 1 = CONVERGED / exit 0 = redispatch, so a
+# bash-induced exit 2 FAILS OPEN and silently pays for a Codex round the gate
+# would have suppressed.
+#
+# This recurred five times before it was fixed at source (live-gotchas entries
+# 2026-07-15, 07-17, 07-25, plus two live occurrences on 2026-07-28), because a
+# gotcha note expires and the wrong doc does not. Hence a lint check rather
+# than a sixth note.
+#
+# WARN-first per the partial-enforcement promotion doctrine.
+if [ "${SKIP_LINT_BASH_PY:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 20 (bash-on-python) skipped via SKIP_LINT_BASH_PY=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    LINT20_OUT="$(python3 - <<'PYEOF'
+import pathlib, re
+
+# `bash <path>.py` / `sh <path>.py`, allowing the line-wrap the skills use
+# (`bash\n  .claude/hooks/x.py`) and an optional opening backtick or quote.
+BASH_PY = re.compile(
+    r"(?<![.\w])(?:bash|sh)\s+[`\"']?((?:\S*/)?[A-Za-z0-9_./-]+\.py)\b")
+
+ROOTS = [".claude", "scripts", "docs"]
+out = []
+for root in ROOTS:
+    p = pathlib.Path(root)
+    if not p.exists():
+        continue
+    for f in p.rglob("*"):
+        if not f.is_file() or f.suffix not in (".md", ".sh", ".py", ".mjs"):
+            continue
+        rel = str(f)
+        if rel.endswith("scripts/lint.sh"):        # this scanner documents it
+            continue
+        if "/state/" in rel:                        # live-gotchas records the bug
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        # Join wrapped lines so `bash\n  path.py` is caught, keeping line nos.
+        lines = text.splitlines()
+        for i, ln in enumerate(lines, 1):
+            probe = ln
+            if ln.rstrip().endswith(("bash", "sh")) and i < len(lines):
+                probe = ln.rstrip() + " " + lines[i].strip()
+            m = BASH_PY.search(probe)
+            if not m:
+                continue
+            target = pathlib.Path(m.group(1).lstrip("`\"'"))
+            # Only a REAL python-shebang file in this repo is a defect; a
+            # generic `bash foo.py` in prose about some other tree is not.
+            cand = pathlib.Path(m.group(1))
+            if not cand.exists():
+                continue
+            try:
+                first = cand.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+            except Exception:
+                continue
+            if "python" not in first:
+                continue
+            out.append(f"WARN {rel}:{i}: documents `bash {target}`, but that file "
+                       f"has a python shebang -- bash exits 2 on it. The exit code "
+                       f"is load-bearing for gate callers (2 fails OPEN), so use "
+                       f"`python3 {target}`.")
+for line in out:
+    print(line)
+PYEOF
+)"
+    if [ -n "$LINT20_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                WARN\ *)
+                    echo -e "${YELLOW}warn${NC}: ${line#WARN }"
+                    WARNINGS=$((WARNINGS + 1))
+                    ;;
+            esac
+        done <<< "$LINT20_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 21: no $(info) in the root Makefile -- parse-time stdout pollution
+# ============================================================================
+# $(info) writes to make's STDOUT and, at parse time, fires on EVERY make
+# invocation -- including the `print-abi-config` / `print-abi-cppflags` /
+# `print-user-cflags` query targets that scripts/gen-user-abi.py and
+# scripts/test-tooling.sh read as a machine-readable one-record-per-line
+# channel. A parse-time $(info) therefore lands INSIDE the flag vector, and
+# gen-user-abi.py hands the diagnostic to clang as a filename:
+#   clang-19: error: no such file or directory: '[SIGN] cert fingerprint
+#   changed (desired 5f8dddb8..., recorded ); invalidating stamp'
+# That failed build/.abi-check.stamp and reddened the CI release-flavor build
+# on 2026-07-30 (run 30516845328) while every local build stayed green,
+# because the local tree's recorded fingerprint matched and the branch never
+# fired. The consumer cannot defend against this -- a flag vector is
+# free-form text, so there is no shape a diagnostic could be rejected by.
+#
+# $(warning) writes to stderr, keeps the message visible in the build log,
+# and cannot reach the query channel. So the rule is absolute for this file:
+# parse-time diagnostics use $(warning), never $(info). ERROR, not WARN --
+# the failure mode is a red CI build that no local gate reproduces.
+# Both make delimiters and any function whitespace are covered, and the paths
+# are anchored at $REPO_ROOT. A grep for the literal `$(info ` in a
+# cwd-relative `Makefile` is trivially bypassed by syntax that pollutes stdout
+# identically: GNU make treats `${info x}` exactly like `$(info x)` and accepts
+# a TAB after the function name (probed against GNU make 4.4 -- `${info
+# BRACE_POLLUTION}` and `$(info<TAB>TAB_POLLUTION)` both print), and lint.sh
+# never cd's, so a relative operand silently skipped the whole check whenever
+# lint ran from anywhere but the repo root.
+if [ "${SKIP_LINT_MAKE_INFO:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 21 (Makefile \$(info)) skipped via SKIP_LINT_MAKE_INFO=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    LINT21_FILES=()
+    [ -f "$REPO_ROOT/Makefile" ] && LINT21_FILES+=("$REPO_ROOT/Makefile")
+    while IFS= read -r _l21f; do
+        [ -n "$_l21f" ] && LINT21_FILES+=("$_l21f")
+    done < <(find "$REPO_ROOT" -maxdepth 2 \( -name '*.mk' -o -name 'Makefile.*' \) \
+                 -not -path "$REPO_ROOT/build/*" -not -path "$REPO_ROOT/.git/*" \
+                 2>/dev/null | sort)
+    for _l21f in "${LINT21_FILES[@]}"; do
+        while IFS=: read -r lno _rest; do
+            [ -n "$lno" ] || continue
+            # A comment line (first non-whitespace char is `#`) mentioning the
+            # syntax in prose -- like the ones directly above this very block
+            # -- is not a live parse-time call; only a code line pollutes
+            # stdout when make evaluates it.
+            _l21_line="$(sed -n "${lno}p" "$_l21f")"
+            case "$_l21_line" in
+                [[:space:]]*'#'*|'#'*) continue ;;
+            esac
+            echo -e "${RED}error${NC}: ${_l21f#"$REPO_ROOT"/}:$lno: \$(info ...) / \${info ...} writes to make's stdout and pollutes the machine-readable print-abi-config / print-abi-cppflags / print-user-cflags query channel (gen-user-abi.py feeds it to clang as a filename). Use \$(warning ...) -- stderr -- instead."
+            ERRORS=$((ERRORS + 1))
+        done < <(grep -nE '\$[({]info([[:space:]]|[)}])' "$_l21f" || true)
+    done
+fi
+
+# ============================================================================
+# Check 22: TODO `## N.` section bodies must run in numeric order
+# ============================================================================
+# Sections were being filed dependency-adjacent -- a section discovered while
+# reviewing an earlier one was inserted directly after its parent and given the
+# next free number -- so TODO-04's bodies ran ... 28, 32, 29, 30, 31, 35, 39,
+# 33, 36, 37, 34, 38. Nothing BROKE (the Implementation Order table stayed
+# right, and section_slice.py matches by number rather than position), which is
+# exactly why it went unnoticed: the only cost is a reader scrolling for a
+# section, walking straight past it, and concluding it is missing. That
+# happened, and it cost real operator time.
+#
+# TODO-06 showed the worse form: sections 12 and 13 had been appended AFTER the
+# file's OS Comparison / Unit Tests / Verification / History blocks.
+#
+# The convention: a new section takes the next free number AND its body goes
+# LAST. Repair is one command and is a proven pure move (the tool refuses any
+# rewrite that is not a reordering of whole blocks).
+#
+# ERROR, not warn: the debt was fully cleared 2026-07-30, so there is no legacy
+# backlog to grandfather and any new hit is a fresh regression.
+if [ "${SKIP_LINT_SECTION_ORDER:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 22 (todo-section-order) skipped via SKIP_LINT_SECTION_ORDER=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ -f "$REPO_ROOT/scripts/todo-section-order.py" ]; then
+    # THE EXIT CODE IS VALIDATED AS AN ENVELOPE, exactly as Check 19 does. This
+    # discarded stderr and erased every status with `|| true`, so the tool's
+    # documented rc 2 REFUSAL -- and, before section 41 bounded the section
+    # number, an outright ValueError traceback -- reached the gate as SILENCE
+    # (Codex adversarial + consistency, section 41 post-commit). rc 1 is
+    # "sections out of order" and must come with records on stdout; anything
+    # else is a refusal or a crash, and both are errors here.
+    LINT22_ERR="$(mktemp 2>/dev/null)" || LINT22_ERR=""
+    LINT22_RC=0
+    if [ -n "$LINT22_ERR" ]; then
+        LINT22_OUT="$(cd "$REPO_ROOT" && python3 scripts/todo-section-order.py --check 2>"$LINT22_ERR")" || LINT22_RC=$?
+    else
+        LINT22_OUT="$(cd "$REPO_ROOT" && python3 scripts/todo-section-order.py --check 2>/dev/null)" || LINT22_RC=$?
+    fi
+    if [ -n "$LINT22_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            echo -e "${RED}error${NC}: Check 22 (todo-section-order) $line -- repair with: python3 scripts/todo-section-order.py --fix"
+            ERRORS=$((ERRORS + 1))
+        done <<< "$LINT22_OUT"
+    fi
+    LINT22_BAD=0
+    case "$LINT22_RC" in
+        0) ;;
+        1) [ -n "$LINT22_OUT" ] || LINT22_BAD=1 ;;
+        *) LINT22_BAD=1 ;;
+    esac
+    if [ "$LINT22_BAD" = "1" ]; then
+        LINT22_SAID=0
+        if [ -n "$LINT22_ERR" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                echo -e "${RED}error${NC}: Check 22 (todo-section-order) $line"
+                ERRORS=$((ERRORS + 1))
+                LINT22_SAID=1
+            done < "$LINT22_ERR"
+        fi
+        if [ "$LINT22_SAID" = "0" ]; then
+            echo -e "${RED}error${NC}: Check 22 (todo-section-order) scripts/todo-section-order.py exited $LINT22_RC with no diagnostic -- the section-order scan did not run"
+            ERRORS=$((ERRORS + 1))
+        fi
+    fi
+    [ -n "$LINT22_ERR" ] && rm -f "$LINT22_ERR"
+fi
+
+# Check 24: reachability -- can a future pass still SEE this item?
+# ============================================================================
+# One question, replacing three partial views (orphan-check, validate's
+# dangling/orphan rows, and the classifier they police). Split by severity
+# because the two classes differ in kind, not degree:
+#
+#   open-in-done      ERROR. A bare `- [ ]` in a section the ORACLE calls DONE
+#                     and which carries no Deferred stamp is unreachable
+#                     outright -- nothing will ever look at it again. Currently
+#                     ZERO, so gating costs nothing and keeps it that way.
+#   open-in-deferred  WARN. 333 exist (2026-08-02). The section is parked with
+#                     a recorded blocker, so the work is not lost, but a bare
+#                     `- [ ]` there is seen by NOTHING: the oracle skips DONE
+#                     sections, orphan-check exempts Deferred ones by design,
+#                     and stranded_deferrals tracks `[/]` ITEMS rather than
+#                     items inside a Deferred SECTION. The repair is per-item
+#                     (`- [/]` naming the blocker), so this cannot be a blocking
+#                     gate until the backlog is triaged -- blocking on 333
+#                     pre-existing findings would just teach everyone the
+#                     opt-out.
+if [ -f "$REPO_ROOT/scripts/todo-reachability.py" ]; then
+    # NO `|| echo '{}'` HERE. The tool exits 1 when findings EXIST, so that
+    # fallback fired precisely when there was something to report, appending
+    # `{}` to valid JSON and breaking the parse -- the check then silently
+    # emitted nothing (2026-08-02). Capture the output and ignore the status.
+    # DISTINGUISH THE VERDICT CODES FROM THE INFRASTRUCTURE CODE. The tool
+    # exits 0 (clean) or 1 (findings) as verdicts, and 2 when the cache exists
+    # but cannot be trusted. Blanket-ignoring the status turned that refusal
+    # into a clean result: stderr went to /dev/null, `|| true` erased the code,
+    # and an empty stdout became `{}` -- so STALE, malformed, oversized,
+    # unreadable and timeout ALL reported zero findings on the every-commit
+    # path, silently disabling this gate (Codex adversarial, section 19,
+    # [high]). Routing the reader fail-closed is worthless while its only
+    # caller fails open.
+    # `&& ... || ...` rather than a bare assignment: this file runs under
+    # `set -euo pipefail`, where a command substitution that exits non-zero
+    # kills the script -- and rc 1 (findings exist) is the NORMAL case. The
+    # original `|| true` was shielding exactly that; it is replaced here, not
+    # dropped, because the status still has to be READ.
+    LINT24_ERRTXT="$(mktemp)"
+    LINT24_RC=0
+    LINT24_OUT="$(cd "$REPO_ROOT" && timeout 600 python3 scripts/todo-reachability.py --json 2>"$LINT24_ERRTXT")" \
+        || LINT24_RC=$?
+    # THE EXIT CODE ALONE IS NOT ENOUGH. Python exits 1 for an UNCAUGHT
+    # EXCEPTION as well as for this tool's findings verdict, so accepting every
+    # rc 1 and letting malformed or empty stdout fall through to `{}` reports a
+    # CRASH as zero findings -- the gate stays fail-open for the most likely
+    # case (reproduced with an invalid-UTF-8 TODO: rc 1, empty stdout; Codex
+    # adversarial round 2, [high]). The verdict is the PAIR (code, envelope):
+    # rc 0 must carry an empty object, rc 1 a non-empty one, anything else is
+    # infrastructure.
+    LINT24_SHAPE="$(printf '%s' "$LINT24_OUT" | python3 -c "
+import json,sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception as exc:
+    print('stdout is not valid JSON'); raise SystemExit(0)
+if not isinstance(d, dict):
+    print('stdout is ' + type(d).__name__ + ', expected an object'); raise SystemExit(0)
+print('EMPTY' if not d else 'NONEMPTY')" 2>/dev/null || echo 'could not parse stdout')"
+    LINT24_BAD=''
+    case "$LINT24_RC:$LINT24_SHAPE" in
+        0:EMPTY|1:NONEMPTY) ;;                       # the two honest verdicts
+        0:NONEMPTY) LINT24_BAD="exited 0 (clean) but reported findings" ;;
+        1:EMPTY)    LINT24_BAD="exited 1 (findings) but reported none -- an uncaught exception exits 1 too" ;;
+        *)          LINT24_BAD="rc $LINT24_RC, $LINT24_SHAPE" ;;
+    esac
+    if [ -n "$LINT24_BAD" ]; then
+        # THE STALE REFUSAL IS THE SAME CLASS AS CHECK 7's, and it arrives
+        # BEFORE any per-file filtering can help: the audit refuses wholesale
+        # because the corpus moved, so there are no findings left to scope.
+        # Under the commit gate, with every modified todo file outside this
+        # commit, that is a corpus this commit does not touch. ONLY the STALE
+        # reason downgrades -- IDENTITY, COVERAGE, a malformed cache and a
+        # timeout all still ERROR, because none of those mean "someone else is
+        # editing".
+        if [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ] && [ -n "$GATE_EXCLUDED_TODO" ] \
+           && [ -z "$GATE_STAGED_TODO" ] \
+           && grep -q 'cache unusable \[STALE\]' "$LINT24_ERRTXT" 2>/dev/null; then
+            echo -e "${YELLOW}warn${NC}: Check 24 (reachability) cache stale, but every modified todo file is outside this commit -- not gating on a corpus this commit does not touch"
+            WARNINGS=$((WARNINGS + 1))
+        else
+        # Surface the tool's OWN diagnostic, which names WHICH shared-validator
+        # rule refused, rather than a generic message.
+        error "scripts/todo-reachability.py" "0" \
+            "reachability audit could not run ($LINT24_BAD): $(head -c 300 "$LINT24_ERRTXT" 2>/dev/null | tr '\n' ' ')"
+        fi
+        LINT24_OUT=''
+    fi
+    rm -f "$LINT24_ERRTXT"
+    # Drop findings in todo files the commit does not touch. Applied AFTER the
+    # rc-vs-shape consistency check above, which validates the TOOL and must
+    # keep seeing what the tool actually returned; this only narrows what the
+    # GATE fails on.
+    if [ -n "$GATE_EXCLUDED_TODO" ] && [ -n "$LINT24_OUT" ]; then
+        LINT24_OUT="$(printf '%s' "$LINT24_OUT" \
+            | LINT24_EXCL="$GATE_EXCLUDED_TODO" python3 -c "
+import json, os, sys
+excl = {p.strip() for p in os.environ['LINT24_EXCL'].splitlines() if p.strip()}
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.stdout.write('')
+    sys.exit(0)
+def norm(p):
+    p = p.replace('\\\\', '/')
+    return p.split('todo/', 1)[-1] and ('todo/' + p.split('todo/', 1)[1]) or p
+json.dump({k: v for k, v in d.items() if norm(k) not in excl}, sys.stdout)
+" 2>/dev/null || printf '%s' "$LINT24_OUT")"
+    fi
+    # ONE EXHAUSTIVE AGGREGATION, and it FAILS CLOSED on a kind it does not
+    # know. This used to be three independent passes keyed on two kind names,
+    # which is a shape that goes silent every time the tool learns a new one --
+    # and it had already gone silent twice. `no-io-row` (todo-reachability.py's
+    # oldest kind, and the one that gates `phase FIXPOINT`) was counted by
+    # NOTHING: rc 1 plus valid JSON passed the rc-vs-shape pair and then no
+    # branch matched, so a section with open work and no Implementation Order
+    # row produced no lint error at all. The `unclosed-*` refusal records added
+    # alongside this work landed in the same hole. Counting handled records and
+    # comparing against the total is what makes the next new kind LOUD instead
+    # of invisible (Codex adversarial, section 38 round 2, [high]; the
+    # `unclosed-*` half was this section's own self-review).
+    #
+    # BOTH numbers for the deferred bucket. The record is per SECTION and
+    # carries its own item count in the message; reporting the record count
+    # while calling it "items" understated the backlog 4.8x (333 sections vs
+    # 1595 items, measured 2026-08-05) and that wrong figure had propagated
+    # into the capture files and the doctrine.
+    LINT24_AGG="$(printf '%s' "$LINT24_OUT" | python3 -c "
+import json,re,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+KNOWN={'open-in-done','open-in-deferred','no-io-row','unclosed-fence','unclosed-comment','unclosed-html'}
+recs=[(f,k,msg) for f,v in d.items() for k,_,msg in v]
+def n(kind): return sum(1 for _,k,_ in recs if k==kind)
+def first(*kinds):
+    for f,k,m in recs:
+        if k in kinds: return f+' -- '+m[:120]
+    return ''
+items=0
+for _,k,msg in recs:
+    if k=='open-in-deferred':
+        m=re.match(r'^(\\d+) open', msg)
+        items+= int(m.group(1)) if m else 1
+unknown=sorted({k for _,k,_ in recs if k not in KNOWN})
+print('done=%d' % n('open-in-done'))
+print('deferred=%d' % n('open-in-deferred'))
+print('items=%d' % items)
+print('noio=%d' % n('no-io-row'))
+print('unreadable=%d' % (n('unclosed-fence')+n('unclosed-comment')+n('unclosed-html')))
+print('unknown=%d' % len(unknown))
+print('unknown_names=%s' % ','.join(unknown))
+print('first_unreadable=%s' % first('unclosed-fence','unclosed-comment','unclosed-html'))
+print('first_noio=%s' % first('no-io-row'))" 2>/dev/null || echo 'parse_failed=1')"
+    lint24_field() { printf '%s\n' "$LINT24_AGG" | sed -n "s/^$1=//p" | head -1; }
+    if printf '%s\n' "$LINT24_AGG" | grep -q '^parse_failed=1$'; then
+        error "scripts/todo-reachability.py" "0" \
+            "Check 24 could not aggregate the reachability findings -- refusing rather than reporting zero"
+    fi
+    LINT24_ERR="$(lint24_field done)"
+    LINT24_WARN="$(lint24_field deferred)"
+    LINT24_ITEMS="$(lint24_field items)"
+    LINT24_NOIO="$(lint24_field noio)"
+    LINT24_UNREADABLE="$(lint24_field unreadable)"
+    LINT24_UNKNOWN="$(lint24_field unknown)"
+    if [ "${LINT24_ERR:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "${RED}error${NC}: Check 24 (reachability) ${LINT24_ERR} open item(s) in DONE sections are unreachable -- nothing will revisit them. Run: python3 scripts/todo-reachability.py"
+        ERRORS=$((ERRORS + LINT24_ERR))
+    fi
+    if [ "${LINT24_NOIO:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "${RED}error${NC}: Check 24 (reachability) ${LINT24_NOIO} section(s) hold open work with no Implementation Order row -- the oracle classifies from the row and never reads the body: $(lint24_field first_noio)"
+        ERRORS=$((ERRORS + LINT24_NOIO))
+    fi
+    if [ "${LINT24_UNREADABLE:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "${RED}error${NC}: Check 24 (reachability) ${LINT24_UNREADABLE} todo file(s) could not be read: $(lint24_field first_unreadable)"
+        ERRORS=$((ERRORS + LINT24_UNREADABLE))
+    fi
+    if [ "${LINT24_UNKNOWN:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "${RED}error${NC}: Check 24 (reachability) reported ${LINT24_UNKNOWN} finding kind(s) this gate does not handle ($(lint24_field unknown_names)) -- add a branch rather than letting them pass uncounted"
+        ERRORS=$((ERRORS + LINT24_UNKNOWN))
+    fi
+    if [ "${LINT24_WARN:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "${YELLOW}warn${NC}: Check 24 (reachability) ${LINT24_ITEMS} open \`- [ ]\` item(s) across ${LINT24_WARN} Deferred section(s); repair shape is \`- [/]\` naming the blocker"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+fi
+
+# Check 22b: a `## N.` body must not sit AFTER the closing matter.
+# Check 22 tests that section numbers ASCEND; it is silent when sections are
+# appended past `## OS Comparison` / `## Unit Tests` / `## Verification` /
+# `## History`, because those sections are still numerically ordered among
+# themselves. Measured 2026-08-01: TODO-04 carried sections 53-59 after all
+# three closing blocks and lint reported 0 errors -- the exact TODO-06 shape
+# CLAUDE.md already names, invisible to the checker that exists to catch it.
+# PROMOTED TO ERROR 2026-08-02, once the tree was clean. It shipped as a
+# warning because promoting a pre-existing violation would have wedged the
+# commit of the run that was mid-section in the offending file; all three
+# affected files (TODO-04 usermode x10, TODO-07 lsp-mcp x1, TODO-04
+# system-logging x1) were then repaired by `--fix` as verified pure block moves
+# -- identical line count, byte count and sorted content -- and the tree-wide
+# scan returns clean. The 99-section hard cap prevents the condition from being
+# reintroduced at scale, so blocking is now safe rather than merely correct.
+if [ -f "$REPO_ROOT/scripts/todo-section-order.py" ]; then
+    # Envelope-validated for the same reason as Check 22 above: this mode turns
+    # a malformed document into an rc 1 stdout record, so a SILENT nonzero (or
+    # any other code) means the scan did not run rather than that it found
+    # nothing.
+    LINT22B_RC=0
+    LINT22B_OUT="$(cd "$REPO_ROOT" && python3 scripts/todo-section-order.py --check-placement 2>/dev/null)" || LINT22B_RC=$?
+    if [ -n "$LINT22B_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo -e "${RED}error${NC}: Check 22b (todo-section-placement) $line"
+            ERRORS=$((ERRORS + 1))
+        done <<< "$LINT22B_OUT"
+    fi
+    if { [ "$LINT22B_RC" = "1" ] && [ -z "$LINT22B_OUT" ]; } || \
+       { [ "$LINT22B_RC" != "0" ] && [ "$LINT22B_RC" != "1" ]; }; then
+        echo -e "${RED}error${NC}: Check 22b (todo-section-placement) scripts/todo-section-order.py --check-placement exited $LINT22B_RC with no findings on stdout -- the placement scan did not run"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 23: no open `- [ ]` item orphaned behind a stamped (DONE) TODO section
+# ============================================================================
+# The triage oracle classifies a section from its Implementation Order row +
+# stamps and never reads the body, so a `- [ ]` appended to a stamped section is
+# invisible to every later pass: the runner never routes back, the item cannot
+# hold fixpoint open, and the run reports the repo complete over it. The
+# overnight run was actively creating these by following the completion-first
+# rule ("file adjacent work in the owning section") into closed sections.
+#
+# PRECISION: sections carrying a `> **Deferred:**` stamp are EXEMPT -- their
+# items are deliberately parked with a re-open path (owner-side
+# stranded_deferrals sweep + the P6.3 fixpoint gate). The naive rule without
+# that exemption over-matched 14.6x (1,712 hits, 1,595 of them parked).
+#
+# ERROR, not warn: the 2026-07-31 cohort (117 items / 59 sections) was fully
+# triaged and cleared the same day, so there is no legacy debt and any hit is a
+# fresh regression. Repair guidance is printed by the checker itself.
+if [ "${SKIP_LINT_ORPHAN_ITEMS:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 23 (todo-orphan-items) skipped via SKIP_LINT_ORPHAN_ITEMS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ -f "$REPO_ROOT/scripts/todo-orphan-check.py" ]; then
+    LINT23_OUT="$(cd "$REPO_ROOT" && python3 scripts/todo-orphan-check.py 2>/dev/null || true)"
+    if [ -n "$LINT23_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                "    "*) ;;   # item detail lines -- show but do not double-count
+                *)
+                    echo -e "${RED}error${NC}: Check 23 (todo-orphan-items) $line"
+                    ERRORS=$((ERRORS + 1))
+                    ;;
+            esac
+        done <<< "$LINT23_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 24: every UTEST_RSN_* reason must be measured by UTEST_REASON_REFUSAL
+# ============================================================================
+# The tree is not documentation. It feeds UTEST_REASON_MAX, which every record
+# format subtracts from UTEST_RECORD_LINE_MAX to derive UTEST_MAX_BINARY_NAME
+# -- so a reason string that is defined but never added to the tree understates
+# the maximum, leaves the derived name bound too generous, and sends the record
+# formatters to their truncation fallback on inputs the build proved could not
+# overflow. Nothing failed; only a comment guarded the relationship.
+#
+# ERROR, not warn: the set is equal today, so any hit is a fresh regression --
+# and the whole point is to fail the build the day a reason is added without
+# being measured, which is precisely when it is cheap to fix.
+if [ "${SKIP_LINT_UTEST_REASONS:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 24 (utest-reason tree) skipped via SKIP_LINT_UTEST_REASONS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ -f "$REPO_ROOT/scripts/utest-reason-lint.py" ]; then
+    # `|| true` INSIDE the substitution, matching Check 22. This script runs
+    # under `set -euo pipefail`, so a bare failing command substitution in an
+    # assignment exits the whole lint immediately -- the checker's own
+    # diagnostic would be discarded and the summary never printed, leaving a
+    # blocked commit with nothing naming the unmeasured reason. Both streams
+    # are captured because violations go to stdout and extraction failures to
+    # stderr; any output at all is a problem to report.
+    LINT24_OUT="$(cd "$REPO_ROOT" && python3 scripts/utest-reason-lint.py --check 2>&1 || true)"
+    if [ -n "$LINT24_OUT" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            echo -e "${RED}error${NC}: Check 24 (utest-reason tree) $line"
+            ERRORS=$((ERRORS + 1))
+        done <<< "$LINT24_OUT"
+    fi
+fi
+
+
+# ============================================================================
+# Check 25: the lint consumer must DELEGATE to the shared resolution rule
+# ============================================================================
+# section 18. The identity gate walks corpus_resolution_snapshot.py and
+# adjudicates NOTHING about scripts/lint/check_stub_behind_stamp.py, even though
+# section 14 unified the two behind one `resolve_ref` precisely so a fallback
+# added to one could not diverge from the other. This is the invariant standing
+# in for a full consumer differential: the consumer routes every symbol
+# occurrence through the shared rule exactly once and propagates its verdicts
+# verbatim.
+#
+# GATED ON THE FILES THAT CAN BREAK IT. The semantic half drives a real corpus
+# walk (~2s), and Check 7 already pays for one; charging every commit in the
+# repo a second walk to re-prove a property only these files can affect is not
+# a trade worth making. SKIP via SKIP_LINT_CONSUMER_DELEGATION=1; force a run
+# with LINT_CONSUMER_DELEGATION_ALWAYS=1.
+if [ "${SKIP_LINT_CONSUMER_DELEGATION:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 25 (consumer-delegation) skipped via SKIP_LINT_CONSUMER_DELEGATION=1"
+    WARNINGS=$((WARNINGS + 1))
+else
+    LINT25_TOUCHED=0
+    if [ "${LINT_CONSUMER_DELEGATION_ALWAYS:-}" = "1" ]; then
+        LINT25_TOUCHED=1
+    else
+        LINT25_DIFF="$( { git -C "$REPO_ROOT" diff --cached --name-only 2>/dev/null; \
+                          git -C "$REPO_ROOT" diff --name-only 2>/dev/null; } || true)"
+        # A CLEAN TREE MEANS CI, AND CI IS THE POINT. GitHub Actions checks out
+        # the committed revision with an empty index and worktree, so both
+        # diffs above are empty and the trigger was ALWAYS false there: the one
+        # check that can detect the lint consumer diverging from the shared
+        # resolution rule never ran in the environment it exists to protect,
+        # and the identity gate explicitly does not cover the consumer (Codex
+        # adversarial, section 18). Deriving paths from a commit RANGE was the
+        # alternative and is worse: a PR spans several commits and the range is
+        # a second thing to get wrong. On a clean tree just run it -- ~7s, and
+        # only where there is a committed state to adjudicate.
+        # ...but ONLY where this check is meaningful. `scripts/lint.sh` is run
+        # against scratch repos by the tooling suite, which have neither the
+        # consumer nor a todo/ corpus -- and since Check 25 fails CLOSED, a
+        # clean-tree trigger there turned every such sub-test red (measured: 4
+        # tooling failures). Absence of the subject is not a finding about it.
+        if [ -z "$(printf '%s' "$LINT25_DIFF" | tr -d '[:space:]')" ] \
+           && [ -f "$REPO_ROOT/scripts/lint/check_stub_behind_stamp.py" ] \
+           && [ -d "$REPO_ROOT/todo" ]; then
+            LINT25_TOUCHED=1
+        fi
+        case "$LINT25_DIFF" in
+            *scripts/lint/check_stub_behind_stamp.py*|\
+            *scripts/lint/check_consumer_delegation.py*|\
+            *scripts/todo-graph/ref_resolution.py*|\
+            *scripts/todo-graph/snapshot_protocol.py*|\
+            *scripts/todo-graph/snapshot_protocol.json*) LINT25_TOUCHED=1 ;;
+        esac
+    fi
+    if [ "$LINT25_TOUCHED" -eq 1 ]; then
+        LINT25_OUT="$(mktemp -t lint-delegation.XXXXXX)"
+        LINT25_RC=0
+        # BUILD THE CACHE IF IT IS NOT THERE. `build/todo-cache.json` is
+        # gitignored, so it is ABSENT in a fresh checkout -- which is exactly
+        # what CI is. Without this the check returned rc 3 (infrastructure),
+        # the branch below turned that into a WARNING, and lint passed: the
+        # only gate that can detect the consumer diverging from the shared
+        # resolution rule was fail-open in the one environment that matters,
+        # and the identity gate explicitly does not cover the consumer (Codex
+        # adversarial, section 18).
+        if [ ! -f "$REPO_ROOT/build/todo-cache.json" ]; then
+            python3 "$REPO_ROOT/scripts/todo-graph/build.py" --quiet \
+                --output "$REPO_ROOT/build/todo-cache.json" >/dev/null 2>&1 || true
+        fi
+        STUB_LINT_CACHE="$REPO_ROOT/build/todo-cache.json" \
+            python3 "$REPO_ROOT/scripts/lint/check_consumer_delegation.py" \
+            >"$LINT25_OUT" 2>&1 || LINT25_RC=$?
+        case "$LINT25_RC" in
+            0) echo -e "${CYAN}info${NC}: Check 25 (consumer-delegation) the lint consumer delegates every symbol occurrence to the shared rule" ;;
+            1)
+                # A REAL VIOLATION: the two gates have diverged.
+                while IFS= read -r _l25; do
+                    [ -z "$_l25" ] && continue
+                    echo -e "${RED}error${NC}: Check 25 (consumer-delegation) ${_l25#  VIOLATION }"
+                done < <(grep '  VIOLATION ' "$LINT25_OUT" || true)
+                ERRORS=$((ERRORS + 1))
+                ;;
+            *)
+                # FAIL CLOSED. This branch runs ONLY because a file that can
+                # break the invariant was changed, and the cache is built above
+                # if it was missing -- so "the check could not run" here is not
+                # a fresh-clone inconvenience, it is the gate being unable to
+                # adjudicate the very change that triggered it. Warning was
+                # fail-open in a fresh checkout, which is what CI always is.
+                echo -e "${RED}error${NC}: Check 25 (consumer-delegation) could not run (rc=$LINT25_RC) while a file that can break the invariant was changed: $(tail -1 "$LINT25_OUT")"
+                ERRORS=$((ERRORS + 1))
+                ;;
+        esac
+        rm -f "$LINT25_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 26: the resolver must DECLARE the bucket set it can emit
+# ============================================================================
+# section 20. `identity-gate.sh` adjudicates bucket RETIREMENT, and its proof
+# that a bucket is no longer produced is now `ref_resolution.EMITTED_BUCKETS`
+# rather than a source-text search for the quoted literal (which an indexed or
+# concatenated emission defeats). That proof is only as good as the declaration,
+# so the declaration's shape is checked here on every commit that can move it.
+#
+# UNCONDITIONAL WHERE THE SUBJECT EXISTS, unlike Check 25. This one is a pure
+# AST read of two files -- no corpus walk, no cache, ~30ms measured -- so there
+# is no cost argument for gating it on a diff, and a gate that only runs when
+# someone remembered to touch the right file is how the contract rots. Absent
+# subject (the tooling suite's scratch repos) is not a finding, exactly as
+# Check 25 learned. SKIP via SKIP_LINT_BUCKET_EMISSION=1.
+if [ "${SKIP_LINT_BUCKET_EMISSION:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 26 (bucket-emission) skipped via SKIP_LINT_BUCKET_EMISSION=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ -f "$REPO_ROOT/scripts/lint/check_bucket_emission.py" ] \
+     && [ -f "$REPO_ROOT/scripts/todo-graph/ref_resolution.py" ] \
+     && [ -f "$REPO_ROOT/scripts/todo-graph/snapshot_protocol.json" ]; then
+    LINT26_OUT="$(mktemp -t lint-bucket-emission.XXXXXX)"
+    LINT26_RC=0
+    python3 "$REPO_ROOT/scripts/lint/check_bucket_emission.py" \
+        --emitter "$REPO_ROOT/scripts/todo-graph/ref_resolution.py" \
+        --protocol "$REPO_ROOT/scripts/todo-graph/snapshot_protocol.json" \
+        >"$LINT26_OUT" 2>&1 || LINT26_RC=$?
+    case "$LINT26_RC" in
+        0) echo -e "${CYAN}info${NC}: Check 26 (bucket-emission) the resolver declares its emitted bucket set" ;;
+        *)
+            # FAIL CLOSED on both violation and infrastructure. A contract that
+            # could not be read proves nothing about what the resolver emits,
+            # and the retirement gate consults it -- treating "could not run" as
+            # a pass is the same inversion that once let an unreadable emitter
+            # approve a retirement (identity-gate fixture 22af).
+            while IFS= read -r _l26; do
+                [ -z "$_l26" ] && continue
+                echo -e "${RED}error${NC}: Check 26 (bucket-emission) ${_l26#\[check_bucket_emission\] }"
+            done < <(grep '^\[check_bucket_emission\]' "$LINT26_OUT" || tail -1 "$LINT26_OUT")
+            ERRORS=$((ERRORS + 1))
+            ;;
+    esac
+    rm -f "$LINT26_OUT"
+fi
+
+# ============================================================================
+# Check 27: OS Comparison last-column cells stay claims, not paragraphs
+# ============================================================================
+# The `Impossible OS` column had grown to 219 display columns in its worst cell,
+# dragging whole rows past 400 -- unreadable in the raw source these files are
+# actually read in. All 223 tables were repaired to <= 80 on 2026-08-08.
+#
+# ERROR from the start, unlike Check 17 which shipped as a warning and watched
+# 22 files drift anyway: this check ships with the corpus already at zero, so it
+# has no legacy debt to be lenient about. `scripts/todo-staged-check.py` is the
+# per-commit half and catches the single added row; this is the corpus backstop
+# for anything that reaches the tree another way.
+#
+# Skip via SKIP_LINT_OSCOMP_CELL=1.
+# The existence guard and the `|| true` are both load-bearing under `set -e`:
+# a bare command substitution that exits non-zero ABORTS lint.sh with rc 1 and
+# no diagnostic, which is how four fixture-repo tooling tests failed the moment
+# this check was added (they run lint.sh in throwaway repos that carry no
+# scripts/format-md-tables.py). Same shape as the `|| true` abort fixed here
+# 2026-08-07; Check 26 above guards identically.
+if [ "${SKIP_LINT_OSCOMP_CELL:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 27 (oscomp-cell-cap) skipped via SKIP_LINT_OSCOMP_CELL=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/format-md-tables.py" ]; then
+    :   # table formatter absent (fixture repo): nothing to measure against
+else
+    OSCOMP_OUT="$(python3 - "$REPO_ROOT" <<'PYOSC'
+import importlib.util, pathlib, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("f", str(root / "scripts/format-md-tables.py"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+CAP = 80
+files = subprocess.run(["git", "-C", str(root), "ls-files", "todo/*.md", "todo/**/*.md"],
+                       capture_output=True, text=True).stdout.split()
+hits = []
+for rel in files:
+    try:
+        lines = (root / rel).read_text(encoding="utf-8").split("\n")
+    except OSError:
+        continue
+    for s0, e0 in m._find_tables(lines):
+        rows = [m._split_row(l) for l in lines[s0:e0]]
+        if "Impossible OS" not in " ".join(rows[0]):
+            continue
+        n = len(rows[0])
+        for i, row in enumerate(rows):
+            if i == 1 or len(row) != n:
+                continue
+            # EVERY claim column, not just the last (2026-08-09). The cap
+            # shipped scanning `row[-1]` only, so prose crept into the Win11 and
+            # Linux columns instead -- and ONE such row pads every column in its
+            # table: a single row with 119- and 115-column cells held TODO-25's
+            # comparison table at 358 columns when its content needed 217. The
+            # operator saw it as "the table is broken" and it was, in a way the
+            # cap was looking straight past.
+            for col, cell in enumerate(row):
+                if col == 0:
+                    continue          # the decorative glyph column is 2 cols
+                w = m._dwidth(cell)
+                if w > CAP:
+                    hits.append(f"{rel}:{s0+1+i}: col {col} {w} cols")
+for h in hits[:5]:
+    print(h)
+print(f"COUNT={len(hits)}")
+PYOSC
+)" || true
+    # `|| true` belongs to the ASSIGNMENT, not inside the quotes. Written as
+    # `... ) || true"` it was literal text appended to the captured string, so
+    # OSCOMP_OUT ended `COUNT=0 || true`, OSCOMP_N parsed as `0 || true`, and the
+    # `-gt` test errored with "integer expression expected" -- which is FALSE, so
+    # Check 27 could never report a violation. It shipped inert in 34af61ea6 and
+    # printed its own bash error on every lint run. Found during the v12
+    # close-out; the error line in the output is what gave it away.
+    OSCOMP_N="$(printf '%s' "$OSCOMP_OUT" | sed -n 's/^COUNT=//p')"
+    if [ "${OSCOMP_N:-0}" -gt 0 ]; then
+        printf '%s\n' "$OSCOMP_OUT" | grep -v '^COUNT=' | sed 's/^/       /'
+        echo -e "${RED}error${NC}: Check 27 (oscomp-cell-cap) $OSCOMP_N OS Comparison cell(s) over 80 columns -- these columns carry claims, not paragraphs, and ONE long cell pads every column in its table; move the justification into the section body"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 28: a `todo_fence` export that no longer has a reason to exist
+# ============================================================================
+# The promotion of the `alias-staleness` finding class, owned by the todo
+# metadata layer roadmap. Its shared-fence-tracker consolidation work retired
+# six private parsers to one-line wrappers over
+# `cache_schema`, and nothing then watched whether a wrapper kept its callers or
+# kept matching what it forwards to. Four had already gone stale by the time the
+# check was written: `fence_step` and `fence_mask` had no reference at all, and
+# `unclosed_reason` and `unmasked` were reached only by their own tests.
+#
+# EVERY VERDICT IS A WARNING; the only ERROR is a checker that could not RUN.
+# Three review rounds argued the enforcement level both ways and the evidence
+# settled it. Erroring on a reachability verdict was tried and withdrawn: live
+# consumers (`{"fence": mod}` reached by subscript, `helper(mod=tf)`,
+# `helper.use(tf)`) all read DEAD. Erroring on DRIFT was tried and withdrawn
+# too: renaming a target parameter while positional forwarding still works, and
+# a transparent decorator exposing `(*args, **kwargs)`, both report drift
+# without any behaviour changing. A check whose false positives stop work gets
+# skipped, and a skipped check is worth less than a noisy one. The class this
+# promotes was never short of a refusal -- it was short of anyone LOOKING.
+#
+# Skip via SKIP_LINT_ALIAS_STALENESS=1.
+if [ "${SKIP_LINT_ALIAS_STALENESS:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 28 (alias-staleness) skipped via SKIP_LINT_ALIAS_STALENESS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/lint/check_alias_staleness.py" ] \
+     || [ ! -f "$REPO_ROOT/scripts/todo_fence.py" ]; then
+    # A hard ERROR, not a silent no-op and not a warning. A missing checker or
+    # shim means Check 28 has quietly dropped out of lint -- exactly the
+    # alias-staleness shape this class is about, one level up -- and CI must
+    # not stay green on that. The correct fix for a sandboxed fixture that
+    # legitimately omits the file is to GIVE it the file
+    # (`scripts/test-tooling.sh`'s `tt_install_lint()` now copies
+    # `check_alias_staleness.py` alongside the shim it already carries), not to
+    # weaken this gate; a downgrade to WARNING was tried and reverted for
+    # exactly that reason (post-ship review, section 49).
+    echo -e "${RED}error${NC}: Check 28 (alias-staleness) checker or shim file missing (scripts/lint/check_alias_staleness.py or scripts/todo_fence.py) -- the check cannot run"
+    ERRORS=$((ERRORS + 1))
+else
+    LINT28_OUT="$(mktemp -t lint-alias-staleness.XXXXXX)"
+    LINT28_RC=0
+    python3 "$REPO_ROOT/scripts/lint/check_alias_staleness.py" "$REPO_ROOT" \
+        >"$LINT28_OUT" 2>&1 || LINT28_RC=$?
+    # PARSED REGARDLESS OF EXIT CODE. Gating the parse on a nonzero exit is how
+    # UNKNOWN went silent: it exits advisory, and a silent UNKNOWN means the
+    # reachability half has stopped working with nothing to say so.
+    while IFS= read -r _l28; do
+        [ -z "$_l28" ] && continue
+        _l28="${_l28#\[check_alias_staleness\] }"
+        # ONLY a FATAL line is an error: that is the checker reporting it could
+        # not run, which is the one claim here with no false-positive path.
+        # Every verdict -- DRIFT, DEAD, TEST-ONLY, UNKNOWN -- warns.
+        case "$_l28" in
+            FATAL*)
+                echo -e "${RED}error${NC}: Check 28 (alias-staleness) $_l28"
+                ERRORS=$((ERRORS + 1)) ;;
+            *)
+                echo -e "${YELLOW}warn${NC}: Check 28 (alias-staleness) $_l28"
+                WARNINGS=$((WARNINGS + 1)) ;;
+        esac
+    done < <(grep '^\[check_alias_staleness\]' "$LINT28_OUT" 2>/dev/null || true)
+    # FAIL CLOSED ON THE MECHANISM, never on the verdict. rc 0 and rc 1 are the
+    # tool speaking; anything else means it did not get to speak, and a check
+    # that could not run proves nothing -- the same stance Check 26 takes.
+    if [ "$LINT28_RC" != "0" ] && [ "$LINT28_RC" != "1" ]; then
+        echo -e "${RED}error${NC}: Check 28 (alias-staleness) checker did not run to completion (rc $LINT28_RC) -- a check that cannot run proves nothing"
+        ERRORS=$((ERRORS + 1))
+    fi
+    rm -f "$LINT28_OUT"
+fi
+
+# ============================================================================
+# Check 29: TPM per-function stack-frame ceiling
+# ============================================================================
+# The TPM modules marshal TPM2 buffers sized by protocol maxima, not by what the
+# calling context can afford, and they chain three-to-four frames deep against
+# 8 KiB kernel task stacks. A frame that outgrows its budget fails no build, no
+# test and no QEMU boot -- it takes out a guard page on real hardware, on
+# whichever path happens to be deepest at the time.
+#
+# Runs ONLY when the commit touches a covered module or the checker itself: it
+# compiles five translation units with -fstack-usage (~2s), which is real cost to
+# put on every unrelated commit. The trigger below is a HARDCODED duplicate of
+# the checker's own MODULES list, not derived from it: deriving it by parsing
+# tpm-stack-check.py made the trigger (and the "checker missing but module
+# changed" fail-closed ERROR two blocks down) depend on the checker existing to
+# compute at all, which is exactly backwards for a fail-closed gate -- delete
+# the checker and the trigger silently goes empty instead of firing. A short,
+# stable duplicate costs a manual sync on the rare day MODULES changes; that is
+# the honest trade against a derivation that fails exactly when fail-closed
+# behavior matters most.
+#
+# Skip via SKIP_LINT_TPM_STACK=1.
+TPM_STACK_COVERED_MODULES="
+src/kernel/tpm_seal.c
+src/kernel/tpm_attest.c
+src/kernel/tpm_nv.c
+src/kernel/tpm_baseline.c
+src/kernel/tpm_transport.c
+include/kernel/tpm.h
+include/kernel/tpm_attest.h
+include/kernel/tpm_authz.h
+include/kernel/tpm_baseline.h
+include/kernel/tpm_nv.h
+include/kernel/tpm_pcr_alloc.h
+include/kernel/tpm_seal.h
+include/kernel/tpm_transport.h
+"
+# Adversarial review (post-ship, section 24) found the trigger covered only the
+# five .c translation units: a HEADER-ONLY change (e.g. widening
+# TPM_NV_MAX_DATA, which directly sizes stack buffers in tpm_nv.c) grows a
+# covered function's frame without ever re-running the checker, because
+# nothing in the header's own diff matched the trigger. The five modules'
+# #include list is finite and stable (grep confirms it above), so the
+# duplicate-list trade already made for the .c files extends cleanly to their
+# headers rather than needing a dependency-closure tool.
+TPM_STACK_TOUCHED=0
+for f in "${FILES[@]}"; do
+    case "$f" in
+        scripts/tpm-stack-check.py) TPM_STACK_TOUCHED=1 ;;
+    esac
+    for m in $TPM_STACK_COVERED_MODULES; do
+        [ "$f" = "$m" ] && TPM_STACK_TOUCHED=1
+    done
+done
+
+if [ "${SKIP_LINT_TPM_STACK:-}" = "1" ]; then
+    if [ "$TPM_STACK_TOUCHED" = "1" ]; then
+        echo -e "${YELLOW}warn${NC}: Check 29 (tpm-stack) skipped via SKIP_LINT_TPM_STACK=1"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+elif [ "$TPM_STACK_TOUCHED" = "1" ]; then
+    if [ ! -f "$REPO_ROOT/scripts/tpm-stack-check.py" ]; then
+        # A commit touching a covered module with the checker GONE is the one
+        # case that must not pass quietly: the gate would have dropped out of
+        # lint exactly where it is needed.
+        echo -e "${RED}error${NC}: Check 29 (tpm-stack) scripts/tpm-stack-check.py is missing but a covered TPM module changed"
+        ERRORS=$((ERRORS + 1))
+    else
+        TPM_STACK_OUT=$(mktemp)
+        # `|| true` is load-bearing under `set -e`: without it a rc-1 verdict
+        # (the checker's normal way of REPORTING a violation) kills lint.sh
+        # before it can print the finding or the summary, so a real failure
+        # looked like a silent truncated run.
+        TPM_STACK_RC=0
+        python3 "$REPO_ROOT/scripts/tpm-stack-check.py" > "$TPM_STACK_OUT" 2>&1 \
+            || TPM_STACK_RC=$?
+        if [ "$TPM_STACK_RC" = "0" ]; then
+            echo -e "${DIM}ok${NC}: Check 29 (tpm-stack) $(grep -m1 'tpm-stack-check:' "$TPM_STACK_OUT" || echo 'clean')"
+        elif [ "$TPM_STACK_RC" = "1" ]; then
+            while IFS= read -r _l29; do
+                echo -e "${RED}error${NC}: Check 29 (tpm-stack) $_l29"
+            done < <(grep -E '^[[:space:]]+src/kernel/' "$TPM_STACK_OUT" || true)
+            ERRORS=$((ERRORS + 1))
+        else
+            # FAIL CLOSED ON THE MECHANISM. rc 0 and rc 1 are the tool speaking;
+            # anything else means it never got to speak, and a check that could
+            # not run proves nothing.
+            echo -e "${RED}error${NC}: Check 29 (tpm-stack) checker did not run to completion (rc $TPM_STACK_RC)"
+            ERRORS=$((ERRORS + 1))
+        fi
+        rm -f "$TPM_STACK_OUT"
+    fi
+fi
+
+# ============================================================================
+# Check 30: published surfaces agree with their sources (site / docs drift)
+# ============================================================================
+# scripts/site/build.py --check builds the website + documentation site in
+# memory and fails on: a project.json fact that a Markdown region no longer
+# matches, an unknown {{key}} in a gh-pages/ template, a dead link or anchor in
+# docs/, a live repository URL naming an owner other than project.json's, a
+# README line-count badge that disagrees with COUNT.md, and a documentation
+# coverage baseline that is stale or missing a new undocumented TODO file.
+# Pages or feature cards whose sources= changed since their content did are
+# reported as warnings (doc freshness), never errors.
+# ~1s, so it runs on every commit. Computed stat_* regions (TODO counts, test
+# totals) are skipped here because ordinary work moves them; the post-commit
+# hook re-syncs README.md and the Pages workflow checks them. Skip via
+# SKIP_LINT_SITE=1.
+if [ "${SKIP_LINT_SITE:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 30 (site drift) skipped via SKIP_LINT_SITE=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/site/build.py" ] || [ ! -f "$REPO_ROOT/project.json" ]; then
+    # Throwaway fixture repos (scripts/test-tooling.sh) copy lint.sh without the
+    # site generator; there is no published surface to check there.
+    :
+else
+    SITE_OUT=$(mktemp)
+    SITE_RC=0
+    # Under the pre-commit gate, judge the INDEX (what the commit contains), not
+    # the working tree: an uncommitted page must neither satisfy nor block a commit.
+    SITE_SCOPE=""
+    [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ] && SITE_SCOPE="--staged"
+    python3 "$REPO_ROOT/scripts/site/build.py" --check --quiet --skip-stats $SITE_SCOPE > "$SITE_OUT" 2>&1 || SITE_RC=$?
+    if [ "$SITE_RC" -ne 0 ]; then
+        sed 's/^/  /' "$SITE_OUT"
+        echo -e "${RED}error${NC}: Check 30 (site drift) -- fix the sources above; python3 scripts/site/build.py --sync rewrites project regions"
+        ERRORS=$((ERRORS + 1))
+    else
+        # Doc freshness: a page whose sources= changed since the page did. A
+        # warning, never an error (a code change is not always a docs change),
+        # but printed, because a passing check's output is otherwise discarded.
+        while IFS= read -r line; do
+            echo -e "${YELLOW}warn${NC}: Check 30 (doc freshness) ${line#WARN: }"
+            WARNINGS=$((WARNINGS + 1))
+        done < <(grep '^WARN: ' "$SITE_OUT")
+    fi
+    rm -f "$SITE_OUT"
+fi
+
+# ============================================================================
+# Check 31: the site tooling parses HTML and URLs with real parsers
+# ============================================================================
+# scripts/site/check_parsers.py reports any regex in scripts/site/*.py that
+# reads markup or URL structure; tags and attributes go through html.parser or
+# markdown-it, URLs through urllib.parse or Node's WHATWG URL. Promoted from the
+# `parser-approximation` review class (40 fixed findings by 2026-09-29, every
+# one caught by a Codex round). A regex over this repo's own syntax carries a
+# `# parser-allow: <reason>` waiver. The control run must report every marked
+# line of its fixture: a detector that goes quiet is an ERROR, not a pass.
+# ~0.2s, so it runs on every commit. Skip via SKIP_LINT_SITE_PARSERS=1.
+if [ "${SKIP_LINT_SITE_PARSERS:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 31 (site parsers) skipped via SKIP_LINT_SITE_PARSERS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/site/check_parsers.py" ]; then
+    :   # throwaway fixture repos (scripts/test-tooling.sh) carry no site tooling
+else
+    PARSERS_RC=0
+    PARSERS_OUT=$(python3 "$REPO_ROOT/scripts/site/check_parsers.py" 2>&1) || PARSERS_RC=$?
+    if [ "$PARSERS_RC" -ne 0 ]; then
+        printf '%s\n' "$PARSERS_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 31 (site parsers) -- parse HTML/URLs with html.parser, markdown-it or urllib.parse"
+        ERRORS=$((ERRORS + 1))
+    fi
+    CONTROL_RC=0
+    CONTROL_OUT=$(python3 "$REPO_ROOT/scripts/site/check_parsers.py" --control 2>&1) || CONTROL_RC=$?
+    if [ "$CONTROL_RC" -ne 0 ]; then
+        printf '%s\n' "$CONTROL_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 31 (site parsers) -- the control fixture was misjudged; the detector cannot be trusted"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Checks 32-33: the site tooling fails closed and bounds every wait
+# ============================================================================
+# scripts/site/check_nets.py, promoted from the `fail-open` (12 fixed) and
+# `unbounded-wait` (4 fixed) review classes by 2026-09-30. Check 32: an empty
+# value on an except or missing-input path carries `# fail-direction: <why>`.
+# Check 33: every subprocess, pipe, thread or HTTP wait has a finite timeout or
+# a `# deadline: <owner>` naming the caller-owned bound. Each control fixture
+# must be judged exactly as marked, so a detector that goes quiet is an ERROR.
+# ~1.5s for all four runs (measured 2026-09-30). Skip via SKIP_LINT_SITE_NETS=1.
+if [ "${SKIP_LINT_SITE_NETS:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Checks 32-33 (site fail direction, bounded waits) skipped via SKIP_LINT_SITE_NETS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/site/check_nets.py" ]; then
+    :   # throwaway fixture repos (scripts/test-tooling.sh) carry no site tooling
+else
+    for NETS_SPEC in "32:fail-direction:mark why an empty value is the safe reading" \
+                     "33:bounded-wait:pass a finite timeout or name the caller-owned deadline"; do
+        NETS_NUM=${NETS_SPEC%%:*}; NETS_REST=${NETS_SPEC#*:}
+        NETS_RULE=${NETS_REST%%:*}; NETS_HINT=${NETS_REST#*:}
+        NETS_RC=0
+        NETS_OUT=$(python3 "$REPO_ROOT/scripts/site/check_nets.py" --rule "$NETS_RULE" 2>&1) || NETS_RC=$?
+        if [ "$NETS_RC" -ne 0 ]; then
+            printf '%s\n' "$NETS_OUT" | sed 's/^/  /'
+            echo -e "${RED}error${NC}: Check $NETS_NUM (site $NETS_RULE) -- $NETS_HINT"
+            ERRORS=$((ERRORS + 1))
+        fi
+        NETS_RC=0
+        NETS_OUT=$(python3 "$REPO_ROOT/scripts/site/check_nets.py" --rule "$NETS_RULE" --control 2>&1) || NETS_RC=$?
+        if [ "$NETS_RC" -ne 0 ]; then
+            printf '%s\n' "$NETS_OUT" | sed 's/^/  /'
+            echo -e "${RED}error${NC}: Check $NETS_NUM (site $NETS_RULE) -- the control fixture was misjudged; the detector cannot be trusted"
+            ERRORS=$((ERRORS + 1))
+        fi
+    done
+fi
+
+# ============================================================================
+# Check 34: current_irql has exactly one writer, irql_store()
+# ============================================================================
+# scripts/lint/check_irql_write_surface.py. A bare store is invisible to anything
+# that must see every IRQL change, so time-at-DISPATCH accounting and a transition
+# validator would silently undercount. The control fixture must be judged exactly
+# as marked, so a detector that goes quiet is an ERROR. Skip via SKIP_LINT_IRQL_WRITE=1.
+if [ "${SKIP_LINT_IRQL_WRITE:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 34 (IRQL write surface) skipped via SKIP_LINT_IRQL_WRITE=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/lint/check_irql_write_surface.py" ]; then
+    :   # throwaway fixture repos (scripts/test-tooling.sh) carry no kernel tree
+else
+    IRQLW_RC=0
+    IRQLW_OUT=$(python3 "$REPO_ROOT/scripts/lint/check_irql_write_surface.py" --root "$REPO_ROOT" 2>&1) || IRQLW_RC=$?
+    if [ "$IRQLW_RC" -ne 0 ]; then
+        printf '%s\n' "$IRQLW_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 34 (IRQL write surface) -- route the write through irql_store() in include/kernel/sched/irql_store.h"
+        ERRORS=$((ERRORS + 1))
+    fi
+    IRQLW_RC=0
+    IRQLW_OUT=$(python3 "$REPO_ROOT/scripts/lint/check_irql_write_surface.py" --control 2>&1) || IRQLW_RC=$?
+    if [ "$IRQLW_RC" -ne 0 ]; then
+        printf '%s\n' "$IRQLW_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 34 (IRQL write surface) -- the control fixture was misjudged; the detector cannot be trusted"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 35: Python tooling has no undefined names, syntax errors or shadowed
+# imports (ruff, rule set in ruff.toml)
+# ============================================================================
+# The repository's gates are Python. A NameError on a path no test reaches is a
+# gate that crashes exactly when it should refuse, and nothing compiled these
+# files before 2026-11-10. Whole tree, every run: 355 files take well under a
+# second. A missing ruff is an ERROR, not a skip: a check that silently does
+# not run reads as a check that passed (`bash scripts/setup.sh` installs it).
+# Skip via SKIP_LINT_RUFF=1.
+if [ "${SKIP_LINT_RUFF:-}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 35 (ruff) skipped via SKIP_LINT_RUFF=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/ruff.toml" ] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # Not this repository's tree (the lint fixtures copy lint.sh into a bare
+    # temporary directory): there is no rule set and no tracked file list.
+    :
+elif ! command -v ruff >/dev/null 2>&1; then
+    echo -e "${RED}error${NC}: Check 35 (ruff) -- ruff is not installed; run bash scripts/setup.sh (or: uv tool install ruff / pipx install ruff)"
+    ERRORS=$((ERRORS + 1))
+else
+    RUFF_RC=0
+    RUFF_OUT=$(cd "$REPO_ROOT" && git ls-files -z '*.py' | xargs -0 ruff check --no-cache --output-format concise --config "$REPO_ROOT/ruff.toml" --force-exclude 2>&1) || RUFF_RC=$?
+    if [ "$RUFF_RC" -ne 0 ]; then
+        printf '%s\n' "$RUFF_OUT" | grep -E '^[^ ]+:[0-9]+:[0-9]+: ' | head -40 | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 35 (ruff) -- $(printf '%s\n' "$RUFF_OUT" | grep -cE '^[^ ]+:[0-9]+:[0-9]+: ') Python defect(s); each is a real error, fix it rather than excluding it"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 36: a project URL in shipped source names the project's real host
+# ============================================================================
+# The kernel halt screen told users to visit a domain the project does not own
+# (found 2026-11-10; the site is project.json's site_url). A string in a C
+# source cannot be templated from project.json, so the host is checked here.
+URLHOST_RC=0
+# Same scope rule as Check 35: only in a tree that has project.json and git.
+if [ -f "$REPO_ROOT/project.json" ] && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+URLHOST_OUT=$(cd "$REPO_ROOT" && python3 - <<'PYEOF' 2>&1
+import json, re, subprocess, sys, urllib.parse
+host = urllib.parse.urlparse(json.load(open("project.json"))["site_url"]).hostname
+if not host:
+    print("could not read site_url from project.json"); sys.exit(2)
+out = subprocess.run(["git", "grep", "-nIoE", r"https?://[A-Za-z0-9.-]*impossible[A-Za-z0-9.-]*",
+                      "--", "src", "include", "user"],
+                     capture_output=True, text=True, timeout=60).stdout
+bad = []
+for line in out.splitlines():
+    where, _, url = line.rpartition(":http")
+    h = urllib.parse.urlparse("http" + url).hostname or ""
+    if h != host and not h.endswith("." + host):
+        bad.append(f"{where}: {h}")
+if bad:
+    print("\n".join(bad[:20])); print(f"expected host: {host}"); sys.exit(1)
+PYEOF
+) || URLHOST_RC=$?
+fi
+if [ "$URLHOST_RC" -ne 0 ]; then
+    printf '%s\n' "$URLHOST_OUT" | sed 's/^/  /'
+    echo -e "${RED}error${NC}: Check 36 (project URL host) -- shipped source names a project URL on a host that is not the project's"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# ============================================================================
+# Check 37: the implementation plan agrees with the TODO graph
+# ============================================================================
+# todo/implementation-plan.md lists every section once, with a box derived from
+# the section's lifecycle class. It goes stale whenever a section ships, is
+# stamped, renamed or filed, and `todo-plan.py --sync` repairs it with no
+# judgement involved. A row moved before its dependency is refused too.
+#
+# Under the commit gate it judges the git index, which is what the commit
+# carries: a plan synced but left unstaged does not pass, and a TODO edit that
+# is not part of the commit does not fail it.
+# The staged form runs whether or not the working tree still has the file: the
+# index may hold a plan the working tree deleted, and the commit carries it.
+if { [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ] || [ -f "$REPO_ROOT/todo/implementation-plan.md" ]; } \
+        && [ "${SKIP_LINT_TODO_PLAN:-}" != "1" ]; then
+    PLAN_RC=0
+    PLAN_ARGS=(--check)
+    [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ] && PLAN_ARGS+=(--staged)
+    PLAN_OUT="$(python3 "$REPO_ROOT/scripts/todo-plan.py" "${PLAN_ARGS[@]}" 2>&1)" || PLAN_RC=$?
+    if [ "$PLAN_RC" -ne 0 ]; then
+        printf '%s\n' "$PLAN_OUT" | head -20 | sed 's/^/  /'
+        if [ "$PLAN_RC" -eq 1 ]; then
+            echo -e "${RED}error${NC}: Check 37 (implementation plan) todo/implementation-plan.md is stale or out of order; repair with: python3 scripts/todo-plan.py --sync, then stage it (a row before its dependency is moved by hand)"
+        else
+            echo -e "${RED}error${NC}: Check 37 (implementation plan) scripts/todo-plan.py could not read the graph (exit $PLAN_RC); the check did not run"
+        fi
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 38: no target in the root Makefile has two recipes
+# ============================================================================
+# GNU make keeps the last recipe and drops the earlier one with a warning, so a
+# documented target silently does something else (run-test and run-debug did,
+# until 2026-11-13). make parses the file and decides; see
+# scripts/lint/check_make_duplicates.sh.
+if [ -f "$REPO_ROOT/Makefile" ] && [ "${SKIP_LINT_MAKE_DUPLICATES:-}" != "1" ]; then
+    MKDUP_RC=0
+    MKDUP_OUT="$(bash "$REPO_ROOT/scripts/lint/check_make_duplicates.sh" "$REPO_ROOT/Makefile" 2>&1)" || MKDUP_RC=$?
+    if [ "$MKDUP_RC" -eq 1 ]; then
+        printf '%s\n' "$MKDUP_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 38 (make duplicates) a Makefile target has two recipes and make silently drops one; give each its own target name"
+        ERRORS=$((ERRORS + 1))
+    elif [ "$MKDUP_RC" -ne 0 ]; then
+        printf '%s\n' "$MKDUP_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 38 (make duplicates) could not parse the Makefile (exit $MKDUP_RC); the check did not run"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 39: a reserved exit reason is declared only in TASK_EXIT_REASONS
+# ============================================================================
+# scripts/lint/check_exit_reason_table.py. include/kernel/sched/task.h generates
+# the reasons, count, _LAST and classifier bounds from one table; a reason
+# declared outside it builds clean and classifies as an application status.
+# The control fixture must be judged exactly as marked. Skip via
+# SKIP_LINT_EXIT_REASONS=1.
+if [ "${SKIP_LINT_EXIT_REASONS:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 39 (exit-reason table) skipped via SKIP_LINT_EXIT_REASONS=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/lint/check_exit_reason_table.py" ]; then
+    :   # throwaway fixture repos (scripts/test-tooling.sh) carry no kernel tree
+else
+    EXR_RC=0
+    EXR_OUT=$(python3 "$REPO_ROOT/scripts/lint/check_exit_reason_table.py" --root "$REPO_ROOT" 2>&1) || EXR_RC=$?
+    if [ "$EXR_RC" -ne 0 ]; then
+        printf '%s\n' "$EXR_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 39 (exit-reason table) -- add the reason as a TASK_EXIT_REASONS row in include/kernel/sched/task.h"
+        ERRORS=$((ERRORS + 1))
+    fi
+    EXR_RC=0
+    EXR_OUT=$(python3 "$REPO_ROOT/scripts/lint/check_exit_reason_table.py" --control 2>&1) || EXR_RC=$?
+    if [ "$EXR_RC" -ne 0 ]; then
+        printf '%s\n' "$EXR_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 39 (exit-reason table) -- the control fixture was misjudged; the detector cannot be trusted"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 40: the Windows 11 inventory holds facts, never Microsoft's text or files
+# ============================================================================
+# scripts/inventory/check-inventory.py (schema, tree and the facts-only rules)
+# and scripts/inventory/check-no-ms-assets.py (no image, sound, font or cursor
+# file of the reference VM). Both run on every lint, so CI's clean checkout is
+# checked as a whole; under the commit gate both read the staged contents, so a
+# commit is judged by the bytes it records, not by a later working-tree fix.
+# Owner: todo/08-graphics-ui/TODO-17-win11-parity-inventory.md section 4.
+# Skip via SKIP_LINT_INVENTORY=1.
+if [ "${SKIP_LINT_INVENTORY:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 40 (inventory facts) skipped via SKIP_LINT_INVENTORY=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ ! -f "$REPO_ROOT/scripts/inventory/check-inventory.py" ]; then
+    :   # throwaway fixture repos (scripts/test-tooling.sh) carry no inventory
+else
+    INV_SCOPE=()
+    [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ] && INV_SCOPE=(--index)
+    INV_RC=0
+    INV_OUT=$(python3 "$REPO_ROOT/scripts/inventory/check-inventory.py" "${INV_SCOPE[@]}" 2>&1) || INV_RC=$?
+    if [ "$INV_RC" -ne 0 ]; then
+        printf '%s\n' "$INV_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 40 (inventory facts) -- docs/design/inventory/ breaks a rule above (exit $INV_RC); see docs/design/inventory/index.md"
+        ERRORS=$((ERRORS + 1))
+    fi
+    [ "${#INV_SCOPE[@]}" -eq 0 ] && INV_SCOPE=(--all)
+    INV_RC=0
+    INV_OUT=$(python3 "$REPO_ROOT/scripts/inventory/check-no-ms-assets.py" "${INV_SCOPE[@]}" 2>&1) || INV_RC=$?
+    if [ "$INV_RC" -ne 0 ]; then
+        printf '%s\n' "$INV_OUT" | sed 's/^/  /'
+        echo -e "${RED}error${NC}: Check 40 (inventory facts) -- a committed asset is a file of the Windows 11 reference VM, or the check could not run (exit $INV_RC)"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ============================================================================
+# Check 41: the inventory coverage report is current
+# ============================================================================
+# docs/design/inventory/COVERAGE.md is generated by
+# scripts/inventory/inventory-report.py from the inventory and the TODO files
+# (which sections own which records, and which owners are shipped). Under the
+# commit gate it is judged against the staged tree, and only when the commit
+# stages an inventory or TODO file; a full lint (CI) always judges it.
+# Owner: todo/08-graphics-ui/TODO-17-win11-parity-inventory.md section 7.
+# Skip via SKIP_LINT_COVERAGE=1.
+if [ "${SKIP_LINT_COVERAGE:-0}" = "1" ]; then
+    echo -e "${YELLOW}warn${NC}: Check 41 (inventory coverage) skipped via SKIP_LINT_COVERAGE=1"
+    WARNINGS=$((WARNINGS + 1))
+elif [ "${LINT_GATE_SCOPE_STAGED:-}" = "1" ]; then
+    # The commit is judged by the report it records: the staged copy drives the
+    # run (it then runs on a snapshot of the staged tree, its own code included),
+    # so neither an unstaged edit nor an unstaged deletion changes the verdict.
+    if git -C "$REPO_ROOT" cat-file -e :scripts/inventory/inventory-report.py 2>/dev/null \
+        && git -C "$REPO_ROOT" diff --cached --name-only -- 'docs/design/inventory/*' 'todo/*' 'scripts/*' '.claude/hooks/sequencer_triage.py' | grep -q .; then
+        COV_DIR=$(mktemp -d "${TMPDIR:-/tmp}/inventory-report-XXXXXX")
+        mkdir -p "$COV_DIR/scripts/inventory"
+        git -C "$REPO_ROOT" show :scripts/inventory/inventory-report.py > "$COV_DIR/scripts/inventory/inventory-report.py"
+        COV_RC=0
+        COV_OUT=$(python3 "$COV_DIR/scripts/inventory/inventory-report.py" --root "$REPO_ROOT" --index --check 2>&1) || COV_RC=$?
+        rm -rf "$COV_DIR"
+        COV_RUN=1
+    else
+        COV_RUN=0
+    fi
+elif [ ! -f "$REPO_ROOT/scripts/inventory/inventory-report.py" ]; then
+    COV_RUN=0   # throwaway fixture repos (scripts/test-tooling.sh) carry no inventory
+else
+    COV_RC=0
+    COV_OUT=$(python3 "$REPO_ROOT/scripts/inventory/inventory-report.py" --check 2>&1) || COV_RC=$?
+    COV_RUN=1
+fi
+if [ "${SKIP_LINT_COVERAGE:-0}" != "1" ] && [ "${COV_RUN:-0}" = "1" ] && [ "$COV_RC" -ne 0 ]; then
+    printf '%s\n' "$COV_OUT" | sed 's/^/  /'
+    echo -e "${RED}error${NC}: Check 41 (inventory coverage) -- docs/design/inventory/COVERAGE.md does not match the inventory and TODO files (exit $COV_RC)"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# ============================================================================
+# Summary
+# ============================================================================
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+TOTAL=$((ERRORS + WARNINGS))
+if [ "$ERRORS" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+    echo -e "  ${CYAN}LINT CLEAN${NC} -- no violations found"
+elif [ "$ERRORS" -eq 0 ]; then
+    echo -e "  ${YELLOW}$WARNINGS warning(s)${NC}, 0 errors"
+else
+    echo -e "  ${RED}$ERRORS error(s)${NC}, ${YELLOW}$WARNINGS warning(s)${NC}"
+fi
+echo -e "  ${DIM}${#FILES[@]} files checked${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+
+if [ "$ERRORS" -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi
