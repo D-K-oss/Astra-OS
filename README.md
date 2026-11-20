@@ -5,7 +5,7 @@ A fully functional, feature-rich operating system from scratch. Everything is wr
 
 ## Design Goals
 
-- **Windows 11 where it matters.** Win32 is the native API, paths look like C:\Impossible\System32\, and the desktop follows Windows 11 closely, with a slightly frostier glass.
+- **Windows 11 where it matters.** Win32 is the native API, paths look like C:\Astra\System32\, and the desktop follows Windows 11 closely, with a slightly frostier glass.
 
 - **Linux where it widens reach.** Linux binaries are planned through a compatibility layer, not a renamed POSIX API.
 
